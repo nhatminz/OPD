@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import gzip
 import json
-import math
 import re
 from pathlib import Path
 from typing import Any
@@ -226,7 +225,7 @@ def evaluate_loaded_suite(
     if unknown:
         raise ValueError(f"Unknown training-evaluation benchmarks: {sorted(unknown)}")
     loaded = {}
-    total_batches = 0
+    total_samples = 0
     for benchmark in benchmark_names:
         records, schema = load_benchmark(
             benchmark, config["evaluation"]["benchmarks"][benchmark]
@@ -234,7 +233,7 @@ def evaluate_loaded_suite(
         if limit is not None:
             records = records[: int(limit)]
         loaded[benchmark] = (records, schema)
-        total_batches += math.ceil(len(records) / batch_size)
+        total_samples += len(records)
     suite = {
         "model": model_name,
         "benchmarks": {},
@@ -255,11 +254,13 @@ def evaluate_loaded_suite(
     previous_use_cache = model.config.use_cache
     model.eval()
     progress = tqdm(
-        total=total_batches,
+        total=total_samples,
         desc=f"Eval {model_name}",
-        unit="batch",
+        unit="sample",
         dynamic_ncols=True,
-        leave=False,
+        leave=True,
+        disable=False,
+        mininterval=0.5,
     )
     try:
         for benchmark in benchmark_names:
@@ -328,7 +329,10 @@ def evaluate_loaded_suite(
                             )
                             + "\n"
                         )
-                    progress.update(1)
+                    progress.set_postfix_str(
+                        f"{benchmark} accuracy={correct / max(total, 1):.3f}"
+                    )
+                    progress.update(len(batch))
             suite["benchmarks"][benchmark] = {
                 "correct": correct,
                 "total": total,

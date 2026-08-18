@@ -355,12 +355,25 @@ def run_training(
     output_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, output_dir / "resolved_config.yaml")
 
+    setup_progress = tqdm(
+        total=3,
+        desc=f"Setup {method.upper()}-OPD",
+        unit="stage",
+        dynamic_ncols=True,
+        leave=False,
+        disable=False,
+    )
+    setup_progress.set_postfix_str("stage=load-data", refresh=True)
     records, data_files = read_records(
         config["data"]["path"], split=config["data"].get("split")
     )
     if not records:
         raise ValueError("Full DAPO dataset is empty")
+    setup_progress.update(1)
+    setup_progress.set_postfix_str("stage=load-models", refresh=True)
     student, teacher, tokenizer, model_metadata = load_models(config, device)
+    setup_progress.update(1)
+    setup_progress.set_postfix_str("stage=optimizer", refresh=True)
     metadata = collect_metadata(
         Path(__file__).resolve().parents[1],
         command_line or sys.argv,
@@ -380,6 +393,8 @@ def run_training(
         [parameter for parameter in student.parameters() if parameter.requires_grad],
         training,
     )
+    setup_progress.update(1)
+    setup_progress.close()
     selector_cfg = config["selector"]
     ta_selector = TASelector(
         int(selector_cfg.get("top_k", 16)),
@@ -427,6 +442,9 @@ def run_training(
         desc=f"{method.upper()}-OPD B200",
         unit="step",
         dynamic_ncols=True,
+        leave=True,
+        disable=False,
+        mininterval=0.5,
     )
     for step_index in progress:
         step, step_started = step_index + 1, time.perf_counter()

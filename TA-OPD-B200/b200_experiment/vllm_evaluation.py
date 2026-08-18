@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from .config import load_config
@@ -109,6 +110,9 @@ def evaluate_vllm_suite(
     if max_model_len is not None:
         engine_kwargs["max_model_len"] = int(max_model_len)
 
+    tqdm.write(
+        f"Eval {model_name}: loading vLLM engine for {len(prompts)} full-dataset samples..."
+    )
     engine = LLM(**engine_kwargs)
     sampling = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
     # One call produces one tqdm progress bar for all configured benchmarks.
@@ -138,16 +142,26 @@ def evaluate_vllm_suite(
         response = request_output.outputs[0].text
         grouped[benchmark].append((row, response))
 
+    grade_progress = tqdm(
+        total=len(prompt_rows),
+        desc=f"Grade {model_name}",
+        unit="sample",
+        dynamic_ncols=True,
+        leave=True,
+        disable=False,
+        mininterval=0.2,
+    )
     for benchmark in benchmark_names:
         records, schema = loaded[benchmark]
         prediction_path = output_dir / (
             f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
         )
-        correct = 0
+        correct = graded = 0
         with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
             for row, response in grouped[benchmark]:
                 passed = _grade(response, row["answer"])
                 correct += int(passed)
+                graded += 1
                 handle.write(
                     json.dumps(
                         {**row, "response": response, "correct": passed},
@@ -155,6 +169,11 @@ def evaluate_vllm_suite(
                     )
                     + "\n"
                 )
+                grade_progress.set_postfix_str(
+                    f"{benchmark} accuracy={correct / max(graded, 1):.3f}",
+                    refresh=False,
+                )
+                grade_progress.update(1)
         suite["benchmarks"][benchmark] = {
             "correct": correct,
             "total": len(records),
@@ -162,6 +181,7 @@ def evaluate_vllm_suite(
             "predictions": str(prediction_path),
             "schema": schema,
         }
+    grade_progress.close()
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(suite, handle, indent=2, ensure_ascii=False)

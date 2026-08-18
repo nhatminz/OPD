@@ -156,6 +156,10 @@ full-parameter Qwen3-1.7B training, không gradient accumulation sau autotune (`
 Teacher luôn frozen. RAC dùng exact full-vocabulary `Delta`, batched top-M branches, KV-cache reuse và
 mọi counterfactual probe nằm trong `torch.inference_mode()`.
 
+Mọi lệnh train TA/RAC đều có tqdm cho setup và optimizer step, kèm stage hiện tại, loss, số token
+được chọn, thời gian selector và VRAM. Mọi lệnh eval đều có tqdm theo sample trong lúc generate và
+chấm đáp án; vLLM vẫn gom cả ba benchmark trong một lần generate để terminal không bị tràn log.
+
 ## Logs
 
 Mỗi run tạo:
