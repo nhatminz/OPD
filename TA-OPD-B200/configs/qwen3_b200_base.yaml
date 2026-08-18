@@ -1,5 +1,5 @@
-# Shared source of truth. The batch value below is only a bootstrap placeholder;
-# full training scripts require configs/qwen3_b200_autotuned.yaml generated on B200.
+# Shared source of truth. The bash wrappers expose TRAIN_BATCH_SIZE and apply the
+# same value to rollout and micro-batch. Optional autotune remains available.
 experiment:
   method: base
   seed: 1234
@@ -26,11 +26,28 @@ data:
     enable_thinking: true
 
 rollout:
-  batch_size: 8
+  # Default training rollout uses a persistent, same-GPU vLLM server. Student
+  # weights are synchronized through CUDA IPC before every optimizer step.
+  backend: vllm
+  batch_size: 64
   max_new_tokens: 256
   temperature: 1.0
   top_p: 1.0
   seed: 42
+  vllm:
+    # This is a co-located engine reservation, not an evaluation sample limit.
+    # It sleeps at level 2 while HF student/teacher scoring and backward run.
+    gpu_memory_utilization: 0.25
+    max_num_seqs: 64
+    max_model_len: 1024
+    max_concurrent_requests: 64
+    # Release the trainer CUDA cache only when the sleeping engine otherwise
+    # cannot wake with this safety margin; avoid empty_cache on every step.
+    wake_headroom_gib: 2
+    enable_prefix_caching: true
+    startup_timeout: 600
+    control_timeout: 600
+    generation_timeout: 3600
 
 selector:
   top_k: 16
@@ -50,7 +67,7 @@ token_budget:
 training:
   epochs: 1
   max_steps: null
-  micro_batch_size: 8
+  micro_batch_size: 64
   learning_rate: 1.0e-5
   adam_betas: [0.9, 0.95]
   weight_decay: 0.0

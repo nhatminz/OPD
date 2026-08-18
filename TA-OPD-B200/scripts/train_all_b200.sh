@@ -5,10 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Shared rollout/micro-batch for both TA and RAC (gradient accumulation = 1).
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+# Set true only when you explicitly want smoke_test_b200.sh to search candidates.
+export USE_BATCH_AUTOTUNE="${USE_BATCH_AUTOTUNE:-false}"
 export EPOCHS="${EPOCHS:-1}"
 export LEARNING_RATE="${LEARNING_RATE:-1.0e-5}"
 export RHO="${RHO:-0.10}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+# Training rollout backend. vllm syncs the live student before every batch;
+# use hf only as a compatibility/debug fallback.
+export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"  # vllm or hf
+export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+export ROLLOUT_VLLM_MAX_NUM_SEQS="${ROLLOUT_VLLM_MAX_NUM_SEQS:-${TRAIN_BATCH_SIZE}}"
+export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-1024}"
+export ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS="${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${TRAIN_BATCH_SIZE}}"
+export ROLLOUT_VLLM_WAKE_HEADROOM_GIB="${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
 export TOP_K="${TOP_K:-16}"
 export BRANCH_M="${BRANCH_M:-2}"
 export RAC_BRANCH_CHUNK_SIZE="${RAC_BRANCH_CHUNK_SIZE:-256}"
@@ -23,7 +35,8 @@ export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"  # vllm or hf
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-2048}"
 export TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-16}"  # hf backend only
 
-# vLLM settings. For tensor parallelism, expose the same number of GPUs above.
+# Periodic/final evaluation vLLM settings (separate from training rollout).
+# For tensor parallelism, expose the same number of GPUs above.
 export VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
 export VLLM_GPU_HEADROOM_GIB="${VLLM_GPU_HEADROOM_GIB:-4}"

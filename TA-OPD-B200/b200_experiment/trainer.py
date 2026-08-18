@@ -35,6 +35,7 @@ from .scoring import (
 )
 from .selector_logging import SelectedTokenLogger
 from .selectors import RACSelector, TASelector, top_budget_mask
+from .vllm_rollout import VLLMRolloutEngine
 
 
 def seed_everything(seed: int) -> None:
@@ -355,8 +356,18 @@ def run_training(
     output_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, output_dir / "resolved_config.yaml")
 
+    rollout_backend = str(config["rollout"].get("backend", "vllm")).lower()
+    if rollout_backend not in {"vllm", "hf"}:
+        raise ValueError("rollout.backend must be 'vllm' or 'hf'")
+    if rollout_backend == "vllm" and bool(training.get("use_lora", False)):
+        raise RuntimeError(
+            "vLLM CUDA-IPC rollout requires full-parameter training; "
+            "set training.use_lora=false or rollout.backend=hf"
+        )
+    rollout_engine: VLLMRolloutEngine | None = None
+
     setup_progress = tqdm(
-        total=3,
+        total=4,
         desc=f"Setup {method.upper()}-OPD",
         unit="stage",
         dynamic_ncols=True,
@@ -369,6 +380,13 @@ def run_training(
     )
     if not records:
         raise ValueError("Full DAPO dataset is empty")
+    setup_progress.update(1)
+    setup_progress.set_postfix_str(
+        f"stage=start-rollout-{rollout_backend}", refresh=True
+    )
+    if rollout_backend == "vllm":
+        rollout_engine = VLLMRolloutEngine(config, output_dir)
+        rollout_engine.start()
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=load-models", refresh=True)
     student, teacher, tokenizer, model_metadata = load_models(config, device)
@@ -448,14 +466,19 @@ def run_training(
     )
     for step_index in progress:
         step, step_started = step_index + 1, time.perf_counter()
-        progress.set_postfix_str("stage=rollout", refresh=True)
+        progress.set_postfix_str(f"stage=rollout-{rollout_backend}", refresh=True)
         torch.cuda.reset_peak_memory_stats(device)
         indices = epoch_batch_indices(len(records), batch_size, step_index, seed)
         batch_records = [records[index] for index in indices]
         encoded, _ = tokenize_prompts(batch_records, tokenizer, config["data"], device)
+        rollout_function = (
+            rollout_engine.generate
+            if rollout_engine is not None
+            else generate_on_policy
+        )
         rollout, rollout_time = _timed(
             device,
-            generate_on_policy,
+            rollout_function,
             student,
             encoded["input_ids"],
             encoded["attention_mask"],
@@ -465,6 +488,9 @@ def run_training(
             eos_token_ids=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             seed=int(config["rollout"].get("seed", seed)) + step_index,
+        )
+        rollout_backend_metrics = (
+            dict(rollout_engine.last_metrics) if rollout_engine is not None else {}
         )
         for field in (
             "input_ids",
@@ -616,7 +642,19 @@ def run_training(
             "micro_batch_size": int(training.get("micro_batch_size", batch_size)),
             "fused_optimizer": fused_optimizer,
             **train_metrics,
+            "rollout_backend": rollout_backend,
             "rollout_time": rollout_time,
+            "vllm_weight_sync_time": rollout_backend_metrics.get(
+                "weight_sync_time", 0.0
+            ),
+            "vllm_generation_time": rollout_backend_metrics.get("generation_time", 0.0),
+            "vllm_sleep_time": rollout_backend_metrics.get("sleep_time", 0.0),
+            "vllm_torch_cache_released": bool(
+                rollout_backend_metrics.get("torch_cache_released", 0.0)
+            ),
+            "vllm_torch_cache_release_time": rollout_backend_metrics.get(
+                "torch_cache_release_time", 0.0
+            ),
             "student_base_scoring_time": student_base_time,
             "teacher_base_scoring_time": teacher_base_time,
             "ta_diagnostic_time": ta_time,
@@ -632,7 +670,8 @@ def run_training(
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
         }
-        # Release per-step tensors before the vLLM subprocess reserves its KV cache.
+        # The rollout server is already sleeping; release tensors before a
+        # possible periodic-evaluation subprocess reserves its KV cache.
         del (
             encoded,
             rollout,
@@ -643,6 +682,7 @@ def run_training(
             primary,
             ta_output,
             valid,
+            rollout_backend_metrics,
         )
         if should_run_training_evaluation(step, max_steps, training_eval_settings):
             progress.set_postfix_str("stage=evaluation", refresh=True)
@@ -676,6 +716,8 @@ def run_training(
             tqdm.write(
                 json.dumps(final_metrics, indent=2, ensure_ascii=False, allow_nan=True)
             )
+    if rollout_engine is not None:
+        rollout_engine.close()
     summary = {
         "status": "ok",
         "method": method,
@@ -683,6 +725,12 @@ def run_training(
         "epochs": training.get("epochs"),
         "dataset_rows": len(records),
         "full_dataset": True,
+        "rollout_backend": rollout_backend,
+        "vllm_rollout_server_log": str(
+            (output_dir / "vllm_rollout_server.log").resolve()
+        )
+        if rollout_backend == "vllm"
+        else None,
         "last": final_metrics,
         "student_path": model_metadata["student_path"],
         "teacher_path": model_metadata["teacher_path"],

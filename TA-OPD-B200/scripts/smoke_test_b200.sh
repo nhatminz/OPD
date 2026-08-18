@@ -8,17 +8,21 @@ cd "${REPO_DIR}"
   --config "${BASE_CONFIG}" \
   --output "${PREFLIGHT_REPORT}"
 
-TUNE_ARGS=(
-  --ta-config "${TA_CONFIG}"
-  --rac-config "${RAC_CONFIG}"
-  --output "${REPO_DIR}/outputs/autotune"
-  --generated-config "${AUTOTUNE_CONFIG}"
-)
-if [[ -n "${BATCH_CANDIDATES:-}" ]]; then
-  read -r -a CANDIDATES <<< "${BATCH_CANDIDATES}"
-  TUNE_ARGS+=(--candidates "${CANDIDATES[@]}")
+if batch_autotune_enabled; then
+  TUNE_ARGS=(
+    --ta-config "${TA_CONFIG}"
+    --rac-config "${RAC_CONFIG}"
+    --output "${REPO_DIR}/outputs/autotune"
+    --generated-config "${AUTOTUNE_CONFIG}"
+  )
+  if [[ -n "${BATCH_CANDIDATES:-}" ]]; then
+    read -r -a CANDIDATES <<< "${BATCH_CANDIDATES}"
+    TUNE_ARGS+=(--candidates "${CANDIDATES[@]}")
+  fi
+  "${PYTHON_BIN}" -m b200_experiment.cli autotune-batch "${TUNE_ARGS[@]}"
+else
+  echo "Skipping batch search; fixed TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}."
 fi
-"${PYTHON_BIN}" -m b200_experiment.cli autotune-batch "${TUNE_ARGS[@]}"
 require_b200_validation
 
-echo "Smoke/autotune passed. Full training was not started."
+echo "Smoke/preflight passed. Full training was not started."

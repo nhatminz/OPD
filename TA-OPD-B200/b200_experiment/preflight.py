@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from packaging.version import Version
 
 from .data import read_records, record_messages, stable_sample_id
 from .evaluation import inspect_evaluation_data
@@ -50,18 +51,24 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
         )
     requested_backends = {
         str(config[section].get("backend", "hf")).lower()
-        for section in ("training_evaluation", "evaluation")
+        for section in ("rollout", "training_evaluation", "evaluation")
         if section in config
     }
     software = {"torch": torch.__version__}
     if "vllm" in requested_backends:
         try:
-            software["vllm"] = version("vllm")
+            vllm_version = version("vllm")
         except PackageNotFoundError as error:
             raise RuntimeError(
-                "vLLM evaluation is enabled but vllm is not installed; run "
+                "vLLM rollout/evaluation is enabled but vllm is not installed; run "
                 "python -m pip install -r requirements.txt inside the active venv"
             ) from error
+        if not Version("0.17.1") <= Version(vllm_version) < Version("0.18"):
+            raise RuntimeError(
+                f"This project requires vLLM >=0.17.1,<0.18 for CUDA-IPC "
+                f"rollout; found {vllm_version}. Reinstall requirements.txt"
+            )
+        software["vllm"] = vllm_version
     report = {
         "status": "passed",
         "gpu": gpus,

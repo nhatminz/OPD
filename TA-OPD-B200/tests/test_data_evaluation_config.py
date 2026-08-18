@@ -80,6 +80,9 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertIsNone(base["training_evaluation"]["limit"])
         self.assertEqual(base["evaluation"]["backend"], "vllm")
         self.assertIsNone(base["evaluation"]["limit"])
+        self.assertEqual(base["rollout"]["backend"], "vllm")
+        self.assertEqual(base["rollout"]["batch_size"], 64)
+        self.assertEqual(base["training"]["micro_batch_size"], 64)
         for section in (
             "models",
             "data",

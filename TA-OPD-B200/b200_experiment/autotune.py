@@ -117,6 +117,8 @@ def run_batch_autotune(
                 "logging.selected_tokens_enabled=false",
                 "--set",
                 "training_evaluation.enabled=false",
+                "--set",
+                "rollout.backend=hf",
             ]
             completed = subprocess.run(command, cwd=repo_root, check=False)
             method_result: dict[str, Any] = {

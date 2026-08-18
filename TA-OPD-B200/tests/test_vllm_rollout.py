@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import torch
+
+from b200_experiment.vllm_rollout import (
+    VLLMRolloutEngine,
+    rollout_batch_from_token_ids,
+)
+
+
+def _config(max_model_len: int = 1024):
+    return {
+        "models": {
+            "student_path": "/workspace/storage-shared/models/Qwen3-1.7B",
+            "dtype": "bfloat16",
+        },
+        "data": {"max_prompt_tokens": 512},
+        "rollout": {
+            "batch_size": 64,
+            "max_new_tokens": 256,
+            "vllm": {
+                "gpu_memory_utilization": 0.25,
+                "max_num_seqs": 64,
+                "max_model_len": max_model_len,
+                "max_concurrent_requests": 64,
+                "enable_prefix_caching": True,
+            },
+        },
+    }
+
+
+class VLLMRolloutTests(unittest.TestCase):
+    def test_token_ids_preserve_left_padded_prompt_and_response_mask(self):
+        prompt_ids = torch.tensor([[0, 11, 12], [21, 22, 23]])
+        prompt_mask = torch.tensor([[0, 1, 1], [1, 1, 1]])
+        rollout = rollout_batch_from_token_ids(
+            prompt_ids,
+            prompt_mask,
+            [[31, 32], [41]],
+            pad_token_id=0,
+        )
+        self.assertEqual(rollout.prompt_width, 3)
+        self.assertTrue(
+            torch.equal(
+                rollout.input_ids,
+                torch.tensor([[0, 11, 12, 31, 32], [21, 22, 23, 41, 0]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                rollout.attention_mask,
+                torch.tensor([[0, 1, 1, 1, 1], [1, 1, 1, 1, 0]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                rollout.valid_mask,
+                torch.tensor([[True, True], [True, False]]),
+            )
+        )
+        self.assertEqual(rollout.rollout_log_probs.dtype, torch.float32)
+        self.assertEqual(float(rollout.rollout_log_probs.sum()), 0.0)
+
+    def test_server_command_enables_ipc_dummy_load_and_sleep(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(_config(), Path(temporary))
+            with patch(
+                "b200_experiment.vllm_rollout.shutil.which",
+                return_value="/venv/bin/vllm",
+            ):
+                command = engine._server_command()
+            engine.close()
+        joined = " ".join(command)
+        self.assertEqual(command[:3], ["/venv/bin/vllm", "serve", command[2]])
+        self.assertIn("--weight-transfer-config", command)
+        self.assertIn('{"backend": "ipc"}', command)
+        self.assertIn("--load-format dummy", joined)
+        self.assertIn("--enable-sleep-mode", command)
+        self.assertIn("--enforce-eager", command)
+        self.assertIn("--enable-prefix-caching", command)
+        self.assertIn("--gpu-memory-utilization 0.25", joined)
+
+    def test_server_rejects_context_smaller_than_prompt_plus_response(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(_config(max_model_len=767), Path(temporary))
+            with patch(
+                "b200_experiment.vllm_rollout.shutil.which",
+                return_value="/venv/bin/vllm",
+            ):
+                with self.assertRaisesRegex(ValueError, "prompt\\+response"):
+                    engine._server_command()
+            engine.close()
+
+    def test_colocated_memory_utilization_must_be_numeric(self):
+        config = _config()
+        config["rollout"]["vllm"]["gpu_memory_utilization"] = "auto"
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(config, Path(temporary))
+            with patch(
+                "b200_experiment.vllm_rollout.shutil.which",
+                return_value="/venv/bin/vllm",
+            ):
+                with self.assertRaisesRegex(ValueError, "must be a number"):
+                    engine._server_command()
+            engine.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

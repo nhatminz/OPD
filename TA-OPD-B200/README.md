@@ -28,7 +28,7 @@ Loader đọc toàn bộ split `all` (17k); nó không cộng thêm các mirror 
 Các row được shuffle xác định theo từng epoch và không pad/lặp batch cuối. Khi
 `training.max_steps: null`, một epoch đi qua toàn bộ dataset đúng một lần.
 
-## Cài đặt và smoke/autotune bắt buộc
+## Cài đặt và smoke/preflight bắt buộc
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
@@ -40,10 +40,13 @@ python -m pip install -r requirements.txt
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 ```
 
-`requirements.txt` đã chứa cả PyTorch/Transformers, thư viện đọc parquet, plotting, `math-verify`
-và `vllm`; venv mới không cần cài thêm package thủ công.
+`requirements.txt` đã chứa cả PyTorch/Transformers, thư viện đọc parquet, plotting, `math-verify`,
+`requests` và vLLM `0.17.x`; venv mới không cần cài thêm package thủ công. Version vLLM được giữ ở
+`>=0.17.1,<0.18` vì training dùng trực tiếp API CUDA-IPC weight transfer và sleep mode của dòng này.
 
-Không có batch size “cuối cùng” được đoán trước trên máy phát triển. Smoke test thực hiện:
+Batch train là hyperparameter cố định, mặc định **64**, được khai báo bằng `TRAIN_BATCH_SIZE` ngay đầu
+`scripts/train_all_b200.sh`. Cùng một giá trị được áp vào rollout batch và micro-batch của TA/RAC,
+nên gradient accumulation luôn bằng 1. Smoke test mặc định thực hiện:
 
 <!-- B200_AUTOTUNE_RESULT_START -->
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
@@ -53,33 +56,33 @@ Không có batch size “cuối cùng” được đoán trước trên máy ph�
 2. xác minh đúng B200, tokenizer/vocabulary và các model path;
 3. đọc toàn bộ DAPO và ghi số dòng/schema;
 4. đọc đúng AIME24 parquet và AIME25 `test.jsonl`, tự suy ra schema rồi lưu ba ví dụ/ground truth;
-5. binary-search danh sách batch `[16,32,64,96,128,160,192]` bằng một optimizer step TA và RAC cho mỗi
-   candidate được thử;
-6. chỉ nhận batch khi loss hữu hạn, rollout hash giống nhau, số token chọn bằng nhau và peak reserved
-   memory không vượt 90% VRAM.
+5. xác minh package vLLM đã được cài trong đúng venv;
+6. ghi báo cáo preflight nhưng không khởi chạy full training.
 
-Mặc định có tối đa ba candidate, tức tối đa ba bước TA và ba bước RAC. Có thể đổi phạm vi hợp lý:
+Kết quả bắt buộc được lưu ở `results/preflight.json`. Full training chỉ cần preflight này, không yêu
+cầu generated autotune config. Đổi batch trực tiếp trong bash hoặc bằng biến môi trường:
 
 ```bash
-BATCH_CANDIDATES="16 32 64 96 128 160 192" bash scripts/smoke_test_b200.sh
+TRAIN_BATCH_SIZE=32 CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
 ```
 
-Kết quả được lưu vào:
+Autotune cũ vẫn có thể bật chủ động nếu muốn tìm batch lớn nhất cùng chạy được cho TA và RAC:
 
-```text
-results/preflight.json
-outputs/autotune/batch_autotune.json
-configs/qwen3_b200_autotuned.yaml
-B200_VALIDATION.md
+```bash
+USE_BATCH_AUTOTUNE=true \
+  BATCH_CANDIDATES="16 32 64 96 128 160 192" \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
+
+USE_BATCH_AUTOTUNE=true CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
 ```
 
-Hai script full training từ chối chạy nếu preflight/config autotune chưa tồn tại hoặc không hợp lệ.
-Smoke test không tự khởi chạy full training và luôn tắt periodic evaluation trong các bước dò batch.
+Chế độ tùy chọn này mới tạo `outputs/autotune/batch_autotune.json`,
+`configs/qwen3_b200_autotuned.yaml` và `B200_VALIDATION.md`. Smoke test không tự khởi chạy full train.
 
 ## Training
 
 Config mặc định train đúng **1 epoch**. Vì `training.max_steps: null`, số optimizer step thực tế là
-`ceil(17.398 / batch_size_autotuned)`. Ví dụ batch 64 tạo 272 step.
+`ceil(17.398 / TRAIN_BATCH_SIZE)`. Batch mặc định 64 tạo 272 step.
 
 Chạy tuần tự cả TA và RAC rồi tự động vẽ các đường accuracy/loss:
 
@@ -88,9 +91,45 @@ cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
 ```
 
-Các tham số thường đổi (`EPOCHS`, LR, `rho`, rollout length, K/M, checkpoint interval, số lần eval và
-các giới hạn memory/concurrency của vLLM) nằm trong block `BASIC PARAMETERS: EDIT HERE` ngay đầu
-`scripts/train_all_b200.sh`. Có thể sửa trực tiếp block đó hoặc override bằng biến môi trường.
+Các tham số thường đổi (`TRAIN_BATCH_SIZE`, `EPOCHS`, LR, `rho`, rollout length, rollout backend,
+K/M, checkpoint interval, số lần eval và các giới hạn memory/concurrency của vLLM) nằm trong block
+`BASIC PARAMETERS: EDIT HERE` ngay đầu `scripts/train_all_b200.sh`. Có thể sửa trực tiếp block đó
+hoặc override bằng biến môi trường.
+
+### vLLM rollout trong lúc train
+
+`ROLLOUT_BACKEND=vllm` là mặc định. Mỗi run giữ một vLLM server local duy nhất thay vì khởi tạo lại
+engine ở mỗi step. Server được tạo bằng dummy load trước khi nạp student/teacher; trước **từng**
+rollout, trainer thực hiện theo thứ tự:
+
+```text
+wake weights -> CUDA-IPC sync student hiện tại -> wake KV cache -> vLLM generate
+-> sleep level 2 -> HF student/teacher scoring -> TA/RAC selector -> backward/update
+```
+
+Như vậy rollout luôn dùng đúng weights student ở đầu optimizer step, không phải checkpoint cũ.
+Level-2 sleep loại bỏ cả weights lẫn KV cache phía vLLM trong lúc scoring/backward để nhường VRAM;
+step sau mới cấp phát lại. Các request trong một batch được gửi đồng thời để scheduler vLLM dynamic
+batching, và tqdm hiển thị một thanh `vLLM rollout` theo số sample. Student log-prob dùng trong
+PPO-clipped OPD loss vẫn được HF chấm lại trên chính rollout đó, nên objective TA/RAC không đổi.
+
+Các knob rollout nằm ngay đầu bash:
+
+```bash
+ROLLOUT_BACKEND=vllm
+ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.25
+ROLLOUT_VLLM_MAX_NUM_SEQS=64
+ROLLOUT_VLLM_MAX_MODEL_LEN=1024
+ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS=64
+ROLLOUT_VLLM_WAKE_HEADROOM_GIB=2
+```
+
+`gpu_memory_utilization=0.25` là phần VRAM dành cho engine đồng vị trí khi nó đang generate, không
+phải giới hạn số sample. Trên B200 180 GB giá trị này dành khoảng 45 GB cho weights/KV scheduler;
+student, teacher và optimizer vẫn cùng resident. Nếu cần debug hoặc environment chưa hỗ trợ IPC,
+fallback không đổi objective bằng `ROLLOUT_BACKEND=hf bash scripts/train_all_b200.sh`.
+Trainer chỉ gọi `torch.cuda.empty_cache()` khi VRAM thật sự còn trống không đủ để wake engine cộng
+thêm headroom nói trên; bình thường nó giữ CUDA cache để tránh mất tốc độ ở mọi step.
 
 Hoặc chạy TA-OPD riêng:
 
@@ -106,7 +145,7 @@ cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
 ```
 
-Hai wrapper dùng cùng generated batch/micro-batch, seed, full DAPO order, epoch, LR, optimizer,
+Hai wrapper dùng cùng fixed batch/micro-batch, seed, full DAPO order, epoch, LR, optimizer,
 rollout, K, rho và OPD objective. Những override chung nên truyền giống nhau cho cả hai, ví dụ:
 
 ```bash
@@ -152,13 +191,14 @@ fallback về evaluator Transformers bằng `TRAIN_EVAL_BACKEND=hf` (`TRAIN_EVAL
 cho backend này). Tắt bằng `TRAIN_EVAL_ENABLED=false`. Không nên dùng giá trị khác nhau giữa TA/RAC.
 
 Config dùng bf16, FlashAttention 2 khi environment hỗ trợ và tự fallback sang SDPA, fused AdamW,
-full-parameter Qwen3-1.7B training, không gradient accumulation sau autotune (`micro_batch=batch`).
+full-parameter Qwen3-1.7B training, không gradient accumulation (`micro_batch=batch`).
 Teacher luôn frozen. RAC dùng exact full-vocabulary `Delta`, batched top-M branches, KV-cache reuse và
 mọi counterfactual probe nằm trong `torch.inference_mode()`.
 
 Mọi lệnh train TA/RAC đều có tqdm cho setup và optimizer step, kèm stage hiện tại, loss, số token
-được chọn, thời gian selector và VRAM. Mọi lệnh eval đều có tqdm theo sample trong lúc generate và
-chấm đáp án; vLLM vẫn gom cả ba benchmark trong một lần generate để terminal không bị tràn log.
+được chọn, thời gian selector và VRAM; rollout vLLM có thêm một thanh sample lồng bên trong. Mọi lệnh
+eval đều có tqdm theo sample trong lúc generate và chấm đáp án; vLLM vẫn gom cả ba benchmark trong
+một lần generate để terminal không bị tràn log.
 
 ## Logs
 
@@ -166,17 +206,20 @@ Mỗi run tạo:
 
 ```text
 outputs/ta_opd/metrics.jsonl
+outputs/ta_opd/vllm_rollout_server.log
 outputs/ta_opd/selector_scores/selected_steps_*.jsonl.gz
 outputs/ta_opd/eval_history.jsonl
 outputs/ta_opd/training_eval/step-*/summary.json
 outputs/rac_opd/metrics.jsonl
+outputs/rac_opd/vllm_rollout_server.log
 outputs/rac_opd/selector_scores/selected_steps_*.jsonl.gz
 outputs/rac_opd/eval_history.jsonl
 outputs/rac_opd/training_eval/step-*/summary.json
 ```
 
-`metrics.jsonl` chứa loss, selector/RAC counterfactual/step time, tokens/s, peak allocated/reserved
-GPU memory, selected fraction và rollout hash theo step. File gzip chỉ chứa token đã chọn và được ghi
+`metrics.jsonl` chứa loss, rollout backend, thời gian CUDA-IPC sync/vLLM generation/sleep,
+selector/RAC counterfactual/step time, tokens/s, peak allocated/reserved GPU memory, selected fraction
+và rollout hash theo step. File gzip chỉ chứa token đã chọn và được ghi
 tăng dần theo chunk 50 step. TA lưu `D,C,D_norm,C_norm,s_TA`; RAC lưu `Delta,A,F,B,s_RAC`, kèm
 sample ID, dataset index, response position, token ID và token text.
 
