@@ -67,11 +67,21 @@ B200_VALIDATION.md
 ```
 
 Hai script full training từ chối chạy nếu preflight/config autotune chưa tồn tại hoặc không hợp lệ.
-Smoke test không tự khởi chạy full training.
+Smoke test không tự khởi chạy full training và luôn tắt periodic evaluation trong các bước dò batch.
 
 ## Training
 
-TA-OPD:
+Config mặc định train đúng **1 epoch**. Vì `training.max_steps: null`, số optimizer step thực tế là
+`ceil(17.398 / batch_size_autotuned)`. Ví dụ batch 64 tạo 272 step.
+
+Chạy tuần tự cả TA và RAC rồi tự động vẽ các đường accuracy/loss:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
+```
+
+Hoặc chạy TA-OPD riêng:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
@@ -95,6 +105,31 @@ EPOCHS=2 LEARNING_RATE=1e-5 RHO=0.10 MAX_NEW_TOKENS=256 \
   bash scripts/train_rac_b200.sh
 ```
 
+### Evaluation trong lúc train
+
+Student được đánh giá trực tiếp trong GPU, không reload checkpoint, tại:
+
+```text
+step 0 (Base Qwen3-1.7B chưa update)
+mỗi 100 optimizer step
+step cuối của epoch, kể cả khi không chia hết cho 100
+```
+
+Với ví dụ batch 64/272 step, lịch là `0, 100, 200, 272`. Mỗi mốc chạy đủ MATH-500, AIME24 và
+AIME25 với cùng greedy evaluation (`temperature=0`, `max_new_tokens=2048`). Eval bảo toàn model
+train/eval mode, `use_cache` và toàn bộ CPU/CUDA RNG state, nên không làm lệch rollout tiếp theo.
+Thời gian eval được ghi riêng, không cộng vào training step time.
+
+Có thể đổi khoảng cách mà vẫn giữ giống nhau cho TA/RAC:
+
+```bash
+TRAIN_EVAL_INTERVAL=100 TRAIN_EVAL_BATCH_SIZE=16 \
+  bash scripts/train_all_b200.sh
+```
+
+Tắt khi cần ablation nhanh bằng `TRAIN_EVAL_ENABLED=false`. Không nên dùng hai giá trị khác nhau giữa
+TA và RAC.
+
 Config dùng bf16, FlashAttention 2 khi environment hỗ trợ và tự fallback sang SDPA, fused AdamW,
 full-parameter Qwen3-1.7B training, không gradient accumulation sau autotune (`micro_batch=batch`).
 Teacher luôn frozen. RAC dùng exact full-vocabulary `Delta`, batched top-M branches, KV-cache reuse và
@@ -107,14 +142,31 @@ Mỗi run tạo:
 ```text
 outputs/ta_opd/metrics.jsonl
 outputs/ta_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/ta_opd/eval_history.jsonl
+outputs/ta_opd/training_eval/step-*/summary.json
 outputs/rac_opd/metrics.jsonl
 outputs/rac_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/rac_opd/eval_history.jsonl
+outputs/rac_opd/training_eval/step-*/summary.json
 ```
 
 `metrics.jsonl` chứa loss, selector/RAC counterfactual/step time, tokens/s, peak allocated/reserved
 GPU memory, selected fraction và rollout hash theo step. File gzip chỉ chứa token đã chọn và được ghi
 tăng dần theo chunk 50 step. TA lưu `D,C,D_norm,C_norm,s_TA`; RAC lưu `Delta,A,F,B,s_RAC`, kèm
 sample ID, dataset index, response position, token ID và token text.
+
+Khi run thứ hai hoàn tất, training wrapper tự đọc hai `eval_history.jsonl` và sinh:
+
+```text
+results/training_eval_history.csv
+results/training_eval_history.json
+results/plots/accuracy_over_steps.png
+results/plots/loss_comparison.png
+```
+
+`accuracy_over_steps.png` có ba subplot MATH-500/AIME24/AIME25, đường TA và RAC theo optimizer step,
+và đường ngang Base Qwen3-1.7B lấy từ step 0. Có thể vẽ lại thủ công bằng
+`bash scripts/plot_training_progress.sh`.
 
 ## Evaluation và plots
 
@@ -141,6 +193,7 @@ results/comparison.csv
 results/comparison.json
 results/eval/{base,ta_opd,rac}/*_predictions.jsonl.gz
 results/plots/accuracy_comparison.png
+results/plots/accuracy_over_steps.png
 results/plots/loss_comparison.png
 ```
 

@@ -61,8 +61,26 @@ build_training_args() {
     --set "rollout.max_new_tokens=${MAX_NEW_TOKENS:-256}"
     --set "token_budget.rho=${RHO:-0.10}"
     --set "selector.top_k=${TOP_K:-16}"
+    --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
+    --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-100}"
+    --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-16}"
+    --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-2048}"
   )
   if [[ -n "${MAX_STEPS:-}" ]]; then
     COMMON_TRAIN_ARGS+=(--set "training.max_steps=${MAX_STEPS}")
+  fi
+}
+
+plot_training_progress_if_ready() {
+  local ta_output="$1"
+  local rac_output="$2"
+  if [[ -f "${ta_output}/eval_history.jsonl" && -f "${rac_output}/eval_history.jsonl" ]]; then
+    "${PYTHON_BIN}" -m b200_experiment.cli plot-training-progress \
+      --results "${RESULTS_DIR:-${REPO_DIR}/results}" \
+      --ta-output "${ta_output}" \
+      --rac-output "${rac_output}" \
+      --smoothing-window "${SMOOTHING_WINDOW:-10}"
+  else
+    echo "Training-progress plot is pending until both TA and RAC histories exist."
   fi
 }

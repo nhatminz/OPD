@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from .config import save_config
 from .data import epoch_batch_indices, read_records, stable_sample_id, tokenize_prompts
 from .diagnostics import correlations, finite_or_raise, selector_summary
+from .evaluation import BENCHMARK_ORDER, evaluate_loaded_suite
 from .metadata import collect_metadata, save_metadata
 from .models import load_models
 from .scoring import (
@@ -48,6 +49,77 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=True) + "\n")
+
+
+def should_run_training_evaluation(
+    step: int, max_steps: int, settings: dict[str, Any]
+) -> bool:
+    if not bool(settings.get("enabled", False)):
+        return False
+    interval = int(settings.get("interval_steps", 100))
+    if interval <= 0:
+        raise ValueError("training_evaluation.interval_steps must be positive")
+    if step == 0:
+        return bool(settings.get("eval_at_start", True))
+    return step % interval == 0 or (
+        step == max_steps and bool(settings.get("eval_at_end", True))
+    )
+
+
+def _run_training_evaluation(
+    model,
+    tokenizer,
+    method: str,
+    step: int,
+    max_steps: int,
+    config: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    settings = config.get("training_evaluation", {})
+    eval_root = output_dir / str(settings.get("output_subdir", "training_eval"))
+    step_dir = eval_root / f"step-{step:06d}"
+    runtime_settings = {
+        "batch_size": int(
+            settings.get("batch_size", config["evaluation"].get("batch_size", 16))
+        ),
+        "max_new_tokens": int(
+            settings.get(
+                "max_new_tokens", config["evaluation"].get("max_new_tokens", 2048)
+            )
+        ),
+        "limit": settings.get("limit", config["evaluation"].get("limit")),
+        "benchmark_names": settings.get("benchmark_names", list(BENCHMARK_ORDER)),
+    }
+    started = time.perf_counter()
+    suite = evaluate_loaded_suite(
+        model,
+        tokenizer,
+        "Base student" if step == 0 else f"{method.upper()}-OPD step {step}",
+        config,
+        step_dir,
+        runtime_settings=runtime_settings,
+    )
+    torch.cuda.empty_cache()
+    elapsed = time.perf_counter() - started
+    history_entry = {
+        "step": step,
+        "max_steps": max_steps,
+        "method": method,
+        "model_role": "base_student" if step == 0 else method,
+        "evaluation_time": elapsed,
+        "benchmarks": {
+            name: {
+                "correct": result["correct"],
+                "total": result["total"],
+                "accuracy": result["accuracy"],
+            }
+            for name, result in suite["benchmarks"].items()
+        },
+        "parameters": suite["parameters"],
+        "details": str((step_dir / "summary.json").resolve()),
+    }
+    _append_jsonl(output_dir / "eval_history.jsonl", history_entry)
+    return history_entry
 
 
 def _make_optimizer(parameters, training: dict[str, Any]):
@@ -251,6 +323,13 @@ def run_training(
         chunk_steps=int(config.get("logging", {}).get("selector_chunk_steps", 50)),
         enabled=bool(config.get("logging", {}).get("selected_tokens_enabled", True)),
     )
+    training_eval_settings = config.get("training_evaluation", {})
+    initial_evaluation = None
+    if should_run_training_evaluation(0, max_steps, training_eval_settings):
+        tqdm.write("Evaluating the untouched base student at optimizer step 0...")
+        initial_evaluation = _run_training_evaluation(
+            student, tokenizer, method, 0, max_steps, config, output_dir
+        )
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
         range(max_steps),
@@ -444,6 +523,19 @@ def run_training(
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
         }
+        if should_run_training_evaluation(step, max_steps, training_eval_settings):
+            progress.set_postfix_str("stage=evaluation", refresh=True)
+            periodic_evaluation = _run_training_evaluation(
+                student, tokenizer, method, step, max_steps, config, output_dir
+            )
+            final_metrics["periodic_evaluation"] = {
+                "evaluation_time": periodic_evaluation["evaluation_time"],
+                "benchmarks": periodic_evaluation["benchmarks"],
+                "details": periodic_evaluation["details"],
+            }
+            final_metrics["wall_clock_step_plus_eval_time"] = (
+                wall_time + periodic_evaluation["evaluation_time"]
+            )
         _append_jsonl(metrics_path, final_metrics)
         progress.set_postfix(
             loss=f"{train_metrics['loss']:.4f}",
@@ -467,6 +559,10 @@ def run_training(
         "student_path": model_metadata["student_path"],
         "teacher_path": model_metadata["teacher_path"],
         "selector_score_dir": str((output_dir / "selector_scores").resolve()),
+        "evaluation_history": str((output_dir / "eval_history.jsonl").resolve())
+        if bool(training_eval_settings.get("enabled", False))
+        else None,
+        "initial_evaluation": initial_evaluation,
     }
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)

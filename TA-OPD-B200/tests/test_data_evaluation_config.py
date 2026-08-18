@@ -82,6 +82,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
             "selector",
             "token_budget",
             "training",
+            "training_evaluation",
         ):
             self.assertEqual(ta[section], rac[section], section)
 

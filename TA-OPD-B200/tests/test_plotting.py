@@ -40,10 +40,31 @@ class PlottingTests(unittest.TestCase):
                         handle.write(
                             json.dumps({"step": step, "loss": 1.0 / step}) + "\n"
                         )
+                with (output / "eval_history.jsonl").open(
+                    "w", encoding="utf-8"
+                ) as handle:
+                    for step in (0, 100):
+                        accuracy = (
+                            0.1 if step == 0 else (0.2 if method == "ta" else 0.3)
+                        )
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "step": step,
+                                    "benchmarks": {
+                                        name: {"accuracy": accuracy}
+                                        for name in ("MATH-500", "AIME24", "AIME25")
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
                 outputs.append(output)
             paths = plot_results(results, outputs[0], outputs[1], smoothing_window=2)
             self.assertTrue(Path(paths["accuracy"]).is_file())
             self.assertTrue(Path(paths["loss"]).is_file())
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+            self.assertTrue(Path(paths["history_csv"]).is_file())
 
 
 if __name__ == "__main__":

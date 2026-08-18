@@ -69,6 +69,19 @@ logging:
   selected_tokens_enabled: true
   selector_chunk_steps: 50
 
+# Evaluation uses the in-memory student, preserves RNG/model training state,
+# and runs after optimizer updates at 100-step intervals plus the final step.
+training_evaluation:
+  enabled: true
+  interval_steps: 100
+  eval_at_start: true
+  eval_at_end: true
+  benchmark_names: [MATH-500, AIME24, AIME25]
+  batch_size: 16
+  max_new_tokens: 2048
+  limit: null
+  output_subdir: training_eval
+
 autotune:
   # Seven candidates make binary search exactly <=3 probes per method. The
   # upper range is intentional for 180+ GiB B200; the 90% guard rejects it if

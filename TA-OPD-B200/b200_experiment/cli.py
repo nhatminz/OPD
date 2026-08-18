@@ -7,7 +7,7 @@ import sys
 from .autotune import run_batch_autotune
 from .config import apply_overrides, load_with_overlays
 from .evaluation import aggregate_evaluations, evaluate_suite
-from .plotting import plot_results
+from .plotting import plot_results, plot_training_progress
 from .preflight import run_preflight
 from .trainer import run_training
 
@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--ta-output", required=True)
     plot.add_argument("--rac-output", required=True)
     plot.add_argument("--smoothing-window", type=int, default=10)
+
+    progress_plot = commands.add_parser("plot-training-progress")
+    progress_plot.add_argument("--results", required=True)
+    progress_plot.add_argument("--ta-output", required=True)
+    progress_plot.add_argument("--rac-output", required=True)
+    progress_plot.add_argument("--smoothing-window", type=int, default=10)
     return parser
 
 
@@ -95,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "plot":
         result = plot_results(
+            args.results, args.ta_output, args.rac_output, args.smoothing_window
+        )
+    elif args.command == "plot-training-progress":
+        result = plot_training_progress(
             args.results, args.ta_output, args.rac_output, args.smoothing_window
         )
     else:
