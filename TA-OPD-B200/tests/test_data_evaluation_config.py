@@ -75,6 +75,9 @@ class DataEvaluationConfigTests(unittest.TestCase):
             base["evaluation"]["benchmarks"]["AIME25"]["path"],
             "/workspace/storage-shared/nlp/minhpn19/data/eval/aime25/test.jsonl",
         )
+        self.assertEqual(base["training_evaluation"]["target_evaluations"], 16)
+        self.assertEqual(base["training_evaluation"]["backend"], "vllm")
+        self.assertEqual(base["evaluation"]["backend"], "vllm")
         for section in (
             "models",
             "data",

@@ -10,3 +10,4 @@ matplotlib>=3.8
 numpy>=1.26
 math-verify>=0.8
 safetensors>=0.4
+vllm>=0.10.0

@@ -8,6 +8,11 @@ cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${BASE_CONFIG}" --name "Base" --model "${MODEL_PATH}" \
   --output "${REPO_DIR}/results/eval/base" \
+  --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \
   --set "evaluation.batch_size=${EVAL_BATCH_SIZE:-16}" \
   --set "evaluation.max_new_tokens=${EVAL_MAX_NEW_TOKENS:-2048}" \
+  --set "evaluation.vllm.tensor_parallel_size=${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}" \
+  --set "evaluation.vllm.gpu_memory_utilization=${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-0.80}" \
+  --set "evaluation.vllm.max_num_seqs=${EVAL_VLLM_MAX_NUM_SEQS:-128}" \
+  --set "evaluation.vllm.max_model_len=${EVAL_VLLM_MAX_MODEL_LEN:-4096}" \
   --set "evaluation.limit=${EVAL_LIMIT:-null}" "$@"

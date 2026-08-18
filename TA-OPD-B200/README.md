@@ -32,9 +32,16 @@ Các row được shuffle xác định theo từng epoch và không pad/lặp ba
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
-python3 -m pip install -r requirements.txt
+# Python 3.10+; Python 3.11 is recommended.
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 ```
+
+`requirements.txt` đã chứa cả PyTorch/Transformers, thư viện đọc parquet, plotting, `math-verify`
+và `vllm`; venv mới không cần cài thêm package thủ công.
 
 Không có batch size “cuối cùng” được đoán trước trên máy phát triển. Smoke test thực hiện:
 
@@ -81,6 +88,10 @@ cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
 ```
 
+Các tham số thường đổi (`EPOCHS`, LR, `rho`, rollout length, K/M, checkpoint interval, số lần eval và
+các giới hạn memory/concurrency của vLLM) nằm trong block `BASIC PARAMETERS: EDIT HERE` ngay đầu
+`scripts/train_all_b200.sh`. Có thể sửa trực tiếp block đó hoặc override bằng biến môi trường.
+
 Hoặc chạy TA-OPD riêng:
 
 ```bash
@@ -107,28 +118,32 @@ EPOCHS=2 LEARNING_RATE=1e-5 RHO=0.10 MAX_NEW_TOKENS=256 \
 
 ### Evaluation trong lúc train
 
-Student được đánh giá trực tiếp trong GPU, không reload checkpoint, tại:
+Mặc định mỗi run có **16 lần eval**, được trải đều sau khi code biết `max_steps` thực tế:
 
 ```text
 step 0 (Base Qwen3-1.7B chưa update)
-mỗi 100 optimizer step
-step cuối của epoch, kể cả khi không chia hết cho 100
+14 mốc gần cách đều trong quá trình train
+step cuối của epoch
 ```
 
-Với ví dụ batch 64/272 step, lịch là `0, 100, 200, 272`. Mỗi mốc chạy đủ MATH-500, AIME24 và
-AIME25 với cùng greedy evaluation (`temperature=0`, `max_new_tokens=2048`). Eval bảo toàn model
-train/eval mode, `use_cache` và toàn bộ CPU/CUDA RNG state, nên không làm lệch rollout tiếp theo.
-Thời gian eval được ghi riêng, không cộng vào training step time.
+Với ví dụ batch 64/272 step, lịch gồm đúng 16 mốc từ `0` đến `272`, gap 18–19 step. Mỗi mốc chạy đủ
+MATH-500, AIME24 và AIME25 bằng greedy decoding (`temperature=0`, `max_new_tokens=2048`). Backend
+mặc định là vLLM: ba benchmark được gom vào **một** lệnh generate/một thanh tiến trình. Step 0 đọc
+base model; step có checkpoint tái sử dụng checkpoint; mốc còn lại lưu một snapshot tạm của student,
+chạy evaluator trong subprocess rồi xóa snapshot. Cách này trả toàn bộ engine/KV-cache cho GPU trước
+khi train tiếp và không làm thay đổi model/optimizer/RNG của process training. Thời gian eval được ghi
+riêng, không cộng vào training step time.
 
-Có thể đổi khoảng cách mà vẫn giữ giống nhau cho TA/RAC:
+Có thể đổi số lần mà vẫn giữ giống nhau cho TA/RAC:
 
 ```bash
-TRAIN_EVAL_INTERVAL=100 TRAIN_EVAL_BATCH_SIZE=16 \
+TRAIN_EVAL_TARGET=16 TRAIN_EVAL_BACKEND=vllm \
   bash scripts/train_all_b200.sh
 ```
 
-Tắt khi cần ablation nhanh bằng `TRAIN_EVAL_ENABLED=false`. Không nên dùng hai giá trị khác nhau giữa
-TA và RAC.
+Nếu cần lịch cố định, đặt `TRAIN_EVAL_INTERVAL=100`; biến này ưu tiên hơn `TRAIN_EVAL_TARGET`. Có thể
+fallback về evaluator Transformers bằng `TRAIN_EVAL_BACKEND=hf` (`TRAIN_EVAL_BATCH_SIZE` chỉ dùng
+cho backend này). Tắt bằng `TRAIN_EVAL_ENABLED=false`. Không nên dùng giá trị khác nhau giữa TA/RAC.
 
 Config dùng bf16, FlashAttention 2 khi environment hỗ trợ và tự fallback sang SDPA, fused AdamW,
 full-parameter Qwen3-1.7B training, không gradient accumulation sau autotune (`micro_batch=batch`).
@@ -176,6 +191,9 @@ Chạy đúng ba model Base/TA/RAC trên MATH-500, AIME24 và AIME25:
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
 ```
+
+Các script eval cuối cũng dùng vLLM mặc định và một thanh tiến trình cho cả ba benchmark; dùng
+`EVAL_BACKEND=hf` nếu cần fallback.
 
 Hoặc chạy riêng:
 

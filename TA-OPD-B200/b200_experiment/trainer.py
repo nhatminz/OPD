@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,10 @@ from .config import save_config
 from .data import epoch_batch_indices, read_records, stable_sample_id, tokenize_prompts
 from .diagnostics import correlations, finite_or_raise, selector_summary
 from .evaluation import BENCHMARK_ORDER, evaluate_loaded_suite
+from .eval_schedule import (
+    should_run_training_evaluation,
+    training_evaluation_steps,
+)
 from .metadata import collect_metadata, save_metadata
 from .models import load_models
 from .scoring import (
@@ -51,19 +58,73 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=True) + "\n")
 
 
-def should_run_training_evaluation(
-    step: int, max_steps: int, settings: dict[str, Any]
-) -> bool:
-    if not bool(settings.get("enabled", False)):
-        return False
-    interval = int(settings.get("interval_steps", 100))
-    if interval <= 0:
-        raise ValueError("training_evaluation.interval_steps must be positive")
-    if step == 0:
-        return bool(settings.get("eval_at_start", True))
-    return step % interval == 0 or (
-        step == max_steps and bool(settings.get("eval_at_end", True))
+def _save_inference_snapshot(model, tokenizer, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    previous_use_cache = model.config.use_cache
+    model.config.use_cache = True
+    try:
+        model.save_pretrained(destination, safe_serialization=True)
+    finally:
+        model.config.use_cache = previous_use_cache
+    tokenizer.save_pretrained(destination)
+
+
+def _evaluate_vllm_subprocess(
+    model,
+    tokenizer,
+    model_name: str,
+    model_path: Path | None,
+    step: int,
+    config: dict[str, Any],
+    resolved_config_path: Path,
+    output_dir: Path,
+    runtime_settings: dict[str, Any],
+) -> dict[str, Any]:
+    if hasattr(model, "peft_config"):
+        raise RuntimeError(
+            "vLLM periodic evaluation currently requires full-parameter training; "
+            "set training_evaluation.backend=hf when training.use_lora=true"
+        )
+
+    temporary_snapshot: tempfile.TemporaryDirectory[str] | None = None
+    if model_path is None:
+        snapshot_root = output_dir.parent / ".snapshots"
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        temporary_snapshot = tempfile.TemporaryDirectory(
+            prefix=f"step-{step:06d}-", dir=snapshot_root
+        )
+        model_path = Path(temporary_snapshot.name)
+        _save_inference_snapshot(model, tokenizer, model_path)
+
+    repo_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["VLLM_LOGGING_LEVEL"] = environment.get("VLLM_LOGGING_LEVEL", "WARNING")
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
     )
+    command = [
+        sys.executable,
+        "-m",
+        "b200_experiment.vllm_evaluation",
+        "--config",
+        str(resolved_config_path.resolve()),
+        "--model",
+        str(model_path.resolve()),
+        "--name",
+        model_name,
+        "--output",
+        str(output_dir.resolve()),
+        "--settings-json",
+        json.dumps(runtime_settings),
+    ]
+    torch.cuda.empty_cache()
+    try:
+        subprocess.run(command, cwd=repo_root, env=environment, check=True)
+        return json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    finally:
+        if temporary_snapshot is not None:
+            temporary_snapshot.cleanup()
 
 
 def _run_training_evaluation(
@@ -74,11 +135,13 @@ def _run_training_evaluation(
     max_steps: int,
     config: dict[str, Any],
     output_dir: Path,
+    checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     settings = config.get("training_evaluation", {})
     eval_root = output_dir / str(settings.get("output_subdir", "training_eval"))
     step_dir = eval_root / f"step-{step:06d}"
     runtime_settings = {
+        "backend": str(settings.get("backend", "vllm")).lower(),
         "batch_size": int(
             settings.get("batch_size", config["evaluation"].get("batch_size", 16))
         ),
@@ -89,16 +152,39 @@ def _run_training_evaluation(
         ),
         "limit": settings.get("limit", config["evaluation"].get("limit")),
         "benchmark_names": settings.get("benchmark_names", list(BENCHMARK_ORDER)),
+        "vllm": settings.get("vllm", {}),
     }
     started = time.perf_counter()
-    suite = evaluate_loaded_suite(
-        model,
-        tokenizer,
-        "Base student" if step == 0 else f"{method.upper()}-OPD step {step}",
-        config,
-        step_dir,
-        runtime_settings=runtime_settings,
-    )
+    model_name = "Base student" if step == 0 else f"{method.upper()}-OPD step {step}"
+    backend = runtime_settings["backend"]
+    if backend == "vllm":
+        source_path = (
+            Path(config["models"]["student_path"]).resolve()
+            if step == 0
+            else checkpoint
+        )
+        suite = _evaluate_vllm_subprocess(
+            model,
+            tokenizer,
+            model_name,
+            source_path,
+            step,
+            config,
+            output_dir / "resolved_config.yaml",
+            step_dir,
+            runtime_settings,
+        )
+    elif backend == "hf":
+        suite = evaluate_loaded_suite(
+            model,
+            tokenizer,
+            model_name,
+            config,
+            step_dir,
+            runtime_settings=runtime_settings,
+        )
+    else:
+        raise ValueError("training_evaluation.backend must be 'vllm' or 'hf'")
     torch.cuda.empty_cache()
     elapsed = time.perf_counter() - started
     history_entry = {
@@ -106,6 +192,7 @@ def _run_training_evaluation(
         "max_steps": max_steps,
         "method": method,
         "model_role": "base_student" if step == 0 else method,
+        "backend": backend,
         "evaluation_time": elapsed,
         "benchmarks": {
             name: {
@@ -229,9 +316,7 @@ def _save_checkpoint(
     save_optimizer: bool,
 ):
     checkpoint = output_dir / ("final" if final else f"checkpoint-{step:06d}")
-    checkpoint.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint, safe_serialization=True)
-    tokenizer.save_pretrained(checkpoint)
+    _save_inference_snapshot(model, tokenizer, checkpoint)
     if save_optimizer:
         torch.save(
             {"step": step, "optimizer": optimizer.state_dict()},
@@ -324,6 +409,12 @@ def run_training(
         enabled=bool(config.get("logging", {}).get("selected_tokens_enabled", True)),
     )
     training_eval_settings = config.get("training_evaluation", {})
+    evaluation_steps = training_evaluation_steps(max_steps, training_eval_settings)
+    if evaluation_steps:
+        tqdm.write(
+            f"Periodic evaluation ({training_eval_settings.get('backend', 'vllm')}): "
+            + ", ".join(map(str, evaluation_steps))
+        )
     initial_evaluation = None
     if should_run_training_evaluation(0, max_steps, training_eval_settings):
         tqdm.write("Evaluating the untouched base student at optimizer step 0...")
@@ -523,10 +614,29 @@ def run_training(
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
         }
+        # Release per-step tensors before the vLLM subprocess reserves its KV cache.
+        del (
+            encoded,
+            rollout,
+            original_rollout,
+            old_student,
+            teacher_log_probs,
+            selected,
+            primary,
+            ta_output,
+            valid,
+        )
         if should_run_training_evaluation(step, max_steps, training_eval_settings):
             progress.set_postfix_str("stage=evaluation", refresh=True)
             periodic_evaluation = _run_training_evaluation(
-                student, tokenizer, method, step, max_steps, config, output_dir
+                student,
+                tokenizer,
+                method,
+                step,
+                max_steps,
+                config,
+                output_dir,
+                checkpoint=checkpoint,
             )
             final_metrics["periodic_evaluation"] = {
                 "evaluation_time": periodic_evaluation["evaluation_time"],

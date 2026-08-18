@@ -8,6 +8,7 @@ export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 export HF_HUB_DISABLE_PROGRESS_BARS=1
 export DATASETS_DISABLE_PROGRESS_BARS=1
 export TOKENIZERS_PARALLELISM=false
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
 
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
@@ -62,10 +63,21 @@ build_training_args() {
     --set "token_budget.rho=${RHO:-0.10}"
     --set "selector.top_k=${TOP_K:-16}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
-    --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-100}"
+    --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
+    --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET:-16}"
     --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-16}"
     --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-2048}"
+    --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+    --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
+    --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-128}"
+    --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-4096}"
   )
+  if [[ -n "${TRAIN_EVAL_INTERVAL:-}" ]]; then
+    COMMON_TRAIN_ARGS+=(
+      --set "training_evaluation.target_evaluations=null"
+      --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL}"
+    )
+  fi
   if [[ -n "${MAX_STEPS:-}" ]]; then
     COMMON_TRAIN_ARGS+=(--set "training.max_steps=${MAX_STEPS}")
   fi

@@ -239,6 +239,7 @@ def evaluate_loaded_suite(
         "model": model_name,
         "benchmarks": {},
         "parameters": {
+            "backend": evaluation.get("backend", "hf"),
             "batch_size": batch_size,
             "max_new_tokens": max_new_tokens,
             "limit": limit,
@@ -359,6 +360,26 @@ def evaluate_suite(
         raise ValueError(f"Model name must be one of {MODEL_ORDER}, got {model_name!r}")
     if not torch.cuda.is_available():
         raise RuntimeError("Evaluation requires CUDA")
+    evaluation = config["evaluation"]
+    backend = str(evaluation.get("backend", "hf")).lower()
+    if backend == "vllm":
+        from .vllm_evaluation import evaluate_vllm_suite
+
+        return evaluate_vllm_suite(
+            model_name,
+            model_path,
+            config,
+            output_dir,
+            {
+                "backend": "vllm",
+                "max_new_tokens": evaluation.get("max_new_tokens", 2048),
+                "limit": evaluation.get("limit"),
+                "benchmark_names": list(BENCHMARK_ORDER),
+                "vllm": evaluation.get("vllm", {}),
+            },
+        )
+    if backend != "hf":
+        raise ValueError("evaluation.backend must be 'vllm' or 'hf'")
     device = torch.device("cuda", 0)
     model, tokenizer = _load_eval_model(model_path, config, device)
     try:

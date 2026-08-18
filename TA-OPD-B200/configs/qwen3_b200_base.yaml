@@ -69,18 +69,29 @@ logging:
   selected_tokens_enabled: true
   selector_chunk_steps: 50
 
-# Evaluation uses the in-memory student, preserves RNG/model training state,
-# and runs after optimizer updates at 100-step intervals plus the final step.
+# By default, evaluation is spread evenly over the measured number of optimizer
+# steps. vLLM runs in a short-lived subprocess so its engine memory is returned
+# before training resumes. "hf" remains available as a low-dependency fallback.
 training_evaluation:
   enabled: true
-  interval_steps: 100
+  backend: vllm
+  target_evaluations: 16
+  interval_steps: null
   eval_at_start: true
   eval_at_end: true
   benchmark_names: [MATH-500, AIME24, AIME25]
+  # Used only by the Hugging Face fallback backend.
   batch_size: 16
   max_new_tokens: 2048
   limit: null
   output_subdir: training_eval
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.40
+    max_num_seqs: 128
+    max_model_len: 4096
+    enable_prefix_caching: true
+    seed: 1234
 
 autotune:
   # Seven candidates make binary search exactly <=3 probes per method. The
@@ -90,9 +101,17 @@ autotune:
   max_reserved_fraction: 0.90
 
 evaluation:
+  backend: vllm
   batch_size: 16
   max_new_tokens: 2048
   limit: null
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.80
+    max_num_seqs: 128
+    max_model_len: 4096
+    enable_prefix_caching: true
+    seed: 1234
   benchmarks:
     MATH-500:
       path: /workspace/storage-shared/nlp/minhpn19/data/eval/math500

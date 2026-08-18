@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
@@ -47,9 +48,24 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
                 "messages": messages,
             }
         )
+    requested_backends = {
+        str(config[section].get("backend", "hf")).lower()
+        for section in ("training_evaluation", "evaluation")
+        if section in config
+    }
+    software = {"torch": torch.__version__}
+    if "vllm" in requested_backends:
+        try:
+            software["vllm"] = version("vllm")
+        except PackageNotFoundError as error:
+            raise RuntimeError(
+                "vLLM evaluation is enabled but vllm is not installed; run "
+                "python -m pip install -r requirements.txt inside the active venv"
+            ) from error
     report = {
         "status": "passed",
         "gpu": gpus,
+        "software": software,
         "models": inspect_model_assets(config),
         "training_data": {
             "path": str(Path(config["data"]["path"]).resolve()),
