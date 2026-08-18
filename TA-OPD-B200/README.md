@@ -134,6 +134,12 @@ chạy evaluator trong subprocess rồi xóa snapshot. Cách này trả toàn b�
 khi train tiếp và không làm thay đổi model/optimizer/RNG của process training. Thời gian eval được ghi
 riêng, không cộng vào training step time.
 
+Periodic eval luôn có `limit=null`, tức chạy **toàn bộ sample của cả ba dataset**, không dùng subset.
+`max_num_seqs=256` chỉ là mức concurrency của scheduler, không phải số sample được eval. vLLM được
+đặt `gpu_memory_utilization=auto`: evaluator đo VRAM còn trống tại mỗi mốc rồi dùng gần như toàn bộ,
+chỉ chừa mặc định 4 GiB cho CUDA workspace. Phần VRAM student, teacher và optimizer đang giữ được
+tính trực tiếp vào lượng đã dùng, thay vì áp một giới hạn phần trăm cố định.
+
 Có thể đổi số lần mà vẫn giữ giống nhau cho TA/RAC:
 
 ```bash

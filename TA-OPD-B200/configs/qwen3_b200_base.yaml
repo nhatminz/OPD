@@ -87,8 +87,11 @@ training_evaluation:
   output_subdir: training_eval
   vllm:
     tensor_parallel_size: 1
-    gpu_memory_utilization: 0.40
-    max_num_seqs: 128
+    # Dynamically consume almost all currently-free VRAM. The training process
+    # remains resident, so using a hard-coded 1.0 would incorrectly claim it.
+    gpu_memory_utilization: auto
+    gpu_headroom_gib: 4
+    max_num_seqs: 256
     max_model_len: 4096
     enable_prefix_caching: true
     seed: 1234
@@ -107,8 +110,9 @@ evaluation:
   limit: null
   vllm:
     tensor_parallel_size: 1
-    gpu_memory_utilization: 0.80
-    max_num_seqs: 128
+    gpu_memory_utilization: auto
+    gpu_headroom_gib: 4
+    max_num_seqs: 256
     max_model_len: 4096
     enable_prefix_caching: true
     seed: 1234

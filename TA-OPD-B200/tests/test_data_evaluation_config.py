@@ -77,7 +77,9 @@ class DataEvaluationConfigTests(unittest.TestCase):
         )
         self.assertEqual(base["training_evaluation"]["target_evaluations"], 16)
         self.assertEqual(base["training_evaluation"]["backend"], "vllm")
+        self.assertIsNone(base["training_evaluation"]["limit"])
         self.assertEqual(base["evaluation"]["backend"], "vllm")
+        self.assertIsNone(base["evaluation"]["limit"])
         for section in (
             "models",
             "data",

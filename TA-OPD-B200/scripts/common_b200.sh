@@ -65,11 +65,13 @@ build_training_args() {
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
     --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET:-16}"
+    --set "training_evaluation.limit=null"
     --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-16}"
     --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-2048}"
     --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
-    --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
-    --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-128}"
+    --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
+    --set "training_evaluation.vllm.gpu_headroom_gib=${VLLM_GPU_HEADROOM_GIB:-4}"
+    --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-256}"
     --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-4096}"
   )
   if [[ -n "${TRAIN_EVAL_INTERVAL:-}" ]]; then

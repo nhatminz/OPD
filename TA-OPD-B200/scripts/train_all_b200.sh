@@ -25,8 +25,9 @@ export TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-16}"  # hf backend only
 
 # vLLM settings. For tensor parallelism, expose the same number of GPUs above.
 export VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-128}"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
+export VLLM_GPU_HEADROOM_GIB="${VLLM_GPU_HEADROOM_GIB:-4}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
 # To use a fixed interval instead, uncomment: export TRAIN_EVAL_INTERVAL=100
 # ================================================================

@@ -8,7 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from b200_experiment.vllm_evaluation import evaluate_vllm_suite
+from b200_experiment.vllm_evaluation import (
+    _resolve_gpu_memory_utilization,
+    evaluate_vllm_suite,
+)
 
 
 class _Tokenizer:
@@ -38,6 +41,17 @@ class _LLM:
 
 
 class VllmEvaluationTests(unittest.TestCase):
+    def test_auto_memory_uses_all_free_vram_except_headroom(self):
+        gib = 2**30
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.mem_get_info", return_value=(160 * gib, 180 * gib)),
+        ):
+            utilization = _resolve_gpu_memory_utilization(
+                {"gpu_memory_utilization": "auto", "gpu_headroom_gib": 4}
+            )
+        self.assertAlmostEqual(utilization, 156 / 180)
+
     def test_all_benchmarks_share_one_generate_progress_bar(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

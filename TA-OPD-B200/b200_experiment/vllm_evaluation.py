@@ -7,10 +7,34 @@ import os
 from pathlib import Path
 from typing import Any
 
+import torch
 from transformers import AutoTokenizer
 
 from .config import load_config
 from .evaluation import BENCHMARK_ORDER, _grade, load_benchmark
+
+
+def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
+    requested = vllm_settings.get("gpu_memory_utilization", "auto")
+    if str(requested).lower() != "auto":
+        utilization = float(requested)
+        if not 0.0 < utilization <= 1.0:
+            raise ValueError("vLLM gpu_memory_utilization must be in (0, 1]")
+        return utilization
+    if not torch.cuda.is_available():
+        raise RuntimeError("Automatic vLLM memory sizing requires CUDA")
+    headroom_gib = float(vllm_settings.get("gpu_headroom_gib", 4))
+    if headroom_gib < 0:
+        raise ValueError("vLLM gpu_headroom_gib must be non-negative")
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    usable_bytes = free_bytes - int(headroom_gib * 2**30)
+    if usable_bytes <= 0:
+        raise RuntimeError(
+            f"Only {free_bytes / 2**30:.1f} GiB VRAM is free, below the "
+            f"configured {headroom_gib:.1f} GiB headroom"
+        )
+    # Keep a tiny driver/workspace margin even when this is the only process.
+    return min(0.98, usable_bytes / total_bytes)
 
 
 def _prompt(tokenizer, problem: str, config: dict[str, Any]) -> str:
@@ -73,10 +97,8 @@ def evaluate_vllm_suite(
         "tokenizer": str(model_path),
         "dtype": config["models"].get("dtype", "bfloat16"),
         "tensor_parallel_size": int(vllm_settings.get("tensor_parallel_size", 1)),
-        "gpu_memory_utilization": float(
-            vllm_settings.get("gpu_memory_utilization", 0.40)
-        ),
-        "max_num_seqs": int(vllm_settings.get("max_num_seqs", 128)),
+        "gpu_memory_utilization": _resolve_gpu_memory_utilization(vllm_settings),
+        "max_num_seqs": int(vllm_settings.get("max_num_seqs", 256)),
         "enable_prefix_caching": bool(vllm_settings.get("enable_prefix_caching", True)),
         "disable_log_stats": True,
         "seed": int(vllm_settings.get("seed", 1234)),
