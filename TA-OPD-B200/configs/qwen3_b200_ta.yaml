@@ -1,0 +1,5 @@
+_base_: qwen3_b200_base.yaml
+
+experiment:
+  method: ta
+  output_dir: outputs/ta_opd

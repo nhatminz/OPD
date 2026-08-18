@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+outputs/
+results/
+configs/qwen3_b200_autotuned.yaml
+B200_VALIDATION.md

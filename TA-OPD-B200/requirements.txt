@@ -1,0 +1,12 @@
+torch>=2.6
+transformers>=4.51
+accelerate>=1.2
+peft>=0.14
+pandas>=2.0
+pyarrow>=14
+PyYAML>=6
+tqdm>=4.66
+matplotlib>=3.8
+numpy>=1.26
+math-verify>=0.8
+safetensors>=0.4
