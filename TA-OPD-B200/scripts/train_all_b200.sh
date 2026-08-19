@@ -5,26 +5,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Use the same run namespace as the independent TA/RAC wrappers.
+export RUN_NAME="${RUN_NAME:-$(date +%Y%m%d_%H%M%S)}"
 # Shared GLOBAL rollout/micro-batch for both methods. Changing the visible GPU
 # count changes only the per-GPU shard; it does not change optimizer semantics.
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 export DDP_BUCKET_CAP_MB="${DDP_BUCKET_CAP_MB:-100}"
 # Set true only when you explicitly want smoke_test_b200.sh to search candidates.
 export USE_BATCH_AUTOTUNE="${USE_BATCH_AUTOTUNE:-false}"
 export EPOCHS="${EPOCHS:-1}"
 export LEARNING_RATE="${LEARNING_RATE:-1.0e-5}"
 export RHO="${RHO:-0.10}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 # Training rollout backend. vllm syncs the live student before every batch;
 # use hf only as a compatibility/debug fallback.
 export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"  # vllm or hf
 export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
 export ROLLOUT_VLLM_MAX_NUM_SEQS="${ROLLOUT_VLLM_MAX_NUM_SEQS:-${TRAIN_BATCH_SIZE}}"
-export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-1024}"
+export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-4096}"
 export ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS="${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${TRAIN_BATCH_SIZE}}"
 export ROLLOUT_VLLM_WAKE_HEADROOM_GIB="${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
 export TOP_K="${TOP_K:-16}"
-export BRANCH_M="${BRANCH_M:-2}"
+export BRANCH_M="${BRANCH_M:-4}"
 export RAC_BRANCH_CHUNK_SIZE="${RAC_BRANCH_CHUNK_SIZE:-256}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 # Optional hard cap; leave empty to train the configured number of epochs.
@@ -49,9 +51,12 @@ export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
 
 source "${SCRIPT_DIR}/common_b200.sh"
 
-TA_RUN_OUTPUT="${TA_OUTPUT_DIR:-${REPO_DIR}/outputs/ta_opd}"
-RAC_RUN_OUTPUT="${RAC_OUTPUT_DIR:-${REPO_DIR}/outputs/rac_opd}"
-OUTPUT_DIR="${TA_RUN_OUTPUT}" bash "${SCRIPT_DIR}/train_ta_b200.sh"
-OUTPUT_DIR="${RAC_RUN_OUTPUT}" bash "${SCRIPT_DIR}/train_rac_b200.sh"
-TA_OUTPUT_DIR="${TA_RUN_OUTPUT}" RAC_OUTPUT_DIR="${RAC_RUN_OUTPUT}" \
-  bash "${SCRIPT_DIR}/plot_training_progress.sh"
+resolve_run_paths
+OUTPUT_DIR="${TA_RUN_OUTPUT}" \
+  RESUME_FROM_CHECKPOINT="${TA_RESUME_FROM_CHECKPOINT:-}" \
+  bash "${SCRIPT_DIR}/train_ta_b200.sh"
+OUTPUT_DIR="${RAC_RUN_OUTPUT}" \
+  RESUME_FROM_CHECKPOINT="${RAC_RESUME_FROM_CHECKPOINT:-}" \
+  bash "${SCRIPT_DIR}/train_rac_b200.sh"
+echo "Both runs finished. Plot explicitly with:"
+echo "RUN_NAME=${RUN_NAME} bash scripts/plot_training_progress.sh"

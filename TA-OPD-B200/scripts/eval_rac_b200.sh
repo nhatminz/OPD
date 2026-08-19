@@ -2,12 +2,14 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
-MODEL_PATH="${RAC_CHECKPOINT:-${REPO_DIR}/outputs/rac_opd/final}"
+resolve_run_paths
+MODEL_PATH="${RAC_CHECKPOINT:-${RAC_RUN_OUTPUT}/final}"
+EVAL_OUTPUT="${RAC_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/rac}"
 require_file "${MODEL_PATH}/config.json"
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${RAC_CONFIG}" --name "RAC" --model "${MODEL_PATH}" \
-  --output "${REPO_DIR}/results/eval/rac" \
+  --output "${EVAL_OUTPUT}" \
   --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \
   --set "evaluation.batch_size=${EVAL_BATCH_SIZE:-16}" \
   --set "evaluation.max_new_tokens=${EVAL_MAX_NEW_TOKENS:-2048}" \

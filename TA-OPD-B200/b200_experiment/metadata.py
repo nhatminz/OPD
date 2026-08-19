@@ -81,9 +81,11 @@ def collect_metadata(repo_root, command_line, model_metadata, data_path, data_fi
     }
 
 
-def save_metadata(metadata: dict, output_dir: str | Path) -> None:
+def save_metadata(
+    metadata: dict, output_dir: str | Path, filename: str = "run_metadata.json"
+) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    with (output / "run_metadata.json").open("w", encoding="utf-8") as handle:
+    with (output / filename).open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
         handle.write("\n")

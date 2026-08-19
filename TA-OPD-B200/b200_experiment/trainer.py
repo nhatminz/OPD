@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -36,6 +37,12 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import load_models
+from .resume import (
+    resolve_resume_checkpoint,
+    restore_optimizer,
+    validate_append_history,
+    validate_resume_config,
+)
 from .scoring import (
     HFBranchProber,
     cuda_sync,
@@ -267,6 +274,7 @@ def _run_training_evaluation(
     max_steps: int,
     config: dict[str, Any],
     output_dir: Path,
+    resolved_config_path: Path,
     checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     settings = config.get("training_evaluation", {})
@@ -302,7 +310,7 @@ def _run_training_evaluation(
             source_path,
             step,
             config,
-            output_dir / "resolved_config.yaml",
+            resolved_config_path,
             step_dir,
             runtime_settings,
         )
@@ -495,15 +503,37 @@ def run_training(
         raise ValueError(f"Training method must be ta or rac, got {method!r}")
     seed = int(experiment.get("seed", 1234))
     seed_everything(seed)
+    resume_checkpoint = resolve_resume_checkpoint(
+        training.get("resume_from_checkpoint")
+    )
+    resume_config_validation = (
+        validate_resume_config(
+            resume_checkpoint,
+            config,
+            allow_mismatch=bool(training.get("resume_allow_config_mismatch", False)),
+        )
+        if resume_checkpoint is not None
+        else None
+    )
     output_dir = Path(experiment["output_dir"]).resolve()
     metrics_path = output_dir / "metrics.jsonl"
-    if metrics_path.exists() and not bool(
-        experiment.get("allow_existing_output", False)
+    if (
+        resume_checkpoint is None
+        and metrics_path.exists()
+        and not bool(experiment.get("allow_existing_output", False))
     ):
         raise FileExistsError(f"Refusing to append to existing run: {metrics_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_config_path = output_dir / (
+        "resolved_config.yaml"
+        if resume_checkpoint is None
+        else f"resolved_config.resume-{resume_checkpoint.name}.yaml"
+    )
     if distributed.is_main:
-        save_config(config, output_dir / "resolved_config.yaml")
+        save_config(config, resolved_config_path)
+        canonical_config = output_dir / "resolved_config.yaml"
+        if resume_checkpoint is not None and not canonical_config.exists():
+            save_config(config, canonical_config)
     distributed.barrier()
 
     rollout_backend = str(config["rollout"].get("backend", "vllm")).lower()
@@ -545,7 +575,11 @@ def run_training(
         rollout_engine.start()
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=load-models", refresh=True)
-    student, teacher, tokenizer, model_metadata = load_models(config, device)
+    model_load_config = config
+    if resume_checkpoint is not None:
+        model_load_config = copy.deepcopy(config)
+        model_load_config["models"]["student_path"] = str(resume_checkpoint)
+    student, teacher, tokenizer, model_metadata = load_models(model_load_config, device)
     training_student = student
     if distributed.enabled:
         training_student = DistributedDataParallel(
@@ -564,6 +598,21 @@ def run_training(
         )
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
+    optimizer, fused_optimizer = _make_optimizer(
+        [parameter for parameter in student.parameters() if parameter.requires_grad],
+        training,
+    )
+    resume_state = (
+        restore_optimizer(optimizer, resume_checkpoint, device)
+        if resume_checkpoint is not None
+        else None
+    )
+    resume_step = resume_state.step if resume_state is not None else 0
+    resume_history = (
+        validate_append_history(output_dir, resume_step)
+        if resume_state is not None
+        else None
+    )
     if distributed.is_main:
         metadata = collect_metadata(
             Path(__file__).resolve().parents[1],
@@ -586,11 +635,24 @@ def run_training(
             "global_ta_normalization": True,
             "global_token_budget": True,
         }
-        save_metadata(metadata, output_dir)
-    optimizer, fused_optimizer = _make_optimizer(
-        [parameter for parameter in student.parameters() if parameter.requires_grad],
-        training,
-    )
+        metadata["resume"] = (
+            {
+                "checkpoint": str(resume_state.checkpoint),
+                "optimizer_path": str(resume_state.optimizer_path),
+                "step": resume_state.step,
+                "history": resume_history,
+                "config_validation": resume_config_validation,
+                "source_world_size": "unknown_for_legacy_checkpoint",
+            }
+            if resume_state is not None
+            else None
+        )
+        metadata_filename = (
+            "run_metadata.json"
+            if resume_state is None
+            else f"run_metadata.resume-step-{resume_step:06d}.json"
+        )
+        save_metadata(metadata, output_dir, filename=metadata_filename)
     setup_progress.update(1)
     setup_progress.close()
     selector_cfg = config["selector"]
@@ -613,6 +675,12 @@ def run_training(
         if configured_max_steps is not None
         else int(training.get("epochs", 1)) * steps_per_epoch
     )
+    if resume_step >= max_steps:
+        raise ValueError(
+            f"Checkpoint is already at step {resume_step}, but configured total "
+            f"max_steps is {max_steps}. Set MAX_STEPS above {resume_step} or "
+            "increase EPOCHS. MAX_STEPS is the total target, not extra steps."
+        )
     rho = float(config["token_budget"]["rho"])
     token_logger = SelectedTokenLogger(
         output_dir,
@@ -630,24 +698,40 @@ def run_training(
             f"Periodic evaluation ({training_eval_settings.get('backend', 'vllm')}): "
             + ", ".join(map(str, evaluation_steps))
         )
+    if resume_state is not None and distributed.is_main:
+        tqdm.write(
+            f"Resuming {method.upper()}-OPD from optimizer step {resume_step}: "
+            f"{resume_state.checkpoint}"
+        )
     initial_evaluation = None
-    if should_run_training_evaluation(0, max_steps, training_eval_settings):
+    if resume_step == 0 and should_run_training_evaluation(
+        0, max_steps, training_eval_settings
+    ):
         distributed.barrier()
         if distributed.is_main:
             tqdm.write("Evaluating the untouched base student at optimizer step 0...")
             initial_evaluation = _run_training_evaluation(
-                student, tokenizer, method, 0, max_steps, config, output_dir
+                student,
+                tokenizer,
+                method,
+                0,
+                max_steps,
+                config,
+                output_dir,
+                resolved_config_path,
             )
         distributed.barrier()
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
-        range(max_steps),
+        range(resume_step, max_steps),
         desc=f"{method.upper()}-OPD B200",
         unit="step",
         dynamic_ncols=True,
         leave=True,
         disable=not distributed.is_main,
         mininterval=0.5,
+        initial=resume_step,
+        total=max_steps,
     )
     for step_index in progress:
         step, step_started = step_index + 1, time.perf_counter()
@@ -911,6 +995,10 @@ def run_training(
             "epoch": step_index // steps_per_epoch,
             "step_in_epoch": step_index % steps_per_epoch,
             "method": method,
+            "resumed_from": (
+                str(resume_state.checkpoint) if resume_state is not None else None
+            ),
+            "resume_step": resume_step,
             "batch_size": len(global_indices),
             "local_batch_size_rank0": len(global_indices) // distributed.world_size
             + int(0 < len(global_indices) % distributed.world_size),
@@ -1001,6 +1089,7 @@ def run_training(
                     max_steps,
                     config,
                     output_dir,
+                    resolved_config_path,
                     checkpoint=checkpoint,
                 )
                 final_metrics["periodic_evaluation"] = {
@@ -1036,6 +1125,10 @@ def run_training(
         "dataset_rows": len(records),
         "full_dataset": True,
         "rollout_backend": rollout_backend,
+        "resumed_from": (
+            str(resume_state.checkpoint) if resume_state is not None else None
+        ),
+        "resume_step": resume_step,
         "distributed_world_size": distributed.world_size,
         "global_batch_preserved": True,
         "vllm_rollout_server_log": str(

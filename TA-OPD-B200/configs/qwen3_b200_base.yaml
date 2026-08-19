@@ -39,8 +39,8 @@ rollout:
   # Default training rollout uses a persistent, same-GPU vLLM server. Student
   # weights are synchronized through CUDA IPC before every optimizer step.
   backend: vllm
-  batch_size: 64
-  max_new_tokens: 256
+  batch_size: 8
+  max_new_tokens: 2048
   temperature: 1.0
   top_p: 1.0
   seed: 42
@@ -48,9 +48,10 @@ rollout:
     # This is a co-located engine reservation, not an evaluation sample limit.
     # It sleeps at level 2 while HF student/teacher scoring and backward run.
     gpu_memory_utilization: 0.25
-    max_num_seqs: 64
-    max_model_len: 1024
-    max_concurrent_requests: 64
+    max_num_seqs: 8
+    # 512 prompt + 2048 generated tokens fit with ample context headroom.
+    max_model_len: 4096
+    max_concurrent_requests: 8
     # Release the trainer CUDA cache only when the sleeping engine otherwise
     # cannot wake with this safety margin; avoid empty_cache on every step.
     wake_headroom_gib: 2
@@ -61,7 +62,7 @@ rollout:
 
 selector:
   top_k: 16
-  branch_m: 2
+  branch_m: 4
   eps: 1.0e-8
   q_low: 0.05
   q_high: 0.95
@@ -77,7 +78,11 @@ token_budget:
 training:
   epochs: 1
   max_steps: null
-  micro_batch_size: 64
+  # Set through RESUME_FROM_CHECKPOINT in the bash wrappers. MAX_STEPS remains
+  # the total target step (not the number of extra steps after resume).
+  resume_from_checkpoint: null
+  resume_allow_config_mismatch: false
+  micro_batch_size: 8
   learning_rate: 1.0e-5
   adam_betas: [0.9, 0.95]
   weight_decay: 0.0

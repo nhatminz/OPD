@@ -81,8 +81,11 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(base["evaluation"]["backend"], "vllm")
         self.assertIsNone(base["evaluation"]["limit"])
         self.assertEqual(base["rollout"]["backend"], "vllm")
-        self.assertEqual(base["rollout"]["batch_size"], 64)
-        self.assertEqual(base["training"]["micro_batch_size"], 64)
+        self.assertEqual(base["rollout"]["batch_size"], 8)
+        self.assertEqual(base["training"]["micro_batch_size"], 8)
+        self.assertEqual(base["rollout"]["max_new_tokens"], 2048)
+        self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 4096)
+        self.assertEqual(base["selector"]["branch_m"], 4)
         for section in (
             "models",
             "data",

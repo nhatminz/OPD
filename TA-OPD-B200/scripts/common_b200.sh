@@ -19,6 +19,31 @@ RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/qwen3_b200_autotuned.yaml}"
 PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight.json}"
 
+resolve_run_paths() {
+  RUN_NAME="${RUN_NAME:-run01}"
+  local ta_name="${TA_RUN_NAME:-${RUN_NAME}}"
+  local rac_name="${RAC_RUN_NAME:-${RUN_NAME}}"
+  if [[ -n "${COMPARISON_NAME:-}" ]]; then
+    COMPARISON_NAME="${COMPARISON_NAME}"
+  elif [[ -n "${TA_RUN_NAME:-}" || -n "${RAC_RUN_NAME:-}" ]]; then
+    COMPARISON_NAME="${ta_name}_vs_${rac_name}"
+  else
+    COMPARISON_NAME="${RUN_NAME}"
+  fi
+  for name in "${RUN_NAME}" "${ta_name}" "${rac_name}" "${COMPARISON_NAME}"; do
+    if ! [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      echo "Run names may contain only letters, numbers, dot, underscore, and dash: ${name}" >&2
+      return 1
+    fi
+  done
+  TA_RUN_NAME="${ta_name}"
+  RAC_RUN_NAME="${rac_name}"
+  OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
+  TA_RUN_OUTPUT="${TA_OUTPUT_DIR:-${OUTPUT_ROOT}/${TA_RUN_NAME}/ta_opd}"
+  RAC_RUN_OUTPUT="${RAC_OUTPUT_DIR:-${OUTPUT_ROOT}/${RAC_RUN_NAME}/rac_opd}"
+  RUN_RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/results/${COMPARISON_NAME}}"
+}
+
 visible_gpu_count() {
   local visible="${CUDA_VISIBLE_DEVICES:-0}"
   local devices=()
@@ -92,7 +117,7 @@ if batch != autotune["rollout"]["batch_size"] or batch != autotune["training"]["
 print(f"Autotuned B200 batch size: {batch} (gradient accumulation: 1)")
 PY
   else
-    "${PYTHON_BIN}" - "${TRAIN_BATCH_SIZE:-64}" <<'PY'
+    "${PYTHON_BIN}" - "${TRAIN_BATCH_SIZE:-8}" <<'PY'
 import sys
 
 batch = int(sys.argv[1])
@@ -114,19 +139,22 @@ build_training_args() {
   local output_dir="$1"
   COMMON_TRAIN_ARGS=(
     --set "experiment.output_dir=${output_dir}"
+    --set "experiment.seed=${EXPERIMENT_SEED:-1234}"
     --set "training.epochs=${EPOCHS:-1}"
     --set "training.learning_rate=${LEARNING_RATE:-1.0e-5}"
     --set "training.save_interval=${SAVE_INTERVAL:-100}"
     --set "distributed.bucket_cap_mb=${DDP_BUCKET_CAP_MB:-100}"
     --set "rollout.backend=${ROLLOUT_BACKEND:-vllm}"
-    --set "rollout.max_new_tokens=${MAX_NEW_TOKENS:-256}"
+    --set "rollout.seed=${ROLLOUT_SEED:-42}"
+    --set "rollout.max_new_tokens=${MAX_NEW_TOKENS:-2048}"
     --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
-    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${TRAIN_BATCH_SIZE:-64}}"
-    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-1024}"
-    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${TRAIN_BATCH_SIZE:-64}}"
+    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${TRAIN_BATCH_SIZE:-8}}"
+    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-4096}"
+    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${TRAIN_BATCH_SIZE:-8}}"
     --set "rollout.vllm.wake_headroom_gib=${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
     --set "token_budget.rho=${RHO:-0.10}"
     --set "selector.top_k=${TOP_K:-16}"
+    --set "selector.branch_m=${BRANCH_M:-4}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
     --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET:-16}"
@@ -143,8 +171,8 @@ build_training_args() {
     COMMON_TRAIN_ARGS=(--overlay "${AUTOTUNE_CONFIG}" "${COMMON_TRAIN_ARGS[@]}")
   else
     COMMON_TRAIN_ARGS+=(
-      --set "rollout.batch_size=${TRAIN_BATCH_SIZE:-64}"
-      --set "training.micro_batch_size=${TRAIN_BATCH_SIZE:-64}"
+      --set "rollout.batch_size=${TRAIN_BATCH_SIZE:-8}"
+      --set "training.micro_batch_size=${TRAIN_BATCH_SIZE:-8}"
     )
   fi
   if [[ -n "${TRAIN_EVAL_INTERVAL:-}" ]]; then
@@ -156,18 +184,10 @@ build_training_args() {
   if [[ -n "${MAX_STEPS:-}" ]]; then
     COMMON_TRAIN_ARGS+=(--set "training.max_steps=${MAX_STEPS}")
   fi
-}
-
-plot_training_progress_if_ready() {
-  local ta_output="$1"
-  local rac_output="$2"
-  if [[ -f "${ta_output}/eval_history.jsonl" && -f "${rac_output}/eval_history.jsonl" ]]; then
-    "${PYTHON_BIN}" -m b200_experiment.cli plot-training-progress \
-      --results "${RESULTS_DIR:-${REPO_DIR}/results}" \
-      --ta-output "${ta_output}" \
-      --rac-output "${rac_output}" \
-      --smoothing-window "${SMOOTHING_WINDOW:-10}"
-  else
-    echo "Training-progress plot is pending until both TA and RAC histories exist."
+  if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
+    COMMON_TRAIN_ARGS+=(
+      --set "training.resume_from_checkpoint=${RESUME_FROM_CHECKPOINT}"
+      --set "training.resume_allow_config_mismatch=${RESUME_ALLOW_CONFIG_MISMATCH:-false}"
+    )
   fi
 }

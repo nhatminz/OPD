@@ -1,5 +1,8 @@
 # TA-OPD vs RAC — standalone NVIDIA B200 project
 
+Hướng dẫn lệnh chạy mới nhất, bao gồm timestamp tự động và resume, nằm trong
+[`HUONG_DAN_CHAY.md`](HUONG_DAN_CHAY.md).
+
 Đây là project độc lập để chạy thí nghiệm `Qwen3-4B -> Qwen3-1.7B` trên B200. Project không
 import, symlink hay đọc bất kỳ file nào từ folder `TA-OPD` cũ. Logic TA được port theo mã nguồn công
 khai [wyy-code/TA-OPD](https://github.com/wyy-code/TA-OPD); RAC chỉ thay token selector, không thay
@@ -44,10 +47,10 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 `requests` và vLLM `0.17.x`; venv mới không cần cài thêm package thủ công. Version vLLM được giữ ở
 `>=0.17.1,<0.18` vì training dùng trực tiếp API CUDA-IPC weight transfer và sleep mode của dòng này.
 
-Batch train là hyperparameter **global** cố định, mặc định **64**, được khai báo bằng
-`TRAIN_BATCH_SIZE` ngay đầu `scripts/train_all_b200.sh`. Cùng một giá trị được áp vào rollout batch
-và micro-batch của TA/RAC, nên gradient accumulation luôn bằng 1. Khi dùng nhiều GPU, code tự chia
-batch global thành các shard liên tiếp cân bằng (ví dụ 64 trên 3 GPU thành 22/21/21); không nhân batch
+Batch train là hyperparameter **global** cố định, mặc định **8**, được khai báo bằng
+`TRAIN_BATCH_SIZE` ngay đầu `scripts/train_ta_b200.sh` và `scripts/train_rac_b200.sh`. Cùng một giá
+trị được áp vào rollout batch và micro-batch của TA/RAC, nên gradient accumulation luôn bằng 1. Khi dùng nhiều GPU, code tự chia
+batch global thành các shard liên tiếp cân bằng (ví dụ 8 trên 3 GPU thành 3/3/2); không nhân batch
 với số GPU và không đổi số optimizer step. Smoke test mặc định thực hiện:
 
 <!-- B200_AUTOTUNE_RESULT_START -->
@@ -65,7 +68,8 @@ Kết quả bắt buộc được lưu ở `results/preflight.json`. Full traini
 cầu generated autotune config. Đổi batch trực tiếp trong bash hoặc bằng biến môi trường:
 
 ```bash
-TRAIN_BATCH_SIZE=32 CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
+RUN_NAME=batch32_test TRAIN_BATCH_SIZE=32 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/train_ta_b200.sh
 ```
 
 Autotune cũ vẫn có thể bật chủ động nếu muốn tìm batch lớn nhất cùng chạy được cho TA và RAC:
@@ -75,7 +79,8 @@ USE_BATCH_AUTOTUNE=true \
   BATCH_CANDIDATES="16 32 64 96 128 160 192" \
   CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 
-USE_BATCH_AUTOTUNE=true CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
+RUN_NAME=autotuned_run USE_BATCH_AUTOTUNE=true CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/train_ta_b200.sh
 ```
 
 Chế độ tùy chọn này mới tạo `outputs/autotune/batch_autotune.json`,
@@ -84,24 +89,25 @@ Chế độ tùy chọn này mới tạo `outputs/autotune/batch_autotune.json`,
 ## Training
 
 Config mặc định train đúng **1 epoch**. Vì `training.max_steps: null`, số optimizer step thực tế là
-`ceil(17.398 / TRAIN_BATCH_SIZE)`. Batch mặc định 64 tạo 272 step.
+`ceil(17.398 / TRAIN_BATCH_SIZE)`. Batch mặc định 8 tạo 2175 step.
 
-Chạy tuần tự cả TA và RAC rồi tự động vẽ các đường accuracy/loss:
+Mỗi method có một launcher độc lập. Dùng cùng `RUN_NAME` để ghép thành một cặp so sánh:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
-CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
+RUN_NAME=run01 CUDA_VISIBLE_DEVICES=0 bash scripts/train_ta_b200.sh
+RUN_NAME=run01 CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
 ```
 
 Launcher tự đếm số phần tử trong `CUDA_VISIBLE_DEVICES`: một GPU chạy Python bình thường, từ hai GPU
 trở lên tự chạy một DDP worker trên mỗi GPU. Không cần sửa config hay hard-code world size:
 
 ```bash
-# 2 B200
-CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_all_b200.sh
+# TA trên 2 B200
+RUN_NAME=run01 CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_ta_b200.sh
 
-# 3 B200; vẫn global batch 64, cùng LR/rho/số step
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_all_b200.sh
+# RAC trên 3 B200; vẫn global batch 8, cùng LR/rho/số step
+RUN_NAME=run01 CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_rac_b200.sh
 ```
 
 Tên biến môi trường phân biệt hoa/thường và phải viết đúng `CUDA_VISIBLE_DEVICES`. Mọi GPU visible đều
@@ -114,8 +120,8 @@ bitwise-identical hoặc accuracy hữu hạn tuyệt đối giống từng ch�
 
 Các tham số thường đổi (`TRAIN_BATCH_SIZE`, `EPOCHS`, LR, `rho`, rollout length, rollout backend,
 K/M, checkpoint interval, số lần eval và các giới hạn memory/concurrency của vLLM) nằm trong block
-`BASIC PARAMETERS: EDIT HERE` ngay đầu `scripts/train_all_b200.sh`. Có thể sửa trực tiếp block đó
-hoặc override bằng biến môi trường.
+`PARAMETERS: EDIT HERE` ngay đầu hai script train. Có thể sửa trực tiếp block đó hoặc override bằng
+biến môi trường.
 
 ### vLLM rollout trong lúc train
 
@@ -139,49 +145,63 @@ Các knob rollout nằm ngay đầu bash:
 ```bash
 ROLLOUT_BACKEND=vllm
 ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.25
-ROLLOUT_VLLM_MAX_NUM_SEQS=64
-ROLLOUT_VLLM_MAX_MODEL_LEN=1024
-ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS=64
+ROLLOUT_VLLM_MAX_NUM_SEQS=8
+ROLLOUT_VLLM_MAX_MODEL_LEN=4096
+ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS=8
 ROLLOUT_VLLM_WAKE_HEADROOM_GIB=2
 ```
 
 `gpu_memory_utilization=0.25` là phần VRAM dành cho engine đồng vị trí khi nó đang generate, không
 phải giới hạn số sample. Trên B200 180 GB giá trị này dành khoảng 45 GB cho weights/KV scheduler;
 student, teacher và optimizer vẫn cùng resident. Nếu cần debug hoặc environment chưa hỗ trợ IPC,
-fallback không đổi objective bằng `ROLLOUT_BACKEND=hf bash scripts/train_all_b200.sh`.
+fallback không đổi objective bằng `ROLLOUT_BACKEND=hf bash scripts/train_ta_b200.sh` (hoặc RAC).
 Trainer chỉ gọi `torch.cuda.empty_cache()` khi VRAM thật sự còn trống không đủ để wake engine cộng
 thêm headroom nói trên; bình thường nó giữ CUDA cache để tránh mất tốc độ ở mọi step.
 
-Hoặc chạy TA-OPD riêng:
+Workflow khuyến nghị là chạy từng method độc lập rồi chủ động plot/eval. Hai file
+`train_ta_b200.sh` và `train_rac_b200.sh` đều có block `PARAMETERS: EDIT HERE` ở đầu file cho các
+tham số cơ bản. Fresh run tự tạo `RUN_NAME=YYYYMMDD_HHMMSS`; vì hai method chạy độc lập, dùng
+`TA_RUN_NAME` và `RAC_RUN_NAME` để chọn cặp khi plot/eval. Có thể truyền cùng một `RUN_NAME` thủ công
+nếu muốn hai method nằm chung một namespace. Layout mặc định:
+
+```text
+outputs/<RUN_NAME>/ta_opd
+outputs/<RUN_NAME>/rac_opd
+results/<RUN_NAME>
+```
+
+Ví dụ chạy mới TA-OPD riêng trên ba GPU:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
-CUDA_VISIBLE_DEVICES=0 bash scripts/train_ta_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/train_ta_b200.sh
 ```
 
-RAC:
+Sau khi TA kết thúc, chạy RAC độc lập với cùng tên run và cùng các shared hyperparameter:
 
 ```bash
-cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
-CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/train_rac_b200.sh
 ```
 
-Hai lệnh riêng hỗ trợ multi-GPU giống hệt `train_all_b200.sh`, ví dụ:
+Hai script chỉ train và log, không tự chạy method còn lại hoặc tự vẽ hình. Khi cả hai đã xong, vẽ
+loss và accuracy trong lúc train bằng:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_ta_b200.sh
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_rac_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 bash scripts/plot_training_progress.sh
 ```
 
-Mỗi wrapper vẫn ghi đầy đủ metrics, selector-token logs, checkpoints và periodic eval. Sau khi run thứ
-hai tồn tại, wrapper tự vẽ comparison; cũng có thể chủ động vẽ lại bằng:
+Sau đó chạy final eval Base/TA/RAC và vẽ comparison cuối:
 
 ```bash
-bash scripts/plot_training_progress.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval_all_b200.sh
 ```
 
-Hai wrapper dùng cùng fixed batch/micro-batch, seed, full DAPO order, epoch, LR, optimizer,
-rollout, K, rho và OPD objective. Những override chung nên truyền giống nhau cho cả hai, ví dụ:
+Mỗi wrapper vẫn ghi đầy đủ metrics, selector-token logs, checkpoints và periodic eval. Biến đặt trên
+lệnh chạy được ưu tiên hơn giá trị mặc định trong block đầu file. Chẳng hạn có thể thử một cấu hình
+khác mà không sửa file:
 
 ```bash
 EPOCHS=2 LEARNING_RATE=1e-5 RHO=0.10 MAX_NEW_TOKENS=256 \
@@ -189,6 +209,50 @@ EPOCHS=2 LEARNING_RATE=1e-5 RHO=0.10 MAX_NEW_TOKENS=256 \
 EPOCHS=2 LEARNING_RATE=1e-5 RHO=0.10 MAX_NEW_TOKENS=256 \
   bash scripts/train_rac_b200.sh
 ```
+
+### Resume sau khi train bị ngắt
+
+Checkpoint có `optimizer.pt` hỗ trợ true resume cho cả TA và RAC. Trainer khôi phục full student,
+AdamW state và global optimizer step; data order/epoch và rollout seed tiếp tục theo step đó. Có thể
+đổi số GPU khi resume vì checkpoint là model/optimizer replicated bình thường, trong khi configured
+batch vẫn là global batch.
+
+Ví dụ run mới `exp01_b8_lr1e-5_rho010` bị dừng ở checkpoint 100 khi đang dùng ba GPU. Hôm sau chỉ có
+hai GPU, TA tiếp tục từ step 101 như sau:
+
+```bash
+RUN_NAME=exp01_b8_lr1e-5_rho010 \
+CUDA_VISIBLE_DEVICES=0,1 \
+RESUME_FROM_CHECKPOINT=outputs/exp01_b8_lr1e-5_rho010/ta_opd/checkpoint-000100 \
+MAX_STEPS=2175 \
+  bash scripts/train_ta_b200.sh
+
+# RAC tương tự, dùng đúng checkpoint RAC
+RUN_NAME=exp01_b8_lr1e-5_rho010 \
+CUDA_VISIBLE_DEVICES=0,1 \
+RESUME_FROM_CHECKPOINT=outputs/exp01_b8_lr1e-5_rho010/rac_opd/checkpoint-000100 \
+MAX_STEPS=2175 \
+  bash scripts/train_rac_b200.sh
+```
+
+Checkpoint theo layout cũ vẫn resume được; phải chỉ rõ output cũ để append đúng log:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 TRAIN_BATCH_SIZE=64 MAX_NEW_TOKENS=256 BRANCH_M=2 \
+OUTPUT_DIR=outputs/ta_opd \
+RESUME_FROM_CHECKPOINT=outputs/ta_opd/checkpoint-000100 \
+MAX_STEPS=272 \
+  bash scripts/train_ta_b200.sh
+```
+
+`MAX_STEPS` là **total target**, không phải số step chạy thêm. Nếu vẫn dùng config một epoch/batch 64
+trên đúng 17.398 mẫu thì có thể bỏ `MAX_STEPS=272`, trainer tự suy ra 272 và chạy 101..272.
+
+Resume mặc định kiểm tra method và các hyperparameter khoa học trong `resolved_config.yaml`; TA
+checkpoint không được dùng để tiếp tục RAC. Nó cũng từ chối append nếu `metrics.jsonl`,
+`eval_history.jsonl` hoặc selector logs đã có step lớn hơn checkpoint, tránh âm thầm duplicate/rewind
+log. Trong trường hợp đó hãy dùng checkpoint mới nhất, hoặc đặt một `OUTPUT_DIR` mới. Chỉ khi chủ động
+muốn đổi thí nghiệm mới dùng `RESUME_ALLOW_CONFIG_MISMATCH=true`.
 
 ### Evaluation trong lúc train
 
@@ -200,7 +264,7 @@ step 0 (Base Qwen3-1.7B chưa update)
 step cuối của epoch
 ```
 
-Với ví dụ batch 64/272 step, lịch gồm đúng 16 mốc từ `0` đến `272`, gap 18–19 step. Mỗi mốc chạy đủ
+Với batch mặc định 8/2175 step, lịch gồm đúng 16 mốc từ `0` đến `2175`, gap khoảng 145 step. Mỗi mốc chạy đủ
 MATH-500, AIME24 và AIME25 bằng greedy decoding (`temperature=0`, `max_new_tokens=2048`). Backend
 mặc định là vLLM: ba benchmark được gom vào **một** lệnh generate/một thanh tiến trình. Step 0 đọc
 base model; step có checkpoint tái sử dụng checkpoint; mốc còn lại lưu một snapshot tạm của student,
@@ -218,7 +282,9 @@ Có thể đổi số lần mà vẫn giữ giống nhau cho TA/RAC:
 
 ```bash
 TRAIN_EVAL_TARGET=16 TRAIN_EVAL_BACKEND=vllm \
-  bash scripts/train_all_b200.sh
+  bash scripts/train_ta_b200.sh
+TRAIN_EVAL_TARGET=16 TRAIN_EVAL_BACKEND=vllm \
+  bash scripts/train_rac_b200.sh
 ```
 
 Nếu cần lịch cố định, đặt `TRAIN_EVAL_INTERVAL=100`; biến này ưu tiên hơn `TRAIN_EVAL_TARGET`. Có thể
@@ -242,20 +308,18 @@ một lần generate để terminal không bị tràn log.
 Mỗi run tạo:
 
 ```text
-outputs/ta_opd/metrics.jsonl
-outputs/ta_opd/vllm_rollout_server.log
-outputs/ta_opd/vllm_rollout_server.rank-*.log  # multi-GPU thay dòng trên
-outputs/ta_opd/selector_scores/selected_steps_*.jsonl.gz
-outputs/ta_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz  # multi-GPU
-outputs/ta_opd/eval_history.jsonl
-outputs/ta_opd/training_eval/step-*/summary.json
-outputs/rac_opd/metrics.jsonl
-outputs/rac_opd/vllm_rollout_server.log
-outputs/rac_opd/vllm_rollout_server.rank-*.log  # multi-GPU thay dòng trên
-outputs/rac_opd/selector_scores/selected_steps_*.jsonl.gz
-outputs/rac_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz  # multi-GPU
-outputs/rac_opd/eval_history.jsonl
-outputs/rac_opd/training_eval/step-*/summary.json
+outputs/<RUN_NAME>/ta_opd/metrics.jsonl
+outputs/<RUN_NAME>/ta_opd/vllm_rollout_server.rank-*.log
+outputs/<RUN_NAME>/ta_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/<RUN_NAME>/ta_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz
+outputs/<RUN_NAME>/ta_opd/eval_history.jsonl
+outputs/<RUN_NAME>/ta_opd/training_eval/step-*/summary.json
+outputs/<RUN_NAME>/rac_opd/metrics.jsonl
+outputs/<RUN_NAME>/rac_opd/vllm_rollout_server.rank-*.log
+outputs/<RUN_NAME>/rac_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/<RUN_NAME>/rac_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz
+outputs/<RUN_NAME>/rac_opd/eval_history.jsonl
+outputs/<RUN_NAME>/rac_opd/training_eval/step-*/summary.json
 ```
 
 `metrics.jsonl` chứa loss, rollout backend, thời gian CUDA-IPC sync/vLLM generation/sleep,
@@ -264,18 +328,17 @@ và rollout hash theo step. File gzip chỉ chứa token đã chọn và đượ
 tăng dần theo chunk 50 step. TA lưu `D,C,D_norm,C_norm,s_TA`; RAC lưu `Delta,A,F,B,s_RAC`, kèm
 sample ID, dataset index, response position, token ID và token text.
 
-Khi run thứ hai hoàn tất, training wrapper tự đọc hai `eval_history.jsonl` và sinh:
+Khi cả hai run hoàn tất, lệnh plot độc lập đọc hai `eval_history.jsonl` và sinh:
 
 ```text
-results/training_eval_history.csv
-results/training_eval_history.json
-results/plots/accuracy_over_steps.png
-results/plots/loss_comparison.png
+results/<RUN_NAME>/training_eval_history.csv
+results/<RUN_NAME>/training_eval_history.json
+results/<RUN_NAME>/plots/accuracy_over_steps.png
+results/<RUN_NAME>/plots/loss_comparison.png
 ```
 
 `accuracy_over_steps.png` có ba subplot MATH-500/AIME24/AIME25, đường TA và RAC theo optimizer step,
-và đường ngang Base Qwen3-1.7B lấy từ step 0. Có thể vẽ lại thủ công bằng
-`bash scripts/plot_training_progress.sh`.
+và đường ngang Base Qwen3-1.7B lấy từ step 0.
 
 ## Evaluation và plots
 
@@ -283,7 +346,8 @@ Chạy đúng ba model Base/TA/RAC trên MATH-500, AIME24 và AIME25:
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
-CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval_all_b200.sh
 ```
 
 Checkpoint tạo bởi DDP là checkpoint Hugging Face bình thường, nên `eval_all_b200.sh` không cần biết
@@ -292,6 +356,7 @@ muốn tensor-parallel eval, expose các GPU và đặt rõ kích thước (ch�
 attention heads của model), ví dụ:
 
 ```bash
+RUN_NAME=exp01_b64_lr1e-5_rho010 \
 CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
   bash scripts/eval_all_b200.sh
 ```
@@ -302,21 +367,23 @@ Các script eval cuối cũng dùng vLLM mặc định và một thanh tiến tr
 Hoặc chạy riêng:
 
 ```bash
-bash scripts/eval_base_b200.sh
-TA_CHECKPOINT=/path/to/ta/checkpoint bash scripts/eval_ta_b200.sh
-RAC_CHECKPOINT=/path/to/rac/checkpoint bash scripts/eval_rac_b200.sh
-bash scripts/plot_results.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 bash scripts/eval_base_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 TA_CHECKPOINT=/path/to/ta/checkpoint \
+  bash scripts/eval_ta_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 RAC_CHECKPOINT=/path/to/rac/checkpoint \
+  bash scripts/eval_rac_b200.sh
+RUN_NAME=exp01_b64_lr1e-5_rho010 bash scripts/plot_results.sh
 ```
 
 Output cuối:
 
 ```text
-results/comparison.csv
-results/comparison.json
-results/eval/{base,ta_opd,rac}/*_predictions.jsonl.gz
-results/plots/accuracy_comparison.png
-results/plots/accuracy_over_steps.png
-results/plots/loss_comparison.png
+results/<RUN_NAME>/comparison.csv
+results/<RUN_NAME>/comparison.json
+results/<RUN_NAME>/eval/{base,ta_opd,rac}/*_predictions.jsonl.gz
+results/<RUN_NAME>/plots/accuracy_comparison.png
+results/<RUN_NAME>/plots/accuracy_over_steps.png
+results/<RUN_NAME>/plots/loss_comparison.png
 ```
 
 Loader không giả định schema cũ. Nó ưu tiên exact B200 filename, kiểm tra columns và hỗ trợ cấu hình
