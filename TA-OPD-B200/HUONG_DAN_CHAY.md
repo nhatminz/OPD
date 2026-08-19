@@ -171,37 +171,34 @@ MAX_STEPS=2175 \
 bash scripts/train_rac_b200.sh
 ```
 
-Phải giữ nguyên global batch 8, rollout 2048 và các scientific hyperparameter của run. DDP chỉ đổi cách chia batch
-cục bộ: ba GPU nhận khoảng `3/3/2`, còn hai GPU nhận `4/4`; global update vẫn có cùng định nghĩa.
+Phải giữ nguyên global batch 8, rollout 2048 và các scientific hyperparameter của run. DDP chỉ đổi
+cách chia batch cục bộ: ba GPU nhận khoảng `3/3/2`, còn hai GPU nhận `4/4`; global update vẫn có cùng
+định nghĩa.
 
-## 8. Resume checkpoint cũ được train với batch 64
+## 8. Resume checkpoint nằm trong layout output cũ
 
-Checkpoint cũ phải dùng lại đúng hyperparameter cũ, không dùng các default mới 8/4096/M=4. Ví dụ
-checkpoint TA cũ dùng batch 64, rollout 256 token và branch setting 2:
+Checkpoint của run trước khi cập nhật code vẫn dùng global batch 8, rollout 2048, vLLM context 4096
+và branch M=4. Các giá trị này trùng với default hiện tại, nên không truyền override khác khi resume.
+Với TA checkpoint trong folder `outputs/ta_opd`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-TRAIN_BATCH_SIZE=64 \
-MAX_NEW_TOKENS=256 \
-ROLLOUT_VLLM_MAX_MODEL_LEN=1024 \
-BRANCH_M=2 \
 RESUME_FROM_CHECKPOINT=outputs/ta_opd/checkpoint-000100 \
-MAX_STEPS=272 \
+MAX_STEPS=2175 \
 bash scripts/train_ta_b200.sh
 ```
 
-RAC cũ:
+RAC trong folder `outputs/rac_opd`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-TRAIN_BATCH_SIZE=64 \
-MAX_NEW_TOKENS=256 \
-ROLLOUT_VLLM_MAX_MODEL_LEN=1024 \
-BRANCH_M=2 \
 RESUME_FROM_CHECKPOINT=outputs/rac_opd/checkpoint-000100 \
-MAX_STEPS=272 \
+MAX_STEPS=2175 \
 bash scripts/train_rac_b200.sh
 ```
+
+Script tự suy ra output là parent của checkpoint, tức tiếp tục ghi vào `outputs/ta_opd` hoặc
+`outputs/rac_opd`; không cần truyền lại `OUTPUT_DIR`.
 
 Resume validator sẽ dừng nếu batch, method, LR, rho, K/M hoặc generation length khác checkpoint.
 Không dùng `RESUME_ALLOW_CONFIG_MISMATCH=true` chỉ để vượt qua lỗi này; hãy đặt lại đúng giá trị của

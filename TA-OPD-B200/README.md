@@ -235,18 +235,18 @@ MAX_STEPS=2175 \
   bash scripts/train_rac_b200.sh
 ```
 
-Checkpoint theo layout cũ vẫn resume được; phải chỉ rõ output cũ để append đúng log:
+Checkpoint theo layout cũ nhưng dùng cùng batch 8, rollout 2048, context 4096 và M=4 vẫn resume trực
+tiếp được. Script tự suy ra output cũ từ parent của checkpoint:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 TRAIN_BATCH_SIZE=64 MAX_NEW_TOKENS=256 BRANCH_M=2 \
-OUTPUT_DIR=outputs/ta_opd \
+CUDA_VISIBLE_DEVICES=0,1 \
 RESUME_FROM_CHECKPOINT=outputs/ta_opd/checkpoint-000100 \
-MAX_STEPS=272 \
+MAX_STEPS=2175 \
   bash scripts/train_ta_b200.sh
 ```
 
-`MAX_STEPS` là **total target**, không phải số step chạy thêm. Nếu vẫn dùng config một epoch/batch 64
-trên đúng 17.398 mẫu thì có thể bỏ `MAX_STEPS=272`, trainer tự suy ra 272 và chạy 101..272.
+`MAX_STEPS` là **total target**, không phải số step chạy thêm. Với một epoch/batch 8 trên đúng 17.398
+mẫu, có thể bỏ `MAX_STEPS=2175`; trainer tự suy ra 2175 và chạy từ step sau checkpoint đến 2175.
 
 Resume mặc định kiểm tra method và các hyperparameter khoa học trong `resolved_config.yaml`; TA
 checkpoint không được dùng để tiếp tục RAC. Nó cũng từ chối append nếu `metrics.jsonl`,
