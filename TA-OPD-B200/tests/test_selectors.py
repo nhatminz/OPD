@@ -96,6 +96,25 @@ class SelectorTests(unittest.TestCase):
             torch.equal(output.scores[self.valid], torch.zeros(int(self.valid.sum())))
         )
 
+    def test_rac_reuses_ta_student_topk_without_changing_any_score(self):
+        ta = TASelector(top_k=8).compute_scores(self.p, self.q, self.valid)
+        selector = RACSelector(top_k=8, branch_m=2)
+        reference = selector.compute_scores(self.p, self.q, self.valid, self.probe)
+        reused = selector.compute_scores(
+            self.p,
+            self.q,
+            self.valid,
+            self.probe,
+            student_topk=(
+                ta.diagnostics["_student_top_values"],
+                ta.diagnostics["_student_top_ids"],
+            ),
+        )
+        for key in ("Delta", "A", "F", "B", "s_RAC"):
+            self.assertTrue(
+                torch.equal(reference.diagnostics[key], reused.diagnostics[key]), key
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

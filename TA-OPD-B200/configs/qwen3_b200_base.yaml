@@ -8,6 +8,16 @@ experiment:
   allow_existing_output: false
   verbose_metrics: false
 
+# scripts/train_{ta,rac}_b200.sh automatically launches one DDP worker per
+# CUDA_VISIBLE_DEVICES entry. rollout.batch_size and training.micro_batch_size
+# remain GLOBAL values, independent of GPU count.
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+  gradient_as_bucket_view: true
+  static_graph: true
+  bucket_cap_mb: 100
+
 models:
   teacher_path: /workspace/storage-shared/models/Qwen3-4B
   student_path: /workspace/storage-shared/models/Qwen3-1.7B

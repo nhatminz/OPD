@@ -26,6 +26,8 @@ class TASelector:
         student_probs: torch.Tensor,
         teacher_probs: torch.Tensor,
         valid_mask: torch.Tensor,
+        *,
+        normalize: bool = True,
     ):
         if student_probs.shape != teacher_probs.shape:
             raise ValueError(
@@ -44,11 +46,18 @@ class TASelector:
         if p.numel() == 0:
             zeros = torch.zeros_like(valid_mask, dtype=torch.float32)
             return SelectorOutput(
-                zeros, {name: zeros for name in ("D", "C", "D_norm", "C_norm", "s_TA")}
+                zeros,
+                {
+                    **{name: zeros for name in ("D", "C", "D_norm", "C_norm", "s_TA")},
+                    "_student_top_values": p.new_empty((0, 0)),
+                    "_student_top_ids": torch.empty(
+                        (0, 0), dtype=torch.long, device=p.device
+                    ),
+                },
             )
 
         k = min(self.top_k, p.shape[-1])
-        _, p_top_ids = torch.topk(p, k=k, dim=-1)
+        p_top_values, p_top_ids = torch.topk(p, k=k, dim=-1)
         _, q_top_ids = torch.topk(q, k=k, dim=-1)
         union_ids = torch.cat((p_top_ids, q_top_ids), dim=-1)
         equal = union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2))
@@ -71,12 +80,16 @@ class TASelector:
         compatibility = (
             (q.gather(-1, p_top_ids) * p_ids_in_teacher).sum(dim=-1).clamp_(0.0, 1.0)
         )
-        d_norm = robust_quantile_normalize(
-            disagreement, self.q_low, self.q_high, self.eps
-        )
-        c_norm = robust_quantile_normalize(
-            compatibility, self.q_low, self.q_high, self.eps
-        )
+        if normalize:
+            d_norm = robust_quantile_normalize(
+                disagreement, self.q_low, self.q_high, self.eps
+            )
+            c_norm = robust_quantile_normalize(
+                compatibility, self.q_low, self.q_high, self.eps
+            )
+        else:
+            d_norm = torch.zeros_like(disagreement)
+            c_norm = torch.zeros_like(compatibility)
         score = d_norm * c_norm
         diagnostics = {
             "D": scatter_valid(disagreement, valid_mask),
@@ -85,5 +98,10 @@ class TASelector:
             "C_norm": scatter_valid(c_norm, valid_mask),
             "s_TA": scatter_valid(score, valid_mask),
             "compatibility_convention": "upstream_topk_intersection",
+            # RAC consumes this exact already-computed student top-K. Keeping
+            # these private tensors avoids a second full top-K over the vocab
+            # without changing either selector's score.
+            "_student_top_values": p_top_values,
+            "_student_top_ids": p_top_ids,
         }
         return SelectorOutput(diagnostics["s_TA"], diagnostics)

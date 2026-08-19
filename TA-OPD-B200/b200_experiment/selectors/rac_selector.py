@@ -32,6 +32,8 @@ class RACSelector:
         teacher_probs: torch.Tensor,
         valid_mask: torch.Tensor,
         cplus_probe: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        *,
+        student_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> SelectorOutput:
         if (
             student_probs.shape != teacher_probs.shape
@@ -54,7 +56,16 @@ class RACSelector:
             )
 
         k = min(self.top_k, p.shape[-1])
-        p_top_values, p_top_ids = torch.topk(p, k=k, dim=-1)
+        if student_topk is None:
+            p_top_values, p_top_ids = torch.topk(p, k=k, dim=-1)
+        else:
+            p_top_values, p_top_ids = student_topk
+            expected = (n_valid, k)
+            if p_top_values.shape != expected or p_top_ids.shape != expected:
+                raise ValueError(
+                    f"Precomputed student top-K must have shape {expected}, got "
+                    f"{p_top_values.shape} and {p_top_ids.shape}"
+                )
         corrective_top = (q.gather(-1, p_top_ids) - p_top_values).clamp_min_(0.0)
         if self.delta_mode == "full_vocab":
             delta = (q - p).clamp_min_(0.0).sum(dim=-1)

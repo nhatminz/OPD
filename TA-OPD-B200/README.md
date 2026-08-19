@@ -44,9 +44,11 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 `requests` và vLLM `0.17.x`; venv mới không cần cài thêm package thủ công. Version vLLM được giữ ở
 `>=0.17.1,<0.18` vì training dùng trực tiếp API CUDA-IPC weight transfer và sleep mode của dòng này.
 
-Batch train là hyperparameter cố định, mặc định **64**, được khai báo bằng `TRAIN_BATCH_SIZE` ngay đầu
-`scripts/train_all_b200.sh`. Cùng một giá trị được áp vào rollout batch và micro-batch của TA/RAC,
-nên gradient accumulation luôn bằng 1. Smoke test mặc định thực hiện:
+Batch train là hyperparameter **global** cố định, mặc định **64**, được khai báo bằng
+`TRAIN_BATCH_SIZE` ngay đầu `scripts/train_all_b200.sh`. Cùng một giá trị được áp vào rollout batch
+và micro-batch của TA/RAC, nên gradient accumulation luôn bằng 1. Khi dùng nhiều GPU, code tự chia
+batch global thành các shard liên tiếp cân bằng (ví dụ 64 trên 3 GPU thành 22/21/21); không nhân batch
+với số GPU và không đổi số optimizer step. Smoke test mặc định thực hiện:
 
 <!-- B200_AUTOTUNE_RESULT_START -->
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
@@ -90,6 +92,25 @@ Chạy tuần tự cả TA và RAC rồi tự động vẽ các đường accura
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/train_all_b200.sh
 ```
+
+Launcher tự đếm số phần tử trong `CUDA_VISIBLE_DEVICES`: một GPU chạy Python bình thường, từ hai GPU
+trở lên tự chạy một DDP worker trên mỗi GPU. Không cần sửa config hay hard-code world size:
+
+```bash
+# 2 B200
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_all_b200.sh
+
+# 3 B200; vẫn global batch 64, cùng LR/rho/số step
+CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_all_b200.sh
+```
+
+Tên biến môi trường phân biệt hoa/thường và phải viết đúng `CUDA_VISIBLE_DEVICES`. Mọi GPU visible đều
+được preflight xác nhận là B200. Multi-GPU giữ nguyên cùng global DAPO batch/order, seed theo global
+sample, TA quantile normalization trên toàn global rollout, một global top-budget
+`ceil(rho*N_valid)`, OPD loss trung bình theo global batch và DDP all-reduce gradient. Batch cuối không
+bị pad/lặp; code scale gradient đúng cả khi shard cuối không đều. Sai số floating-point rất nhỏ do thứ
+tự all-reduce có thể khác single-GPU là thuộc tính chung của DDP; vì vậy không thể cam kết checkpoint
+bitwise-identical hoặc accuracy hữu hạn tuyệt đối giống từng chữ số nếu chưa chạy thực nghiệm.
 
 Các tham số thường đổi (`TRAIN_BATCH_SIZE`, `EPOCHS`, LR, `rho`, rollout length, rollout backend,
 K/M, checkpoint interval, số lần eval và các giới hạn memory/concurrency của vLLM) nằm trong block
@@ -145,6 +166,20 @@ cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
 ```
 
+Hai lệnh riêng hỗ trợ multi-GPU giống hệt `train_all_b200.sh`, ví dụ:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_ta_b200.sh
+CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_rac_b200.sh
+```
+
+Mỗi wrapper vẫn ghi đầy đủ metrics, selector-token logs, checkpoints và periodic eval. Sau khi run thứ
+hai tồn tại, wrapper tự vẽ comparison; cũng có thể chủ động vẽ lại bằng:
+
+```bash
+bash scripts/plot_training_progress.sh
+```
+
 Hai wrapper dùng cùng fixed batch/micro-batch, seed, full DAPO order, epoch, LR, optimizer,
 rollout, K, rho và OPD objective. Những override chung nên truyền giống nhau cho cả hai, ví dụ:
 
@@ -193,7 +228,9 @@ cho backend này). Tắt bằng `TRAIN_EVAL_ENABLED=false`. Không nên dùng gi
 Config dùng bf16, FlashAttention 2 khi environment hỗ trợ và tự fallback sang SDPA, fused AdamW,
 full-parameter Qwen3-1.7B training, không gradient accumulation (`micro_batch=batch`).
 Teacher luôn frozen. RAC dùng exact full-vocabulary `Delta`, batched top-M branches, KV-cache reuse và
-mọi counterfactual probe nằm trong `torch.inference_mode()`.
+mọi counterfactual probe nằm trong `torch.inference_mode()`. RAC tái sử dụng chính student top-K đã
+tính cho TA cross-diagnostics, nên bỏ được một full-vocabulary top-K trùng lặp mà score/mask không đổi.
+Với multi-GPU, exact RAC branches được chia theo global batch và chạy song song trên từng B200.
 
 Mọi lệnh train TA/RAC đều có tqdm cho setup và optimizer step, kèm stage hiện tại, loss, số token
 được chọn, thời gian selector và VRAM; rollout vLLM có thêm một thanh sample lồng bên trong. Mọi lệnh
@@ -207,12 +244,16 @@ Mỗi run tạo:
 ```text
 outputs/ta_opd/metrics.jsonl
 outputs/ta_opd/vllm_rollout_server.log
+outputs/ta_opd/vllm_rollout_server.rank-*.log  # multi-GPU thay dòng trên
 outputs/ta_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/ta_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz  # multi-GPU
 outputs/ta_opd/eval_history.jsonl
 outputs/ta_opd/training_eval/step-*/summary.json
 outputs/rac_opd/metrics.jsonl
 outputs/rac_opd/vllm_rollout_server.log
+outputs/rac_opd/vllm_rollout_server.rank-*.log  # multi-GPU thay dòng trên
 outputs/rac_opd/selector_scores/selected_steps_*.jsonl.gz
+outputs/rac_opd/selector_scores/selected_steps_*_rank-*.jsonl.gz  # multi-GPU
 outputs/rac_opd/eval_history.jsonl
 outputs/rac_opd/training_eval/step-*/summary.json
 ```
@@ -243,6 +284,16 @@ Chạy đúng ba model Base/TA/RAC trên MATH-500, AIME24 và AIME25:
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
+```
+
+Checkpoint tạo bởi DDP là checkpoint Hugging Face bình thường, nên `eval_all_b200.sh` không cần biết
+train đã dùng bao nhiêu GPU. Eval greedy trên một B200 như lệnh trên là lựa chọn luôn tương thích. Nếu
+muốn tensor-parallel eval, expose các GPU và đặt rõ kích thước (chỉ dùng giá trị tương thích số
+attention heads của model), ví dụ:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
+  bash scripts/eval_all_b200.sh
 ```
 
 Các script eval cuối cũng dùng vLLM mặc định và một thanh tiến trình cho cả ba benchmark; dùng
@@ -282,5 +333,7 @@ Sau khi selector tạo shared global mask `ceil(rho*N_valid)`, cả hai đi qua 
 advantage và PPO-clipped OPD policy loss. RAC không thay token rollout và counterfactual token không
 đi vào loss.
 
-Project hiện tối ưu cho một process trên B200 đầu tiên trong `CUDA_VISIBLE_DEVICES`; không hard-code
-physical GPU ID. Mỗi process chứa cả student và frozen teacher để giữ exact selector distributions.
+Project dùng một DDP process và một vLLM rollout server đồng vị trí trên mỗi B200 trong
+`CUDA_VISIBLE_DEVICES`; không hard-code physical GPU ID. Mỗi process chứa cả student và frozen teacher
+để giữ exact selector distributions. Rank 0 là process duy nhất ghi `metrics.jsonl`, checkpoint,
+summary và chạy periodic eval; selector-token gzip được tách theo rank để tránh concurrent corruption.

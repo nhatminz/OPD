@@ -5,8 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-# Shared rollout/micro-batch for both TA and RAC (gradient accumulation = 1).
+# Shared GLOBAL rollout/micro-batch for both methods. Changing the visible GPU
+# count changes only the per-GPU shard; it does not change optimizer semantics.
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+export DDP_BUCKET_CAP_MB="${DDP_BUCKET_CAP_MB:-100}"
 # Set true only when you explicitly want smoke_test_b200.sh to search candidates.
 export USE_BATCH_AUTOTUNE="${USE_BATCH_AUTOTUNE:-false}"
 export EPOCHS="${EPOCHS:-1}"

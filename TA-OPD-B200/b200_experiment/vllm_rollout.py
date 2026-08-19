@@ -57,10 +57,20 @@ def rollout_batch_from_token_ids(
 class VLLMRolloutEngine:
     """Persistent same-GPU vLLM server with per-step CUDA-IPC weight sync."""
 
-    def __init__(self, config: dict[str, Any], output_dir: Path):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        output_dir: Path,
+        *,
+        local_rank: int = 0,
+        world_size: int = 1,
+        port: int | None = None,
+    ):
         self.config = config
         self.settings = dict(config["rollout"].get("vllm", {}))
         self.output_dir = output_dir
+        self.local_rank = int(local_rank)
+        self.world_size = int(world_size)
         self.model_path = Path(config["models"]["student_path"]).resolve()
         self.served_model_name = "opd-rollout-student"
         self.process: subprocess.Popen | None = None
@@ -68,7 +78,7 @@ class VLLMRolloutEngine:
         self.sleeping = False
         self.closed = False
         self.last_metrics: dict[str, float] = {}
-        self.port = self._free_port()
+        self.port = int(port) if port is not None else self._free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         atexit.register(self.close)
 
@@ -142,20 +152,55 @@ class VLLMRolloutEngine:
             command.append("--enable-prefix-caching")
         return command
 
-    def start(self) -> None:
-        if self.closed:
-            raise RuntimeError("Cannot restart a closed vLLM rollout engine")
-        if self.process is not None:
-            return
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self.output_dir / "vllm_rollout_server.log"
-        self.log_handle = log_path.open("a", encoding="utf-8")
+    def _server_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["VLLM_SERVER_DEV_MODE"] = "1"
         environment["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         environment["VLLM_LOGGING_LEVEL"] = environment.get(
             "VLLM_LOGGING_LEVEL", "WARNING"
         )
+        for name in (
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "TORCHELASTIC_RUN_ID",
+        ):
+            environment.pop(name, None)
+        # torchrun workers see every listed GPU. Restrict this child to the
+        # worker's matching physical device so each rank owns one colocated
+        # vLLM server and CUDA-IPC transfers target the correct B200.
+        visible = environment.get("CUDA_VISIBLE_DEVICES", "")
+        visible_devices = [item.strip() for item in visible.split(",") if item.strip()]
+        if visible_devices:
+            if self.local_rank >= len(visible_devices):
+                raise RuntimeError(
+                    f"LOCAL_RANK={self.local_rank} exceeds CUDA_VISIBLE_DEVICES={visible!r}"
+                )
+            environment["CUDA_VISIBLE_DEVICES"] = visible_devices[self.local_rank]
+        else:
+            environment["CUDA_VISIBLE_DEVICES"] = str(self.local_rank)
+        return environment
+
+    def start(self) -> None:
+        if self.closed:
+            raise RuntimeError("Cannot restart a closed vLLM rollout engine")
+        if self.process is not None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        log_name = (
+            f"vllm_rollout_server.rank-{self.local_rank:05d}.log"
+            if self.world_size > 1
+            else "vllm_rollout_server.log"
+        )
+        log_path = self.output_dir / log_name
+        self.log_handle = log_path.open("a", encoding="utf-8")
+        environment = self._server_environment()
         try:
             self.process = subprocess.Popen(
                 self._server_command(),
@@ -305,6 +350,7 @@ class VLLMRolloutEngine:
         eos_token_ids: int | list[int],
         pad_token_id: int,
         seed: int,
+        sample_seed_offset: int = 0,
     ) -> RolloutBatch:
         if self.process is None:
             raise RuntimeError("vLLM rollout server was not started")
@@ -342,7 +388,7 @@ class VLLMRolloutEngine:
                         temperature=temperature,
                         top_p=top_p,
                         eos_token_ids=eos_ids,
-                        seed=seed,
+                        seed=seed + int(sample_seed_offset),
                     )
                     for index, prompt in enumerate(prompts)
                 ]

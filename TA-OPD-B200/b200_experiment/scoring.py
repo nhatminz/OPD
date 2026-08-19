@@ -53,12 +53,18 @@ def generate_on_policy(
     eos_token_ids: int | list[int],
     pad_token_id: int,
     seed: int,
+    sample_seed_offset: int = 0,
 ) -> RolloutBatch:
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
     device = prompt_ids.device
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
+    # One RNG stream per global sample keeps a rollout invariant when the same
+    # global batch is split across a different number of DDP workers.
+    generators = []
+    for row in range(prompt_ids.shape[0]):
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed) + int(sample_seed_offset) + row)
+        generators.append(generator)
     model.eval()
     prompt_width = prompt_ids.shape[1]
     attention = prompt_attention_mask.clone()
@@ -79,8 +85,14 @@ def generate_on_policy(
         if temperature <= 0:
             next_token = logits.argmax(dim=-1)
         else:
-            next_token = _sample_top_p(
-                torch.softmax(logits / temperature, dim=-1), top_p, generator
+            probabilities = torch.softmax(logits / temperature, dim=-1)
+            next_token = torch.stack(
+                [
+                    _sample_top_p(
+                        probabilities[row : row + 1], top_p, generators[row]
+                    ).squeeze(0)
+                    for row in range(probabilities.shape[0])
+                ]
             )
         next_token = torch.where(
             active, next_token, torch.full_like(next_token, pad_token_id)

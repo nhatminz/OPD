@@ -6,7 +6,7 @@ require_b200_validation
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/outputs/rac_opd}"
 build_training_args "${OUTPUT_DIR}"
 cd "${REPO_DIR}"
-"${PYTHON_BIN}" -m b200_experiment.cli train \
+run_training_cli train \
   --config "${RAC_CONFIG}" \
   "${COMMON_TRAIN_ARGS[@]}" \
   --set "selector.branch_m=${BRANCH_M:-2}" \

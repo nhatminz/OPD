@@ -20,13 +20,16 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
             "No CUDA GPU is visible; set CUDA_VISIBLE_DEVICES before B200 preflight"
         )
     gpus = gpu_inventory()
-    if (
-        bool(config["experiment"].get("require_b200", True))
-        and "B200" not in gpus[0]["name"].upper()
-    ):
-        raise RuntimeError(
-            f"Expected NVIDIA B200 as visible cuda:0, detected {gpus[0]['name']!r}"
-        )
+    if bool(config["experiment"].get("require_b200", True)):
+        non_b200 = [gpu for gpu in gpus if "B200" not in gpu["name"].upper()]
+        if non_b200:
+            detected = ", ".join(
+                f"cuda:{gpu['visible_index']}={gpu['name']}" for gpu in non_b200
+            )
+            raise RuntimeError(
+                "Every visible training GPU must be an NVIDIA B200; detected "
+                + detected
+            )
     records, files = read_records(
         config["data"]["path"], split=config["data"].get("split")
     )

@@ -11,12 +11,46 @@ export TOKENIZERS_PARALLELISM=false
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export PYTHONUNBUFFERED=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/qwen3_b200_autotuned.yaml}"
 PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight.json}"
+
+visible_gpu_count() {
+  local visible="${CUDA_VISIBLE_DEVICES:-0}"
+  local devices=()
+  IFS=',' read -r -a devices <<< "${visible}"
+  if [[ "${#devices[@]}" -le 0 ]]; then
+    echo "CUDA_VISIBLE_DEVICES must contain at least one GPU" >&2
+    return 1
+  fi
+  printf '%s\n' "${#devices[@]}"
+}
+
+run_training_cli() {
+  local visible_count
+  visible_count="$(visible_gpu_count)"
+  local processes="${TRAIN_NPROC_PER_NODE:-${visible_count}}"
+  if ! [[ "${processes}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TRAIN_NPROC_PER_NODE must be a positive integer, got ${processes}" >&2
+    return 1
+  fi
+  if (( processes > visible_count )); then
+    echo "Requested ${processes} workers but only ${visible_count} GPUs are visible" >&2
+    return 1
+  fi
+  if (( processes == 1 )); then
+    "${PYTHON_BIN}" -m b200_experiment.cli "$@"
+  else
+    "${PYTHON_BIN}" -m torch.distributed.run \
+      --standalone \
+      --nproc_per_node="${processes}" \
+      -m b200_experiment.cli "$@"
+  fi
+}
 
 require_file() {
   if [[ ! -f "$1" ]]; then
@@ -64,7 +98,7 @@ import sys
 batch = int(sys.argv[1])
 if batch <= 0:
     raise SystemExit("TRAIN_BATCH_SIZE must be a positive integer")
-print(f"Fixed training batch size: {batch} (micro-batch: {batch}, gradient accumulation: 1)")
+print(f"Fixed global training batch size: {batch} (global micro-batch: {batch}, gradient accumulation: 1)")
 PY
   fi
 }
@@ -83,6 +117,7 @@ build_training_args() {
     --set "training.epochs=${EPOCHS:-1}"
     --set "training.learning_rate=${LEARNING_RATE:-1.0e-5}"
     --set "training.save_interval=${SAVE_INTERVAL:-100}"
+    --set "distributed.bucket_cap_mb=${DDP_BUCKET_CAP_MB:-100}"
     --set "rollout.backend=${ROLLOUT_BACKEND:-vllm}"
     --set "rollout.max_new_tokens=${MAX_NEW_TOKENS:-256}"
     --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"

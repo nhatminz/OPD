@@ -18,12 +18,16 @@ class SelectedTokenLogger:
         method: str,
         chunk_steps: int = 50,
         enabled: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.root = Path(output_dir) / "selector_scores"
         self.tokenizer = tokenizer
         self.method = method
         self.chunk_steps = max(1, int(chunk_steps))
         self.enabled = bool(enabled)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
         if self.enabled:
             self.root.mkdir(parents=True, exist_ok=True)
             manifest = {
@@ -31,6 +35,12 @@ class SelectedTokenLogger:
                 "scope": "selected/accepted response positions only",
                 "method": method,
                 "chunk_steps": self.chunk_steps,
+                "distributed_world_size": self.world_size,
+                "distributed_file_pattern": (
+                    "selected_steps_*_rank-*.jsonl.gz"
+                    if self.world_size > 1
+                    else "selected_steps_*.jsonl.gz"
+                ),
                 "common_fields": [
                     "training_step",
                     "sample_id",
@@ -44,14 +54,18 @@ class SelectedTokenLogger:
                 if method == "ta"
                 else ["Delta", "A", "F", "B", "s_RAC"],
             }
-            with (self.root / "manifest.json").open("w", encoding="utf-8") as handle:
-                json.dump(manifest, handle, indent=2, ensure_ascii=False)
-                handle.write("\n")
+            if self.rank == 0:
+                with (self.root / "manifest.json").open(
+                    "w", encoding="utf-8"
+                ) as handle:
+                    json.dump(manifest, handle, indent=2, ensure_ascii=False)
+                    handle.write("\n")
 
     def _path(self, step: int) -> Path:
         first = ((step - 1) // self.chunk_steps) * self.chunk_steps + 1
         last = first + self.chunk_steps - 1
-        return self.root / f"selected_steps_{first:06d}_{last:06d}.jsonl.gz"
+        suffix = f"_rank-{self.rank:05d}" if self.world_size > 1 else ""
+        return self.root / (f"selected_steps_{first:06d}_{last:06d}{suffix}.jsonl.gz")
 
     def write(
         self,
@@ -62,6 +76,7 @@ class SelectedTokenLogger:
         response_ids: torch.Tensor,
         selected_mask: torch.Tensor,
         diagnostics: dict[str, Any],
+        batch_index_offset: int = 0,
     ) -> int:
         if not self.enabled:
             return 0
@@ -88,7 +103,7 @@ class SelectedTokenLogger:
                     "training_step": step,
                     "sample_id": sample_ids[batch_index],
                     "dataset_index": int(dataset_indices[batch_index]),
-                    "batch_index": batch_index,
+                    "batch_index": int(batch_index_offset) + batch_index,
                     "response_position": position,
                     "token_id": int(token_ids[offset]),
                     "token_text": str(token_texts[offset]),

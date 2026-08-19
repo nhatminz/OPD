@@ -6,7 +6,7 @@ require_b200_validation
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/outputs/ta_opd}"
 build_training_args "${OUTPUT_DIR}"
 cd "${REPO_DIR}"
-"${PYTHON_BIN}" -m b200_experiment.cli train \
+run_training_cli train \
   --config "${TA_CONFIG}" \
   "${COMMON_TRAIN_ARGS[@]}" "$@"
 plot_training_progress_if_ready \

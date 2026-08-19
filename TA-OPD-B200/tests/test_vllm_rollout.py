@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +36,28 @@ def _config(max_model_len: int = 1024):
 
 
 class VLLMRolloutTests(unittest.TestCase):
+    def test_each_torchrun_worker_isolates_its_vllm_child_gpu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(
+                _config(), Path(temporary), local_rank=1, world_size=3
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "CUDA_VISIBLE_DEVICES": "2,4,6",
+                    "RANK": "1",
+                    "LOCAL_RANK": "1",
+                    "WORLD_SIZE": "3",
+                    "MASTER_PORT": "12345",
+                },
+                clear=False,
+            ):
+                environment = engine._server_environment()
+            engine.close()
+        self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "4")
+        for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_PORT"):
+            self.assertNotIn(name, environment)
+
     def test_token_ids_preserve_left_padded_prompt_and_response_mask(self):
         prompt_ids = torch.tensor([[0, 11, 12], [21, 22, 23]])
         prompt_mask = torch.tensor([[0, 1, 1], [1, 1, 1]])

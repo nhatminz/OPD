@@ -9,17 +9,26 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from tqdm.auto import tqdm
 
 from .config import save_config
 from .data import epoch_batch_indices, read_records, stable_sample_id, tokenize_prompts
 from .diagnostics import correlations, finite_or_raise, selector_summary
+from .distributed import (
+    DistributedContext,
+    contiguous_partition,
+    initialize_distributed,
+    unique_free_port,
+    unwrap_model,
+)
 from .evaluation import BENCHMARK_ORDER, evaluate_loaded_suite
 from .eval_schedule import (
     should_run_training_evaluation,
@@ -35,6 +44,7 @@ from .scoring import (
 )
 from .selector_logging import SelectedTokenLogger
 from .selectors import RACSelector, TASelector, top_budget_mask
+from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
 from .vllm_rollout import VLLMRolloutEngine
 
 
@@ -51,6 +61,114 @@ def _timed(device: torch.device, function, *args, **kwargs):
     result = function(*args, **kwargs)
     cuda_sync(device)
     return result, time.perf_counter() - started
+
+
+def _globalize_ta_output(
+    local: SelectorOutput,
+    valid_mask: torch.Tensor,
+    selector: TASelector,
+    distributed: DistributedContext,
+) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
+    """Apply TA's quantile normalization over the true global rollout batch."""
+    global_d, start, end, lengths = distributed.all_gather_variable_1d(
+        local.diagnostics["D"][valid_mask]
+    )
+    global_c, c_start, c_end, c_lengths = distributed.all_gather_variable_1d(
+        local.diagnostics["C"][valid_mask]
+    )
+    if (start, end, lengths) != (c_start, c_end, c_lengths):
+        raise AssertionError("Distributed TA D/C layouts differ")
+    global_d_norm = robust_quantile_normalize(
+        global_d, selector.q_low, selector.q_high, selector.eps
+    )
+    global_c_norm = robust_quantile_normalize(
+        global_c, selector.q_low, selector.q_high, selector.eps
+    )
+    global_score = global_d_norm * global_c_norm
+    diagnostics = dict(local.diagnostics)
+    diagnostics.update(
+        D_norm=scatter_valid(global_d_norm[start:end], valid_mask),
+        C_norm=scatter_valid(global_c_norm[start:end], valid_mask),
+        s_TA=scatter_valid(global_score[start:end], valid_mask),
+    )
+    global_diagnostics = {
+        "D": global_d,
+        "C": global_c,
+        "D_norm": global_d_norm,
+        "C_norm": global_c_norm,
+        "s_TA": global_score,
+    }
+    return (
+        SelectorOutput(diagnostics["s_TA"], diagnostics),
+        global_diagnostics,
+        start,
+        end,
+    )
+
+
+def _gather_selector_diagnostics(
+    diagnostics: dict[str, Any],
+    valid_mask: torch.Tensor,
+    keys: tuple[str, ...],
+    distributed: DistributedContext,
+) -> tuple[dict[str, torch.Tensor], int, int]:
+    gathered: dict[str, torch.Tensor] = {}
+    layout: tuple[int, int, tuple[int, ...]] | None = None
+    for key in keys:
+        value = diagnostics.get(key)
+        if not torch.is_tensor(value) or value.shape != valid_mask.shape:
+            continue
+        combined, start, end, lengths = distributed.all_gather_variable_1d(
+            value[valid_mask]
+        )
+        current_layout = (start, end, lengths)
+        if layout is None:
+            layout = current_layout
+        elif layout != current_layout:
+            raise AssertionError(f"Distributed selector layout differs for {key}")
+        gathered[key] = combined
+    if layout is None:
+        raise ValueError("No token-shaped selector diagnostics were available")
+    return gathered, layout[0], layout[1]
+
+
+def _local_mask_from_global_budget(
+    global_scores: torch.Tensor,
+    local_valid_mask: torch.Tensor,
+    start: int,
+    end: int,
+    rho: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global_valid = torch.ones_like(global_scores, dtype=torch.bool)
+    global_selected = top_budget_mask(global_scores, global_valid, rho)
+    local_selected = torch.zeros_like(local_valid_mask, dtype=torch.bool)
+    local_selected[local_valid_mask] = global_selected[start:end]
+    return local_selected, global_selected
+
+
+def _rollout_hash(
+    response_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    distributed: DistributedContext,
+) -> str:
+    serialized = []
+    for row_ids, row_valid in zip(response_ids, valid_mask):
+        tokens = row_ids[row_valid].long()
+        serialized.append(
+            torch.cat(
+                (
+                    torch.tensor([tokens.numel()], device=tokens.device),
+                    tokens,
+                )
+            )
+        )
+    local = (
+        torch.cat(serialized)
+        if serialized
+        else torch.empty(0, dtype=torch.long, device=distributed.device)
+    )
+    combined, _, _, _ = distributed.all_gather_variable_1d(local)
+    return hashlib.sha256(combined.detach().cpu().numpy().tobytes()).hexdigest()
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -104,6 +222,19 @@ def _evaluate_vllm_subprocess(
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
     )
+    for name in (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCHELASTIC_RUN_ID",
+    ):
+        environment.pop(name, None)
     command = [
         sys.executable,
         "-m",
@@ -233,12 +364,17 @@ def _opd_train_step(
     teacher_log_probs,
     config,
     device,
+    distributed: DistributedContext,
+    global_batch_size: int,
 ):
     training = config["training"]
-    micro_batch = max(
-        1, int(training.get("micro_batch_size", rollout.input_ids.shape[0]))
+    global_micro_batch = max(
+        1, int(training.get("micro_batch_size", global_batch_size))
     )
-    batch_size = rollout.input_ids.shape[0]
+    micro_batch = max(1, math.ceil(global_micro_batch / distributed.world_size))
+    local_batch_size = rollout.input_ids.shape[0]
+    if local_batch_size <= 0 or global_batch_size <= 0:
+        raise ValueError("OPD train step received an empty local/global batch")
     eps_low, eps_high = (
         float(training.get("ppo_clip_low", 0.2)),
         float(training.get("ppo_clip_high", 0.28)),
@@ -246,49 +382,60 @@ def _opd_train_step(
     advantage = (teacher_log_probs - old_student_log_probs).detach()
     optimizer.zero_grad(set_to_none=True)
     model.train()
-    model.config.use_cache = False
+    unwrap_model(model).config.use_cache = False
     forward_seconds = backward_seconds = loss_value = 0.0
-    for begin in range(0, batch_size, micro_batch):
-        end = min(begin + micro_batch, batch_size)
-        cuda_sync(device)
-        started = time.perf_counter()
-        output = model(
-            input_ids=rollout.input_ids[begin:end],
-            attention_mask=rollout.attention_mask[begin:end],
-            use_cache=False,
-            return_dict=True,
+    begins = list(range(0, local_batch_size, micro_batch))
+    for chunk_index, begin in enumerate(begins):
+        end = min(begin + micro_batch, local_batch_size)
+        synchronize = chunk_index == len(begins) - 1
+        sync_context = (
+            nullcontext()
+            if synchronize or not isinstance(model, DistributedDataParallel)
+            else model.no_sync()
         )
-        width, start = rollout.response_ids.shape[1], rollout.prompt_width - 1
-        logits = output.logits[:, start : start + width]
-        labels = rollout.response_ids[begin:end]
-        current = (
-            -F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                labels.reshape(-1),
-                reduction="none",
+        with sync_context:
+            cuda_sync(device)
+            started = time.perf_counter()
+            output = model(
+                input_ids=rollout.input_ids[begin:end],
+                attention_mask=rollout.attention_mask[begin:end],
+                use_cache=False,
+                return_dict=True,
             )
-            .view_as(labels)
-            .float()
-        )
-        old, adv = old_student_log_probs[begin:end], advantage[begin:end]
-        ratio = torch.exp((current - old).clamp(-20.0, 20.0))
-        elementwise = torch.maximum(
-            -ratio * adv, -ratio.clamp(1.0 - eps_low, 1.0 + eps_high) * adv
-        )
-        masks = selected_mask[begin:end].float()
-        loss = (
-            (elementwise * masks).sum(-1) / masks.sum(-1).clamp_min(1.0)
-        ).sum() / batch_size
-        cuda_sync(device)
-        forward_seconds += time.perf_counter() - started
-        finite_or_raise("OPD loss", loss.detach().reshape(1))
-        cuda_sync(device)
-        started = time.perf_counter()
-        loss.backward()
-        cuda_sync(device)
-        backward_seconds += time.perf_counter() - started
-        loss_value += float(loss.detach().item())
-        del output, logits, current, ratio, elementwise, loss
+            width, start = rollout.response_ids.shape[1], rollout.prompt_width - 1
+            logits = output.logits[:, start : start + width]
+            labels = rollout.response_ids[begin:end]
+            current = (
+                -F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    labels.reshape(-1),
+                    reduction="none",
+                )
+                .view_as(labels)
+                .float()
+            )
+            old, adv = old_student_log_probs[begin:end], advantage[begin:end]
+            ratio = torch.exp((current - old).clamp(-20.0, 20.0))
+            elementwise = torch.maximum(
+                -ratio * adv, -ratio.clamp(1.0 - eps_low, 1.0 + eps_high) * adv
+            )
+            masks = selected_mask[begin:end].float()
+            # DDP averages gradients across ranks. Multiplying each local sum
+            # by world/global_batch therefore reproduces the original global
+            # per-sample mean even for an uneven final batch.
+            loss = (
+                (elementwise * masks).sum(-1) / masks.sum(-1).clamp_min(1.0)
+            ).sum() * (distributed.world_size / global_batch_size)
+            cuda_sync(device)
+            forward_seconds += time.perf_counter() - started
+            finite_or_raise("OPD loss", loss.detach().reshape(1))
+            cuda_sync(device)
+            started = time.perf_counter()
+            loss.backward()
+            cuda_sync(device)
+            backward_seconds += time.perf_counter() - started
+            loss_value += float(loss.detach().item())
+            del output, logits, current, ratio, elementwise, loss
     cuda_sync(device)
     started = time.perf_counter()
     gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -299,8 +446,9 @@ def _opd_train_step(
     optimizer.zero_grad(set_to_none=True)
     cuda_sync(device)
     backward_seconds += time.perf_counter() - started
+    global_loss = distributed.sum_float(loss_value) / distributed.world_size
     return {
-        "loss": loss_value,
+        "loss": global_loss,
         "gradient_norm": float(gradient_norm.detach().item()),
         "training_forward_time": forward_seconds,
         "backward_update_time": backward_seconds,
@@ -329,9 +477,9 @@ def _save_checkpoint(
 def run_training(
     config: dict[str, Any], command_line: list[str] | None = None
 ) -> dict[str, Any]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("B200 training requires CUDA")
-    device = torch.device("cuda", 0)
+    distributed_cfg = config.get("distributed", {})
+    distributed = initialize_distributed(distributed_cfg.get("backend", "nccl"))
+    device = distributed.device
     if (
         bool(config["experiment"].get("require_b200", True))
         and "B200" not in torch.cuda.get_device_name(device).upper()
@@ -354,7 +502,9 @@ def run_training(
     ):
         raise FileExistsError(f"Refusing to append to existing run: {metrics_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, output_dir / "resolved_config.yaml")
+    if distributed.is_main:
+        save_config(config, output_dir / "resolved_config.yaml")
+    distributed.barrier()
 
     rollout_backend = str(config["rollout"].get("backend", "vllm")).lower()
     if rollout_backend not in {"vllm", "hf"}:
@@ -372,7 +522,7 @@ def run_training(
         unit="stage",
         dynamic_ncols=True,
         leave=False,
-        disable=False,
+        disable=not distributed.is_main,
     )
     setup_progress.set_postfix_str("stage=load-data", refresh=True)
     records, data_files = read_records(
@@ -385,28 +535,58 @@ def run_training(
         f"stage=start-rollout-{rollout_backend}", refresh=True
     )
     if rollout_backend == "vllm":
-        rollout_engine = VLLMRolloutEngine(config, output_dir)
+        rollout_engine = VLLMRolloutEngine(
+            config,
+            output_dir,
+            local_rank=distributed.local_rank,
+            world_size=distributed.world_size,
+            port=unique_free_port(distributed),
+        )
         rollout_engine.start()
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=load-models", refresh=True)
     student, teacher, tokenizer, model_metadata = load_models(config, device)
+    training_student = student
+    if distributed.enabled:
+        training_student = DistributedDataParallel(
+            student,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=bool(
+                distributed_cfg.get("find_unused_parameters", False)
+            ),
+            gradient_as_bucket_view=bool(
+                distributed_cfg.get("gradient_as_bucket_view", True)
+            ),
+            static_graph=bool(distributed_cfg.get("static_graph", True)),
+            bucket_cap_mb=float(distributed_cfg.get("bucket_cap_mb", 100)),
+        )
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
-    metadata = collect_metadata(
-        Path(__file__).resolve().parents[1],
-        command_line or sys.argv,
-        model_metadata,
-        config["data"]["path"],
-        data_files,
-    )
-    metadata["data_schema"] = {
-        "rows": len(records),
-        "columns": sorted(records[0]),
-        "files": [str(path) for path in data_files],
-        "split": config["data"].get("split"),
-        "full_dataset": True,
-    }
-    save_metadata(metadata, output_dir)
+    if distributed.is_main:
+        metadata = collect_metadata(
+            Path(__file__).resolve().parents[1],
+            command_line or sys.argv,
+            model_metadata,
+            config["data"]["path"],
+            data_files,
+        )
+        metadata["data_schema"] = {
+            "rows": len(records),
+            "columns": sorted(records[0]),
+            "files": [str(path) for path in data_files],
+            "split": config["data"].get("split"),
+            "full_dataset": True,
+        }
+        metadata["distributed"] = {
+            "strategy": "ddp" if distributed.enabled else "single_process",
+            "world_size": distributed.world_size,
+            "global_batch_preserved": True,
+            "global_ta_normalization": True,
+            "global_token_budget": True,
+        }
+        save_metadata(metadata, output_dir)
     optimizer, fused_optimizer = _make_optimizer(
         [parameter for parameter in student.parameters() if parameter.requires_grad],
         training,
@@ -440,20 +620,25 @@ def run_training(
         method,
         chunk_steps=int(config.get("logging", {}).get("selector_chunk_steps", 50)),
         enabled=bool(config.get("logging", {}).get("selected_tokens_enabled", True)),
+        rank=distributed.rank,
+        world_size=distributed.world_size,
     )
     training_eval_settings = config.get("training_evaluation", {})
     evaluation_steps = training_evaluation_steps(max_steps, training_eval_settings)
-    if evaluation_steps:
+    if evaluation_steps and distributed.is_main:
         tqdm.write(
             f"Periodic evaluation ({training_eval_settings.get('backend', 'vllm')}): "
             + ", ".join(map(str, evaluation_steps))
         )
     initial_evaluation = None
     if should_run_training_evaluation(0, max_steps, training_eval_settings):
-        tqdm.write("Evaluating the untouched base student at optimizer step 0...")
-        initial_evaluation = _run_training_evaluation(
-            student, tokenizer, method, 0, max_steps, config, output_dir
-        )
+        distributed.barrier()
+        if distributed.is_main:
+            tqdm.write("Evaluating the untouched base student at optimizer step 0...")
+            initial_evaluation = _run_training_evaluation(
+                student, tokenizer, method, 0, max_steps, config, output_dir
+            )
+        distributed.barrier()
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
         range(max_steps),
@@ -461,14 +646,24 @@ def run_training(
         unit="step",
         dynamic_ncols=True,
         leave=True,
-        disable=False,
+        disable=not distributed.is_main,
         mininterval=0.5,
     )
     for step_index in progress:
         step, step_started = step_index + 1, time.perf_counter()
-        progress.set_postfix_str(f"stage=rollout-{rollout_backend}", refresh=True)
+        if distributed.is_main:
+            progress.set_postfix_str(f"stage=rollout-{rollout_backend}", refresh=True)
         torch.cuda.reset_peak_memory_stats(device)
-        indices = epoch_batch_indices(len(records), batch_size, step_index, seed)
+        global_indices = epoch_batch_indices(len(records), batch_size, step_index, seed)
+        if len(global_indices) < distributed.world_size:
+            raise ValueError(
+                f"Global batch has {len(global_indices)} samples but WORLD_SIZE is "
+                f"{distributed.world_size}; every DDP worker needs at least one sample"
+            )
+        local_start, local_end = contiguous_partition(
+            len(global_indices), distributed.rank, distributed.world_size
+        )
+        indices = global_indices[local_start:local_end]
         batch_records = [records[index] for index in indices]
         encoded, _ = tokenize_prompts(batch_records, tokenizer, config["data"], device)
         rollout_function = (
@@ -488,6 +683,7 @@ def run_training(
             eos_token_ids=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             seed=int(config["rollout"].get("seed", seed)) + step_index,
+            sample_seed_offset=local_start,
         )
         rollout_backend_metrics = (
             dict(rollout_engine.last_metrics) if rollout_engine is not None else {}
@@ -501,30 +697,44 @@ def run_training(
         ):
             setattr(rollout, field, getattr(rollout, field).clone())
         original_rollout = rollout.input_ids.clone()
-        rollout_hash = hashlib.sha256(
-            rollout.input_ids.detach().cpu().numpy().tobytes()
-        ).hexdigest()
-        progress.set_postfix_str("stage=score-student", refresh=True)
+        rollout_hash = _rollout_hash(
+            rollout.response_ids, rollout.valid_mask, distributed
+        )
+        if distributed.is_main:
+            progress.set_postfix_str("stage=score-student", refresh=True)
         student_scores, student_base_time = _timed(
             device, score_original_rollout, student, rollout, True
         )
-        progress.set_postfix_str("stage=score-teacher", refresh=True)
+        if distributed.is_main:
+            progress.set_postfix_str("stage=score-teacher", refresh=True)
         teacher_scores, teacher_base_time = _timed(
             device, score_original_rollout, teacher, rollout, True
         )
         valid = rollout.valid_mask
         finite_or_raise("student probabilities", student_scores.probabilities[valid])
         finite_or_raise("teacher probabilities", teacher_scores.probabilities[valid])
-        ta_output, ta_time = _timed(
+        ta_raw, ta_raw_time = _timed(
             device,
             ta_selector.compute_scores,
             student_scores.probabilities,
             teacher_scores.probabilities,
             valid,
+            normalize=False,
         )
+        ta_globalized, ta_normalization_time = _timed(
+            device,
+            _globalize_ta_output,
+            ta_raw,
+            valid,
+            ta_selector,
+            distributed,
+        )
+        ta_output, global_ta_diagnostics, ta_start, ta_end = ta_globalized
+        ta_time = ta_raw_time + ta_normalization_time
         cross_diagnostics, prober = {}, None
         if method == "rac":
-            progress.set_postfix_str("stage=selector-RAC", refresh=True)
+            if distributed.is_main:
+                progress.set_postfix_str("stage=selector-RAC", refresh=True)
             prober = HFBranchProber(
                 student,
                 teacher,
@@ -537,6 +747,7 @@ def run_training(
             )
             if step_index == 0 and bool(selector_cfg.get("validate_kv_cache", True)):
                 cache_error = prober.validate_kv_equivalence()
+                cache_error = distributed.max_float(cache_error)
                 tolerance = float(selector_cfg.get("kv_cache_tolerance", 0.04))
                 if cache_error > tolerance:
                     raise AssertionError(
@@ -550,26 +761,64 @@ def run_training(
                 teacher_scores.probabilities,
                 valid,
                 prober,
+                student_topk=(
+                    ta_output.diagnostics["_student_top_values"],
+                    ta_output.diagnostics["_student_top_ids"],
+                ),
+            )
+            rac_keys = (
+                "s_RAC",
+                "Delta",
+                "A",
+                "F",
+                "B",
+                "positive_reachable_candidates",
+                "evaluated_branches",
+                "mean_Cplus",
+            )
+            global_primary_diagnostics, primary_start, primary_end = (
+                _gather_selector_diagnostics(
+                    primary.diagnostics, valid, rac_keys, distributed
+                )
+            )
+            if (primary_start, primary_end) != (ta_start, ta_end):
+                raise AssertionError("TA/RAC distributed token layouts differ")
+            global_valid_mask = torch.ones_like(
+                global_ta_diagnostics["s_TA"], dtype=torch.bool
             )
             cross_diagnostics.update(
-                correlations(ta_output.scores, primary.diagnostics, valid)
+                correlations(
+                    global_ta_diagnostics["s_TA"],
+                    global_primary_diagnostics,
+                    global_valid_mask,
+                )
             )
             rac_probe_time, rac_branches = (
                 prober.counterfactual_seconds,
                 prober.evaluated_branches,
             )
         else:
-            progress.set_postfix_str("stage=selector-TA", refresh=True)
+            if distributed.is_main:
+                progress.set_postfix_str("stage=selector-TA", refresh=True)
             primary, selector_time, rac_probe_time, rac_branches = (
                 ta_output,
                 ta_time,
                 0.0,
                 0,
             )
+            global_primary_diagnostics = global_ta_diagnostics
+            primary_start, primary_end = ta_start, ta_end
         finite_or_raise(f"{method} selector", primary.scores[valid])
-        selected = top_budget_mask(primary.scores, valid, rho).clone()
-        expected = math.ceil(rho * int(valid.sum().item()))
-        if int(selected.sum().item()) != expected:
+        score_key = "s_RAC" if method == "rac" else "s_TA"
+        selected, global_selected = _local_mask_from_global_budget(
+            global_primary_diagnostics[score_key],
+            valid,
+            primary_start,
+            primary_end,
+            rho,
+        )
+        expected = math.ceil(rho * global_primary_diagnostics[score_key].numel())
+        if distributed.sum_int(int(selected.sum().item())) != expected:
             raise AssertionError("TA/RAC shared budget count is incorrect")
         if not torch.equal(original_rollout, rollout.input_ids):
             raise AssertionError("Selector changed the original rollout")
@@ -584,13 +833,16 @@ def run_training(
             response_ids=rollout.response_ids,
             selected_mask=selected,
             diagnostics=primary.diagnostics,
+            batch_index_offset=local_start,
         )
+        global_logged_selected = distributed.sum_int(logged_selected)
         if (
             bool(config.get("logging", {}).get("selected_tokens_enabled", True))
-            and logged_selected != expected
+            and global_logged_selected != expected
         ):
             raise AssertionError(
-                f"Detailed selector log wrote {logged_selected}, expected {expected}"
+                f"Detailed selector logs wrote {global_logged_selected}, "
+                f"expected {expected}"
             )
 
         old_student = student_scores.sampled_log_probs.detach().clone()
@@ -600,9 +852,10 @@ def run_training(
         # Emptying the CUDA allocator every step is materially slower on B200.
         if bool(training.get("empty_cuda_cache_each_step", False)):
             torch.cuda.empty_cache()
-        progress.set_postfix_str("stage=train", refresh=True)
+        if distributed.is_main:
+            progress.set_postfix_str("stage=train", refresh=True)
         train_metrics = _opd_train_step(
-            student,
+            training_student,
             optimizer,
             rollout,
             selected,
@@ -610,12 +863,16 @@ def run_training(
             teacher_log_probs,
             config,
             device,
+            distributed,
+            len(global_indices),
         )
         checkpoint = None
         save_checkpoints = bool(training.get("save_checkpoints", True))
         save_interval = int(training.get("save_interval", 100))
-        if save_checkpoints and (
-            step == max_steps or (save_interval > 0 and step % save_interval == 0)
+        if (
+            distributed.is_main
+            and save_checkpoints
+            and (step == max_steps or (save_interval > 0 and step % save_interval == 0))
         ):
             progress.set_postfix_str("stage=checkpoint", refresh=True)
             checkpoint = _save_checkpoint(
@@ -627,45 +884,89 @@ def run_training(
                 step == max_steps,
                 bool(training.get("save_optimizer", True)),
             )
+        distributed.barrier()
         cuda_sync(device)
-        wall_time, valid_tokens = (
-            time.perf_counter() - step_started,
-            int(valid.sum().item()),
-        )
+        local_wall_time = time.perf_counter() - step_started
+        local_valid_tokens = int(valid.sum().item())
+        local_peak_allocated = torch.cuda.max_memory_allocated(device)
+        local_peak_reserved = torch.cuda.max_memory_reserved(device)
+        wall_time = distributed.max_float(local_wall_time)
+        valid_tokens = distributed.sum_int(local_valid_tokens)
+        peak_allocated = distributed.max_int(local_peak_allocated)
+        peak_reserved = distributed.max_int(local_peak_reserved)
+        peak_allocated_total = distributed.sum_int(local_peak_allocated)
+        peak_reserved_total = distributed.sum_int(local_peak_reserved)
+        aggregated_train_metrics = {
+            "loss": train_metrics["loss"],
+            "gradient_norm": distributed.max_float(train_metrics["gradient_norm"]),
+            "training_forward_time": distributed.max_float(
+                train_metrics["training_forward_time"]
+            ),
+            "backward_update_time": distributed.max_float(
+                train_metrics["backward_update_time"]
+            ),
+        }
         final_metrics = {
             "step": step,
             "epoch": step_index // steps_per_epoch,
             "step_in_epoch": step_index % steps_per_epoch,
             "method": method,
-            "batch_size": len(indices),
+            "batch_size": len(global_indices),
+            "local_batch_size_rank0": len(global_indices) // distributed.world_size
+            + int(0 < len(global_indices) % distributed.world_size),
             "configured_batch_size": batch_size,
             "micro_batch_size": int(training.get("micro_batch_size", batch_size)),
+            "local_micro_batch_size": math.ceil(
+                int(training.get("micro_batch_size", batch_size))
+                / distributed.world_size
+            ),
+            "distributed_world_size": distributed.world_size,
+            "distributed_strategy": (
+                "ddp" if distributed.enabled else "single_process"
+            ),
+            "global_batch_preserved": True,
+            "global_ta_normalization": True,
+            "global_token_budget": True,
+            "rac_reused_ta_student_topk": method == "rac",
             "fused_optimizer": fused_optimizer,
-            **train_metrics,
+            **aggregated_train_metrics,
             "rollout_backend": rollout_backend,
-            "rollout_time": rollout_time,
-            "vllm_weight_sync_time": rollout_backend_metrics.get(
-                "weight_sync_time", 0.0
+            "rollout_time": distributed.max_float(rollout_time),
+            "vllm_weight_sync_time": distributed.max_float(
+                rollout_backend_metrics.get("weight_sync_time", 0.0)
             ),
-            "vllm_generation_time": rollout_backend_metrics.get("generation_time", 0.0),
-            "vllm_sleep_time": rollout_backend_metrics.get("sleep_time", 0.0),
-            "vllm_torch_cache_released": bool(
-                rollout_backend_metrics.get("torch_cache_released", 0.0)
+            "vllm_generation_time": distributed.max_float(
+                rollout_backend_metrics.get("generation_time", 0.0)
             ),
-            "vllm_torch_cache_release_time": rollout_backend_metrics.get(
-                "torch_cache_release_time", 0.0
+            "vllm_sleep_time": distributed.max_float(
+                rollout_backend_metrics.get("sleep_time", 0.0)
             ),
-            "student_base_scoring_time": student_base_time,
-            "teacher_base_scoring_time": teacher_base_time,
-            "ta_diagnostic_time": ta_time,
-            "selector_time": selector_time,
-            "rac_counterfactual_time": rac_probe_time,
-            "rac_evaluated_branches": rac_branches,
+            "vllm_torch_cache_released": distributed.any(
+                bool(rollout_backend_metrics.get("torch_cache_released", 0.0))
+            ),
+            "vllm_torch_cache_release_time": distributed.max_float(
+                rollout_backend_metrics.get("torch_cache_release_time", 0.0)
+            ),
+            "student_base_scoring_time": distributed.max_float(student_base_time),
+            "teacher_base_scoring_time": distributed.max_float(teacher_base_time),
+            "ta_diagnostic_time": distributed.max_float(ta_time),
+            "selector_time": distributed.max_float(selector_time),
+            "rac_counterfactual_time": distributed.max_float(rac_probe_time),
+            "rac_evaluated_branches": distributed.sum_int(rac_branches),
             "wall_clock_step_time": wall_time,
             "tokens_per_second": valid_tokens / max(wall_time, 1e-12),
-            "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(device),
-            "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(device),
-            "selector": selector_summary(method, primary.diagnostics, valid, selected),
+            "peak_gpu_allocated_bytes": peak_allocated,
+            "peak_gpu_reserved_bytes": peak_reserved,
+            "peak_gpu_allocated_bytes_all_workers": peak_allocated_total,
+            "peak_gpu_reserved_bytes_all_workers": peak_reserved_total,
+            "selector": selector_summary(
+                method,
+                global_primary_diagnostics,
+                torch.ones_like(
+                    global_primary_diagnostics[score_key], dtype=torch.bool
+                ),
+                global_selected,
+            ),
             "cross_selector": cross_diagnostics,
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
@@ -680,44 +981,53 @@ def run_training(
             teacher_log_probs,
             selected,
             primary,
+            ta_raw,
             ta_output,
+            global_primary_diagnostics,
+            global_ta_diagnostics,
+            global_selected,
             valid,
             rollout_backend_metrics,
         )
         if should_run_training_evaluation(step, max_steps, training_eval_settings):
-            progress.set_postfix_str("stage=evaluation", refresh=True)
-            periodic_evaluation = _run_training_evaluation(
-                student,
-                tokenizer,
-                method,
-                step,
-                max_steps,
-                config,
-                output_dir,
-                checkpoint=checkpoint,
+            distributed.barrier()
+            if distributed.is_main:
+                progress.set_postfix_str("stage=evaluation", refresh=True)
+                periodic_evaluation = _run_training_evaluation(
+                    student,
+                    tokenizer,
+                    method,
+                    step,
+                    max_steps,
+                    config,
+                    output_dir,
+                    checkpoint=checkpoint,
+                )
+                final_metrics["periodic_evaluation"] = {
+                    "evaluation_time": periodic_evaluation["evaluation_time"],
+                    "benchmarks": periodic_evaluation["benchmarks"],
+                    "details": periodic_evaluation["details"],
+                }
+                final_metrics["wall_clock_step_plus_eval_time"] = (
+                    wall_time + periodic_evaluation["evaluation_time"]
+                )
+            distributed.barrier()
+        if distributed.is_main:
+            _append_jsonl(metrics_path, final_metrics)
+            progress.set_postfix(
+                loss=f"{train_metrics['loss']:.4f}",
+                selected=f"{expected}/{valid_tokens}",
+                selector=f"{final_metrics['selector_time']:.2f}s",
+                gpu=f"{final_metrics['peak_gpu_allocated_bytes'] / 2**30:.1f}GiB",
+                refresh=True,
             )
-            final_metrics["periodic_evaluation"] = {
-                "evaluation_time": periodic_evaluation["evaluation_time"],
-                "benchmarks": periodic_evaluation["benchmarks"],
-                "details": periodic_evaluation["details"],
-            }
-            final_metrics["wall_clock_step_plus_eval_time"] = (
-                wall_time + periodic_evaluation["evaluation_time"]
-            )
-        _append_jsonl(metrics_path, final_metrics)
-        progress.set_postfix(
-            loss=f"{train_metrics['loss']:.4f}",
-            selected=f"{expected}/{valid_tokens}",
-            selector=f"{selector_time:.2f}s",
-            gpu=f"{final_metrics['peak_gpu_allocated_bytes'] / 2**30:.1f}GiB",
-            refresh=True,
-        )
-        if bool(experiment.get("verbose_metrics", False)):
+        if distributed.is_main and bool(experiment.get("verbose_metrics", False)):
             tqdm.write(
                 json.dumps(final_metrics, indent=2, ensure_ascii=False, allow_nan=True)
             )
     if rollout_engine is not None:
         rollout_engine.close()
+    distributed.barrier()
     summary = {
         "status": "ok",
         "method": method,
@@ -726,9 +1036,26 @@ def run_training(
         "dataset_rows": len(records),
         "full_dataset": True,
         "rollout_backend": rollout_backend,
+        "distributed_world_size": distributed.world_size,
+        "global_batch_preserved": True,
         "vllm_rollout_server_log": str(
             (output_dir / "vllm_rollout_server.log").resolve()
         )
+        if rollout_backend == "vllm" and distributed.world_size == 1
+        else None,
+        "vllm_rollout_server_logs": [
+            str(
+                (
+                    output_dir
+                    / (
+                        f"vllm_rollout_server.rank-{rank:05d}.log"
+                        if distributed.world_size > 1
+                        else "vllm_rollout_server.log"
+                    )
+                ).resolve()
+            )
+            for rank in range(distributed.world_size)
+        ]
         if rollout_backend == "vllm"
         else None,
         "last": final_metrics,
@@ -740,7 +1067,14 @@ def run_training(
         else None,
         "initial_evaluation": initial_evaluation,
     }
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)
-        handle.write("\n")
-    return summary
+    if distributed.is_main:
+        with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)
+            handle.write("\n")
+    result = (
+        summary
+        if distributed.is_main
+        else {"status": "worker_ok", "rank": distributed.rank}
+    )
+    distributed.close()
+    return result
