@@ -18,7 +18,7 @@ class AutotuneTests(unittest.TestCase):
             )
             _update_readme(readme, 64, 0.81, "NVIDIA B200")
             content = readme.read_text(encoding="utf-8")
-            self.assertIn("batch/micro-batch **64/64**", content)
+            self.assertIn("global batch/micro-batch **64/1**", content)
             self.assertIn("`0.810`", content)
             self.assertNotIn("old", content)
 

@@ -60,6 +60,24 @@ def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, A
     return result
 
 
+def resolve_runtime_paths(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve all B200 assets from one configurable storage root."""
+    result = copy.deepcopy(config)
+    root = Path(result.get("paths", {}).get("storage_root", "/workspace/storage-shared"))
+
+    def resolved(value: str) -> str:
+        path = Path(value).expanduser()
+        return str((path if path.is_absolute() else root / path).resolve())
+
+    for key in ("teacher_path", "student_path"):
+        result["models"][key] = resolved(result["models"][key])
+    result["data"]["path"] = resolved(result["data"]["path"])
+    for benchmark in result.get("evaluation", {}).get("benchmarks", {}).values():
+        benchmark["path"] = resolved(benchmark["path"])
+    result.setdefault("paths", {})["storage_root"] = str(root.resolve())
+    return result
+
+
 def save_config(config: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

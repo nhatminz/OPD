@@ -12,6 +12,7 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}"
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export PYTHONUNBUFFERED=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
@@ -112,18 +113,19 @@ autotune = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if not autotune.get("autotune", {}).get("validated"):
     raise SystemExit("B200 batch config is not validated")
 batch = autotune["autotune"]["selected_batch_size"]
-if batch != autotune["rollout"]["batch_size"] or batch != autotune["training"]["micro_batch_size"]:
-    raise SystemExit("Autotune batch/micro-batch values are inconsistent")
-print(f"Autotuned B200 batch size: {batch} (gradient accumulation: 1)")
+micro = autotune["training"]["micro_batch_size"]
+if batch != autotune["rollout"]["batch_size"] or micro <= 0:
+    raise SystemExit("Autotune rollout/micro-batch values are inconsistent")
+print(f"Autotuned B200 global batch size: {batch} (global micro-batch: {micro})")
 PY
   else
-    "${PYTHON_BIN}" - "${TRAIN_BATCH_SIZE:-8}" <<'PY'
+    "${PYTHON_BIN}" - "${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}" "${MICRO_BATCH_SIZE:-1}" <<'PY'
 import sys
 
-batch = int(sys.argv[1])
-if batch <= 0:
-    raise SystemExit("TRAIN_BATCH_SIZE must be a positive integer")
-print(f"Fixed global training batch size: {batch} (global micro-batch: {batch}, gradient accumulation: 1)")
+batch, micro = map(int, sys.argv[1:])
+if batch <= 0 or micro <= 0:
+    raise SystemExit("GLOBAL_BATCH_SIZE and MICRO_BATCH_SIZE must be positive integers")
+print(f"Fixed global training batch size: {batch} (global micro-batch: {micro})")
 PY
   fi
 }
@@ -139,49 +141,60 @@ build_training_args() {
   local output_dir="$1"
   COMMON_TRAIN_ARGS=(
     --set "experiment.output_dir=${output_dir}"
-    --set "experiment.seed=${EXPERIMENT_SEED:-1234}"
-    --set "training.epochs=${EPOCHS:-1}"
-    --set "training.learning_rate=${LEARNING_RATE:-1.0e-5}"
-    --set "training.save_interval=${SAVE_INTERVAL:-100}"
+    --set "paths.storage_root=${STORAGE_ROOT}"
+    --set "experiment.seed=${SEED:-${EXPERIMENT_SEED:-42}}"
+    --set "data.max_prompt_tokens=${MAX_PROMPT_LEN:-2048}"
+    --set "training.epochs=${NUM_EPOCHS:-${EPOCHS:-1}}"
+    --set "training.learning_rate=${LR:-${LEARNING_RATE:-1.0e-6}}"
+    --set "training.save_interval=${SAVE_INTERVAL:-50}"
+    --set "training.grad_accum_steps=${GRAD_ACCUM_STEPS:-auto}"
     --set "distributed.bucket_cap_mb=${DDP_BUCKET_CAP_MB:-100}"
     --set "rollout.backend=${ROLLOUT_BACKEND:-vllm}"
     --set "rollout.seed=${ROLLOUT_SEED:-42}"
-    --set "rollout.max_new_tokens=${MAX_NEW_TOKENS:-2048}"
+    --set "rollout.max_new_tokens=${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-8192}}"
     --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
-    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${TRAIN_BATCH_SIZE:-8}}"
-    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-4096}"
-    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${TRAIN_BATCH_SIZE:-8}}"
+    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}}"
+    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-12288}"
+    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}}"
     --set "rollout.vllm.wake_headroom_gib=${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
-    --set "token_budget.rho=${RHO:-0.10}"
+    --set "token_budget.rho=${TA_RHO:-${RHO:-0.10}}"
     --set "selector.top_k=${TOP_K:-16}"
-    --set "selector.branch_m=${BRANCH_M:-4}"
+    --set "selector.score_chunk_steps=${SCORE_CHUNK_STEPS:-128}"
+    --set "selector.ta_vocab_chunk_tokens=${TA_VOCAB_CHUNK_TOKENS:-2048}"
+    --set "selector.rac_gamma=${RAC_GAMMA:-0.995}"
+    --set "selector.rac_w_min=${RAC_W_MIN:-0.10}"
+    --set "selector.rac_beta=${RAC_BETA:-2.0}"
+    --set "selector.rac_scan_backend=${RAC_SCAN_BACKEND:-parallel}"
+    --set "logging.token_score_interval=${TOKEN_SCORE_INTERVAL:-${EVAL_INTERVAL:-50}}"
+    --set "logging.log_interval=${LOG_INTERVAL:-1}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
-    --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET:-16}"
+    --set "training_evaluation.target_evaluations=null"
+    --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "training_evaluation.limit=null"
     --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-16}"
-    --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-2048}"
+    --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"
     --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
     --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
     --set "training_evaluation.vllm.gpu_headroom_gib=${VLLM_GPU_HEADROOM_GIB:-4}"
     --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-256}"
-    --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-4096}"
+    --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-12288}"
   )
   if batch_autotune_enabled; then
     COMMON_TRAIN_ARGS=(--overlay "${AUTOTUNE_CONFIG}" "${COMMON_TRAIN_ARGS[@]}")
   else
     COMMON_TRAIN_ARGS+=(
-      --set "rollout.batch_size=${TRAIN_BATCH_SIZE:-8}"
-      --set "training.micro_batch_size=${TRAIN_BATCH_SIZE:-8}"
+      --set "rollout.batch_size=${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}"
+      --set "training.micro_batch_size=${MICRO_BATCH_SIZE:-1}"
     )
   fi
-  if [[ -n "${TRAIN_EVAL_INTERVAL:-}" ]]; then
+  if [[ -n "${TRAIN_EVAL_TARGET:-}" ]]; then
     COMMON_TRAIN_ARGS+=(
-      --set "training_evaluation.target_evaluations=null"
-      --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL}"
+      --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET}"
+      --set "training_evaluation.interval_steps=null"
     )
   fi
-  if [[ -n "${MAX_STEPS:-}" ]]; then
+  if [[ -n "${MAX_STEPS:-}" && "${MAX_STEPS}" != "-1" ]]; then
     COMMON_TRAIN_ARGS+=(--set "training.max_steps=${MAX_STEPS}")
   fi
   if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then

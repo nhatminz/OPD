@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from b200_experiment.config import load_config
+from b200_experiment.config import load_config, resolve_runtime_paths
 from b200_experiment.data import epoch_batch_indices, read_records
 from b200_experiment.evaluation import load_benchmark
 
@@ -57,9 +57,9 @@ class DataEvaluationConfigTests(unittest.TestCase):
 
     def test_configs_have_exact_paths_and_fair_shared_settings(self):
         root = Path(__file__).resolve().parents[1]
-        base = load_config(root / "configs/qwen3_b200_base.yaml")
-        ta = load_config(root / "configs/qwen3_b200_ta.yaml")
-        rac = load_config(root / "configs/qwen3_b200_rac.yaml")
+        base = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_base.yaml"))
+        ta = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_ta.yaml"))
+        rac = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_rac.yaml"))
         self.assertEqual(
             base["models"]["teacher_path"], "/workspace/storage-shared/models/Qwen3-4B"
         )
@@ -69,25 +69,29 @@ class DataEvaluationConfigTests(unittest.TestCase):
         )
         self.assertEqual(
             base["evaluation"]["benchmarks"]["AIME24"]["path"],
-            "/workspace/storage-shared/nlp/minhpn19/data/eval/aime24/test-00000-of-00001.parquet",
+            "/workspace/storage-shared/nlp/minhpn19/data/eval/aime24",
         )
         self.assertEqual(
             base["evaluation"]["benchmarks"]["AIME25"]["path"],
-            "/workspace/storage-shared/nlp/minhpn19/data/eval/aime25/test.jsonl",
+            "/workspace/storage-shared/nlp/minhpn19/data/eval/aime25",
         )
-        self.assertEqual(base["training_evaluation"]["target_evaluations"], 16)
+        self.assertIsNone(base["training_evaluation"]["target_evaluations"])
+        self.assertEqual(base["training_evaluation"]["interval_steps"], 50)
         self.assertEqual(base["training_evaluation"]["backend"], "vllm")
         self.assertIsNone(base["training_evaluation"]["limit"])
         self.assertEqual(base["evaluation"]["backend"], "vllm")
         self.assertIsNone(base["evaluation"]["limit"])
         self.assertEqual(base["rollout"]["backend"], "vllm")
         self.assertEqual(base["rollout"]["batch_size"], 8)
-        self.assertEqual(base["training"]["micro_batch_size"], 8)
-        self.assertEqual(base["rollout"]["max_new_tokens"], 2048)
-        self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 4096)
-        self.assertEqual(base["selector"]["branch_m"], 4)
+        self.assertEqual(base["training"]["micro_batch_size"], 1)
+        self.assertEqual(base["rollout"]["max_new_tokens"], 8192)
+        self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 12288)
+        self.assertEqual(base["selector"]["rac_gamma"], 0.995)
+        self.assertEqual(base["selector"]["rac_w_min"], 0.10)
+        self.assertEqual(base["selector"]["rac_beta"], 2.0)
         for section in (
             "models",
+            "paths",
             "data",
             "rollout",
             "selector",

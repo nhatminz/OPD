@@ -35,7 +35,7 @@ def _write_generated_config(
             "report": str(report_path),
         },
         "rollout": {"batch_size": selected},
-        "training": {"micro_batch_size": selected},
+        "training": {"micro_batch_size": 1},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -55,8 +55,8 @@ def _update_readme(
     _, after = remainder.split(end, 1)
     block = (
         f"{start}\n"
-        f"**Measured target result:** `{gpu_name}`, batch/micro-batch **{selected}/{selected}**, "
-        f"gradient accumulation **1**, worst peak-reserved fraction `{peak_ratio:.3f}`.\n"
+        f"**Measured target result:** `{gpu_name}`, global batch/micro-batch **{selected}/1**, "
+        f"worst peak-reserved fraction `{peak_ratio:.3f}`.\n"
         f"{end}"
     )
     readme.write_text(before + block + after, encoding="utf-8")
@@ -110,7 +110,7 @@ def run_batch_autotune(
                 "--set",
                 "training.save_checkpoints=false",
                 "--set",
-                f"training.micro_batch_size={batch_size}",
+                "training.micro_batch_size=1",
                 "--set",
                 f"rollout.batch_size={batch_size}",
                 "--set",
@@ -141,9 +141,13 @@ def run_batch_autotune(
         if pair_ok:
             ta_metric = pair["methods"]["ta"]["metrics"]
             rac_metric = pair["methods"]["rac"]["metrics"]
-            same_budget = (
-                ta_metric["selector"]["selected_tokens"]
-                == rac_metric["selector"]["selected_tokens"]
+            ta_budget_ok = ta_metric["selector"]["selected_tokens"] == math.ceil(
+                float(base["token_budget"]["rho"])
+                * ta_metric["selector"]["valid_tokens"]
+            )
+            rac_all_tokens = (
+                rac_metric["selector"]["selected_tokens"]
+                == rac_metric["selector"]["valid_tokens"]
             )
             same_rollout = (
                 ta_metric["rollout_token_sha256"] == rac_metric["rollout_token_sha256"]
@@ -153,12 +157,16 @@ def run_batch_autotune(
                 pair["methods"]["rac"]["peak_reserved_fraction"],
             )
             pair.update(
-                same_selected_token_count=same_budget,
+                ta_hard_budget_valid=ta_budget_ok,
+                rac_all_tokens_supervised=rac_all_tokens,
                 identical_initial_rollout=same_rollout,
                 peak_reserved_fraction=peak_ratio,
             )
             pair_ok = (
-                same_budget and same_rollout and peak_ratio <= max_reserved_fraction
+                ta_budget_ok
+                and rac_all_tokens
+                and same_rollout
+                and peak_ratio <= max_reserved_fraction
             )
         pair["accepted"] = pair_ok
         attempts.append(pair)
@@ -182,10 +190,10 @@ def run_batch_autotune(
         "candidate_policy": {
             "candidates": candidates,
             "max_reserved_fraction": max_reserved_fraction,
-            "selection": "largest tested TA+RAC batch passing finite-loss, equal-budget, identical-rollout and memory-headroom checks",
+            "selection": "largest tested TA+Bellman-RAC batch passing finite-loss, method-allocation, identical-rollout and memory-headroom checks",
         },
         "selected_batch_size": selected,
-        "selected_micro_batch_size": selected,
+        "selected_micro_batch_size": 1,
         "selected_peak_reserved_fraction": selected_peak_ratio,
         "attempts": attempts,
     }
@@ -203,10 +211,10 @@ def run_batch_autotune(
         "# B200 validation result\n\n"
         f"- GPU: `{report['gpu'][0]['name']}` ({report['gpu'][0]['memory_bytes'] / 2**30:.1f} GiB)\n"
         f"- Selected training batch: **{selected}**\n"
-        f"- Micro-batch / gradient accumulation: **{selected} / 1**\n"
+        "- Global micro-batch: **1** (accumulated within each rollout)\n"
         f"- Peak reserved fraction (worst of TA/RAC): `{selected_peak_ratio:.3f}`\n"
         f"- Full report: `{report_path}`\n"
-        "- Validation: both selectors had finite loss, identical rollout hash, equal selected-token count, and no checkpoint/full-run was started.\n",
+        "- Validation: both methods had finite loss and identical rollout hash; TA used its exact hard budget and Bellman-RAC supervised every valid token. No checkpoint/full run was started.\n",
         encoding="utf-8",
     )
     _update_readme(

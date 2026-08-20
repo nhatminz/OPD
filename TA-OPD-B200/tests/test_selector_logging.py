@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from b200_experiment.selector_logging import SelectedTokenLogger
+from b200_experiment.selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
 
 
 class FakeTokenizer:
@@ -71,6 +71,22 @@ class SelectorLoggingTests(unittest.TestCase):
             self.assertEqual(len(paths), 2)
             self.assertIn("rank-00000", paths[0].name)
             self.assertIn("rank-00001", paths[1].name)
+
+    def test_compact_rac_stats_cover_all_values_and_bound_raw_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            diagnostics = {
+                key: torch.linspace(0, 1, 100)
+                for key in ("g", "alignment", "V", "z", "w")
+            }
+            logger = TokenScoreStatsLogger(
+                temporary, "rac", interval=50, bins=10, raw_sample_size=7
+            )
+            path = logger.write(1, 100, diagnostics)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["scores"]["V"]["count"], 100)
+            self.assertEqual(sum(payload["scores"]["V"]["histogram"]["counts"]), 100)
+            self.assertEqual(len(payload["scores"]["V"]["sample"]), 7)
+            self.assertIsNone(logger.write(2, 100, diagnostics))
 
 
 if __name__ == "__main__":

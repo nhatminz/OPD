@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import torch
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -42,6 +41,8 @@ def _normalized_key(key: str) -> str:
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".parquet":
+        import pandas as pd
+
         return [
             {key: _plain(value) for key, value in row.items()}
             for row in pd.read_parquet(path).to_dict("records")
@@ -49,6 +50,19 @@ def _read_rows(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".jsonl":
         with path.open(encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, list) and all(isinstance(row, dict) for row in payload):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("data", "test", "records", "examples"):
+                rows = payload.get(key)
+                if isinstance(rows, list) and all(
+                    isinstance(row, dict) for row in rows
+                ):
+                    return rows
+            return [payload]
+        raise ValueError(f"Unsupported JSON evaluation structure in {path}")
     raise ValueError(f"Unsupported evaluation file: {path}")
 
 
@@ -60,13 +74,18 @@ def _resolve_benchmark_file(name: str, path: str | Path) -> Path:
         raise FileNotFoundError(f"{name} path does not exist: {path}")
     preferred = [
         path / "test.jsonl",
+        path / "test.json",
         path / "test-00000-of-00001.parquet",
         path / "test.parquet",
     ]
     for candidate in preferred:
         if candidate.is_file():
             return candidate
-    candidates = sorted(path.glob("*.jsonl")) + sorted(path.glob("*.parquet"))
+    candidates = (
+        sorted(path.glob("*.jsonl"))
+        + sorted(path.glob("*.json"))
+        + sorted(path.glob("*.parquet"))
+    )
     if len(candidates) != 1:
         raise ValueError(
             f"Expected one unambiguous data file for {name} under {path}; found {candidates}"

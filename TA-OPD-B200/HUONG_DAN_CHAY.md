@@ -1,208 +1,82 @@
-# Hướng dẫn train, plot, eval và resume TA-OPD/RAC trên B200
+# Hướng dẫn nhanh TA-OPD và Bellman-RAC trên B200
 
-Tất cả lệnh dưới đây chạy từ project root:
+Hướng dẫn chi tiết hơn nằm trong [`RUN_B200.md`](RUN_B200.md).
+
+## 1. Cài và kiểm tra
 
 ```bash
 cd /workspace/storage-shared/nlp/minhpn19/TA-OPD-B200
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
-## 1. Cấu hình mặc định hiện tại
-
-Hai file `scripts/train_ta_b200.sh` và `scripts/train_rac_b200.sh` có block tham số dễ sửa ở đầu
-file. Giá trị mặc định hiện tại là:
-
-```text
-global batch size              = 8
-training rollout max_new_tokens = 2048
-max prompt tokens               = 512
-training rollout max_model_len  = 4096
-RAC branch M                    = 4
-rho                             = 0.10
-top K                           = 16
-save interval                   = 100 step
-```
-
-`max_model_len=4096` tính cả prompt và response, và đủ cho cấu hình hiện tại:
-
-```text
-512 prompt + 2048 generated = 2560 context tokens <= 4096
-```
-
-Batch 8 là **global batch**. Chuyển giữa một, hai hoặc ba GPU không nhân batch lên theo số GPU.
-Với 17.398 mẫu, một epoch có `ceil(17398 / 8) = 2175` optimizer step.
-
-Sau khi đổi batch/context như trên, nên chạy lại preflight trên B200 một lần:
-
-```bash
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+python scripts/check_b200_env.py
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 ```
 
-## 2. Train mới TA-OPD
+## 2. Chạy full và công bằng
 
-Không cần tự đặt `RUN_NAME`. Script lấy thời gian bắt đầu lệnh theo định dạng
-`YYYYMMDD_HHMMSS`, ví dụ `20260819_143012`.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_ta_b200.sh
-```
-
-Terminal in tên cần giữ lại ở đầu/cuối run, ví dụ:
-
-```text
-TA-OPD run: 20260819_143012
-TA-OPD output: .../outputs/20260819_143012/ta_opd
-TA-OPD completed. Keep this identifier: TA_RUN_NAME=20260819_143012
-```
-
-## 3. Train mới RAC
-
-RAC là một lệnh hoàn toàn độc lập:
+Đặt hai tên riêng nhưng dùng cùng suffix và cùng mọi shared hyperparameter:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/train_rac_b200.sh
+PAIR=$(date +%Y%m%d_%H%M%S)
+export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
+export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
+
+RUN_NAME="$TA_RUN_NAME" CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/train_ta_b200.sh
+
+RUN_NAME="$RAC_RUN_NAME" CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/train_rac_b200.sh
 ```
 
-Ví dụ RAC bắt đầu muộn hơn và được gán tên khác:
-
-```text
-RAC run: 20260820_090530
-RAC output: .../outputs/20260820_090530/rac_opd
-RAC completed. Keep this identifier: RAC_RUN_NAME=20260820_090530
-```
-
-Không truyền `RESUME_FROM_CHECKPOINT` khi muốn train từ đầu. Nếu biến này từng được export trong
-shell hiện tại, xóa nó trước:
+Không đặt `MAX_STEPS` (hoặc để `-1`) để dùng toàn bộ epoch/full DAPO. Nếu cần hạ memory, đặt cùng
+giá trị cho hai lệnh, ví dụ:
 
 ```bash
-unset RESUME_FROM_CHECKPOINT
+GLOBAL_BATCH_SIZE=4 MICRO_BATCH_SIZE=1 MAX_RESPONSE_LEN=4096 \
+  RUN_NAME="$TA_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_ta_b200.sh
+GLOBAL_BATCH_SIZE=4 MICRO_BATCH_SIZE=1 MAX_RESPONSE_LEN=4096 \
+  RUN_NAME="$RAC_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
 ```
 
-## 4. Vẽ hình so sánh log training
+## 3. Resume
 
-Sau khi cả TA và RAC hoàn tất, ghép đúng hai timestamp đã được terminal in ra:
+Tự tìm checkpoint hoàn chỉnh mới nhất trong run:
 
 ```bash
-TA_RUN_NAME=20260819_143012 \
-RAC_RUN_NAME=20260820_090530 \
-bash scripts/plot_training_progress.sh
+RUN_NAME="$TA_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/train_ta_b200.sh
+RUN_NAME="$RAC_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/train_rac_b200.sh
 ```
 
-`COMPARISON_NAME` là tùy chọn. Khi bỏ qua như trên, script tự đặt
-`20260819_143012_vs_20260820_090530`. Chỉ truyền `COMPARISON_NAME=...` nếu muốn tên kết quả ngắn hoặc
-dễ đọc hơn.
-
-Kết quả:
-
-```text
-results/20260819_143012_vs_20260820_090530/training_eval_history.csv
-results/20260819_143012_vs_20260820_090530/training_eval_history.json
-results/20260819_143012_vs_20260820_090530/plots/accuracy_over_steps.png
-results/20260819_143012_vs_20260820_090530/plots/loss_comparison.png
-```
-
-Giữ `TRAIN_EVAL_ENABLED=true` trong cả hai script để có `accuracy_over_steps.png`.
-
-## 5. Final eval Base, TA-OPD và RAC
-
-Có thể eval bằng một GPU, không phụ thuộc số GPU đã dùng để train:
+Hoặc chỉ rõ checkpoint:
 
 ```bash
-TA_RUN_NAME=20260819_143012 \
-RAC_RUN_NAME=20260820_090530 \
-CUDA_VISIBLE_DEVICES=0 \
-bash scripts/eval_all_b200.sh
+RESUME_FROM_CHECKPOINT="outputs/$RAC_RUN_NAME/rac_opd/checkpoint-000100" \
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_rac_b200.sh
 ```
 
-Script tự đọc:
+Giữ nguyên model/data, batch, rollout length, seed, LR và hyperparameter khoa học khi resume.
 
-```text
-outputs/20260819_143012/ta_opd/final
-outputs/20260820_090530/rac_opd/final
-```
-
-Kết quả final eval và plots nằm trong:
-
-```text
-results/20260819_143012_vs_20260820_090530/
-```
-
-## 6. Resume một run dùng cấu hình mặc định mới
-
-Ví dụ TA bị ngắt và checkpoint mới nhất là step 100. `MAX_STEPS` là tổng step mục tiêu, không phải
-số step chạy thêm:
+## 4. Eval và plot
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-RESUME_FROM_CHECKPOINT=outputs/20260819_143012/ta_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_ta_b200.sh
+TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval_all_b200.sh
+
+TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  bash scripts/plot_training_progress.sh
 ```
 
-RAC tương tự:
+Manual eval riêng checkpoint RAC:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-RESUME_FROM_CHECKPOINT=outputs/20260820_090530/rac_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_rac_b200.sh
+RUN_NAME="$RAC_RUN_NAME" \
+RAC_CHECKPOINT="outputs/$RAC_RUN_NAME/rac_opd/checkpoint-000100" \
+CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 ```
 
-Khi có `RESUME_FROM_CHECKPOINT`, script tự suy ra `OUTPUT_DIR` là parent của checkpoint và append
-vào đúng run cũ. Checkpoint phải có cả `config.json` và `optimizer.pt`.
-
-## 7. Resume từ ba GPU xuống hai GPU
-
-Có thể đổi số GPU. Ví dụ hôm trước TA chạy trên `0,1,2`, hôm sau chỉ còn `0,1`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-RESUME_FROM_CHECKPOINT=outputs/20260819_143012/ta_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_ta_b200.sh
-```
-
-RAC:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-RESUME_FROM_CHECKPOINT=outputs/20260820_090530/rac_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_rac_b200.sh
-```
-
-Phải giữ nguyên global batch 8, rollout 2048 và các scientific hyperparameter của run. DDP chỉ đổi
-cách chia batch cục bộ: ba GPU nhận khoảng `3/3/2`, còn hai GPU nhận `4/4`; global update vẫn có cùng
-định nghĩa.
-
-## 8. Resume checkpoint nằm trong layout output cũ
-
-Checkpoint của run trước khi cập nhật code vẫn dùng global batch 8, rollout 2048, vLLM context 4096
-và branch M=4. Các giá trị này trùng với default hiện tại, nên không truyền override khác khi resume.
-Với TA checkpoint trong folder `outputs/ta_opd`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-RESUME_FROM_CHECKPOINT=outputs/ta_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_ta_b200.sh
-```
-
-RAC trong folder `outputs/rac_opd`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-RESUME_FROM_CHECKPOINT=outputs/rac_opd/checkpoint-000100 \
-MAX_STEPS=2175 \
-bash scripts/train_rac_b200.sh
-```
-
-Script tự suy ra output là parent của checkpoint, tức tiếp tục ghi vào `outputs/ta_opd` hoặc
-`outputs/rac_opd`; không cần truyền lại `OUTPUT_DIR`.
-
-Resume validator sẽ dừng nếu batch, method, LR, rho, K/M hoặc generation length khác checkpoint.
-Không dùng `RESUME_ALLOW_CONFIG_MISMATCH=true` chỉ để vượt qua lỗi này; hãy đặt lại đúng giá trị của
-run cũ.
-
-Nếu log hiện tại đã chứa step lớn hơn checkpoint được chọn, trainer cũng từ chối append để tránh ghi
-trùng hoặc rewind lịch sử. Khi đó cần dùng checkpoint mới nhất hoặc một `OUTPUT_DIR` mới.
+Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
+không phải subset size.

@@ -6,7 +6,6 @@ import random
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import torch
 
 
@@ -19,8 +18,10 @@ def _plain(value: Any) -> Any:
 def discover_data_files(path: str | Path, split: str | None = None) -> list[Path]:
     path = Path(path).resolve()
     if path.is_file():
-        if path.suffix.lower() not in {".parquet", ".jsonl"}:
-            raise ValueError(f"Unsupported data file {path}; expected parquet or JSONL")
+        if path.suffix.lower() not in {".parquet", ".json", ".jsonl"}:
+            raise ValueError(
+                f"Unsupported data file {path}; expected parquet, JSON, or JSONL"
+            )
         return [path]
     if not path.is_dir():
         raise FileNotFoundError(f"Training data path does not exist: {path}")
@@ -38,21 +39,37 @@ def discover_data_files(path: str | Path, split: str | None = None) -> list[Path
     jsonl = sorted(
         item for item in search_root.rglob("*.jsonl") if ".cache" not in item.parts
     )
-    files = parquet or jsonl
+    json_files = sorted(
+        item for item in search_root.rglob("*.json") if ".cache" not in item.parts
+    )
+    files = parquet or jsonl or json_files
     if not files:
-        raise FileNotFoundError(f"No parquet/JSONL files found under {path}")
+        raise FileNotFoundError(f"No parquet/JSON/JSONL files found under {path}")
     return files
 
 
 def _read_file(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".parquet":
+        import pandas as pd
+
         frame = pd.read_parquet(path)
         return [
             {key: _plain(value) for key, value in row.items()}
             for row in frame.to_dict("records")
         ]
     with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        if path.suffix.lower() == ".jsonl":
+            return [json.loads(line) for line in handle if line.strip()]
+        payload = json.load(handle)
+    if isinstance(payload, list) and all(isinstance(row, dict) for row in payload):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "train", "test", "records", "examples"):
+            rows = payload.get(key)
+            if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+                return rows
+        return [payload]
+    raise ValueError(f"Unsupported JSON dataset structure in {path}")
 
 
 def read_records(

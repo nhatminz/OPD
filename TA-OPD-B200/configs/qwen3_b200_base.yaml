@@ -1,8 +1,8 @@
-# Shared source of truth. The bash wrappers expose TRAIN_BATCH_SIZE and apply the
-# same value to rollout and micro-batch. Optional autotune remains available.
+# Shared source of truth. Bash exposes independent global rollout-batch and
+# within-step micro-batch knobs; both methods inherit these same values.
 experiment:
   method: base
-  seed: 1234
+  seed: 42
   output_dir: outputs/base_unused
   require_b200: true
   allow_existing_output: false
@@ -18,20 +18,25 @@ distributed:
   static_graph: true
   bucket_cap_mb: 100
 
+# Change this one value (or STORAGE_ROOT in the launch scripts) if the shared
+# filesystem is mounted without the leading slash or at another location.
+paths:
+  storage_root: /workspace/storage-shared
+
 models:
-  teacher_path: /workspace/storage-shared/models/Qwen3-4B
-  student_path: /workspace/storage-shared/models/Qwen3-1.7B
+  teacher_path: models/Qwen3-4B
+  student_path: models/Qwen3-1.7B
   dtype: bfloat16
   attention_implementation: auto
 
 data:
-  path: /workspace/storage-shared/nlp/minhpn19/data/DAPO-Math-17k-Processed
+  path: nlp/minhpn19/data/DAPO-Math-17k-Processed
   # The root also contains language-specific mirrors; "all" is the complete
   # 17k split and avoids duplicating cn/en rows.
   split: all
   prompt_key: prompt
   prefer_source_prompt: false
-  max_prompt_tokens: 512
+  max_prompt_tokens: 2048
   chat_template_kwargs:
     enable_thinking: true
 
@@ -40,7 +45,7 @@ rollout:
   # weights are synchronized through CUDA IPC before every optimizer step.
   backend: vllm
   batch_size: 8
-  max_new_tokens: 2048
+  max_new_tokens: 8192
   temperature: 1.0
   top_p: 1.0
   seed: 42
@@ -49,8 +54,8 @@ rollout:
     # It sleeps at level 2 while HF student/teacher scoring and backward run.
     gpu_memory_utilization: 0.25
     max_num_seqs: 8
-    # 512 prompt + 2048 generated tokens fit with ample context headroom.
-    max_model_len: 4096
+    # 2048 prompt + 8192 generated tokens fit with context headroom.
+    max_model_len: 12288
     max_concurrent_requests: 8
     # Release the trainer CUDA cache only when the sleeping engine otherwise
     # cannot wake with this safety margin; avoid empty_cache on every step.
@@ -62,15 +67,16 @@ rollout:
 
 selector:
   top_k: 16
-  branch_m: 4
+  score_chunk_steps: 128
+  ta_vocab_chunk_tokens: 2048
   eps: 1.0e-8
   q_low: 0.05
   q_high: 0.95
-  rac_delta_mode: full_vocab
-  rac_probe_mode: kv_cache
-  rac_branch_chunk_size: 256
-  validate_kv_cache: true
-  kv_cache_tolerance: 0.04
+  rac_gamma: 0.995
+  rac_w_min: 0.10
+  rac_beta: 2.0
+  # parallel = vectorized O(log T) associative scan; reference is a test/debug fallback.
+  rac_scan_backend: parallel
 
 token_budget:
   rho: 0.10
@@ -82,8 +88,10 @@ training:
   # the total target step (not the number of extra steps after resume).
   resume_from_checkpoint: null
   resume_allow_config_mismatch: false
-  micro_batch_size: 8
-  learning_rate: 1.0e-5
+  # Micro-batches are accumulated within each rollout before one optimizer step.
+  micro_batch_size: 1
+  grad_accum_steps: auto
+  learning_rate: 1.0e-6
   adam_betas: [0.9, 0.95]
   weight_decay: 0.0
   ppo_clip_low: 0.2
@@ -94,27 +102,32 @@ training:
   fused_optimizer: true
   empty_cuda_cache_each_step: false
   save_checkpoints: true
-  save_interval: 100
+  save_interval: 50
   save_optimizer: true
 
 logging:
-  selected_tokens_enabled: true
+  # Optional detailed TA audit log; disabled by default to bound disk usage.
+  selected_tokens_enabled: false
   selector_chunk_steps: 50
+  token_score_stats_enabled: true
+  token_score_interval: 50
+  token_score_histogram_bins: 64
+  token_score_raw_sample_size: 2048
 
-# By default, evaluation is spread evenly over the measured number of optimizer
-# steps. vLLM runs in a short-lived subprocess so its engine memory is returned
+# By default, evaluation runs at step 0, every 50 optimizer steps, and the final
+# step. vLLM uses a short-lived subprocess so its engine memory is returned
 # before training resumes. "hf" remains available as a low-dependency fallback.
 training_evaluation:
   enabled: true
   backend: vllm
-  target_evaluations: 16
-  interval_steps: null
+  target_evaluations: null
+  interval_steps: 50
   eval_at_start: true
   eval_at_end: true
   benchmark_names: [MATH-500, AIME24, AIME25]
   # Used only by the Hugging Face fallback backend.
   batch_size: 16
-  max_new_tokens: 2048
+  max_new_tokens: 8192
   limit: null
   output_subdir: training_eval
   vllm:
@@ -124,7 +137,7 @@ training_evaluation:
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
     max_num_seqs: 256
-    max_model_len: 4096
+    max_model_len: 12288
     enable_prefix_caching: true
     seed: 1234
 
@@ -132,29 +145,29 @@ autotune:
   # Seven candidates make binary search exactly <=3 probes per method. The
   # upper range is intentional for 180+ GiB B200; the 90% guard rejects it if
   # full-parameter backward or RAC scoring leaves insufficient headroom.
-  batch_candidates: [16, 32, 64, 96, 128, 160, 192]
+  batch_candidates: [1, 2, 4, 8, 12, 16, 24]
   max_reserved_fraction: 0.90
 
 evaluation:
   backend: vllm
   batch_size: 16
-  max_new_tokens: 2048
+  max_new_tokens: 8192
   limit: null
   vllm:
     tensor_parallel_size: 1
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
     max_num_seqs: 256
-    max_model_len: 4096
+    max_model_len: 12288
     enable_prefix_caching: true
     seed: 1234
   benchmarks:
     MATH-500:
-      path: /workspace/storage-shared/nlp/minhpn19/data/eval/math500
+      path: nlp/minhpn19/data/eval/math500
     AIME24:
-      path: /workspace/storage-shared/nlp/minhpn19/data/eval/aime24/test-00000-of-00001.parquet
+      path: nlp/minhpn19/data/eval/aime24
     AIME25:
-      path: /workspace/storage-shared/nlp/minhpn19/data/eval/aime25/test.jsonl
+      path: nlp/minhpn19/data/eval/aime25
 
 plotting:
   smoothing_window: 10

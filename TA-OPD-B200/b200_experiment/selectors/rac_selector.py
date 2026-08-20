@@ -1,140 +1,197 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
-
 import torch
 
-from .base import SelectorOutput, scatter_valid
+from .base import SelectorOutput, robust_quantile_normalize, scatter_valid
+
+
+def _validate_inputs(
+    g: torch.Tensor, alignment: torch.Tensor, valid_mask: torch.Tensor, gamma: float
+) -> None:
+    if g.shape != alignment.shape or g.shape != valid_mask.shape:
+        raise ValueError(
+            "g, alignment, and valid_mask must have identical [batch, time] shapes"
+        )
+    if g.ndim != 2:
+        raise ValueError("Bellman-RAC expects rank-2 [batch, time] tensors")
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(f"gamma must be in [0, 1], got {gamma}")
+
+
+@torch.no_grad()
+def bellman_reference_scan(
+    g: torch.Tensor,
+    alignment: torch.Tensor,
+    valid_mask: torch.Tensor,
+    gamma: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Clear correctness-first recurrence, intentionally not used by default."""
+    _validate_inputs(g, alignment, valid_mask, gamma)
+    g = g.detach().float()
+    alignment = alignment.detach().float()
+    valid_mask = valid_mask.bool()
+    returns = torch.zeros_like(g)
+    masses = torch.zeros_like(g)
+    for row in range(g.shape[0]):
+        next_return = g.new_zeros(())
+        next_mass = g.new_zeros(())
+        for position in range(g.shape[1] - 1, -1, -1):
+            if bool(valid_mask[row, position]):
+                coefficient = float(gamma) * alignment[row, position]
+                next_return = g[row, position] + coefficient * next_return
+                next_mass = 1.0 + coefficient * next_mass
+                returns[row, position] = next_return
+                masses[row, position] = next_mass
+            else:
+                # An invalid position is a hard trajectory boundary.
+                next_return = g.new_zeros(())
+                next_mass = g.new_zeros(())
+    values = torch.where(
+        valid_mask, returns / (masses + float(eps)), torch.zeros_like(returns)
+    )
+    return returns, masses, values
+
+
+@torch.no_grad()
+def bellman_parallel_scan(
+    g: torch.Tensor,
+    alignment: torch.Tensor,
+    valid_mask: torch.Tensor,
+    gamma: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized O(log T) suffix scan of Bellman affine recurrences.
+
+    Each position represents the affine map ``x -> g_t + c_t*x``. Affine-map
+    composition is associative, so a Hillis-Steele suffix scan replaces a
+    Python loop over T response tokens with ceil(log2(T)) batched GPU passes.
+    Invalid positions have zero continuation and therefore reset trajectories.
+    """
+    _validate_inputs(g, alignment, valid_mask, gamma)
+    valid = valid_mask.bool()
+    returns = torch.where(valid, g.detach().float(), torch.zeros_like(g).float())
+    masses = valid.float()
+    coefficients = torch.where(
+        valid,
+        float(gamma) * alignment.detach().float(),
+        torch.zeros_like(alignment).float(),
+    )
+    offset = 1
+    width = g.shape[1]
+    while offset < width:
+        left_c = coefficients[:, :-offset]
+        next_returns = returns.clone()
+        next_masses = masses.clone()
+        next_coefficients = coefficients.clone()
+        next_returns[:, :-offset] = (
+            returns[:, :-offset] + left_c * returns[:, offset:]
+        )
+        next_masses[:, :-offset] = masses[:, :-offset] + left_c * masses[:, offset:]
+        next_coefficients[:, :-offset] = left_c * coefficients[:, offset:]
+        returns, masses, coefficients = (
+            next_returns,
+            next_masses,
+            next_coefficients,
+        )
+        offset *= 2
+    values = torch.where(
+        valid, returns / (masses + float(eps)), torch.zeros_like(returns)
+    )
+    return returns, masses, values
 
 
 class RACSelector:
-    """Recoverable accessible corrective-mass selector: s_RAC = Delta*A*F."""
+    """Bellman-RAC: future TA teachability and continuous all-token weights."""
 
     def __init__(
         self,
-        top_k: int = 16,
-        branch_m: int = 2,
+        gamma: float = 0.995,
+        w_min: float = 0.10,
+        beta: float = 2.0,
+        q_low: float = 0.05,
+        q_high: float = 0.95,
         eps: float = 1e-8,
-        delta_mode: str = "full_vocab",
+        scan_backend: str = "parallel",
     ):
-        if delta_mode not in {"full_vocab", "approx_topk"}:
-            raise ValueError(f"Unknown RAC delta mode {delta_mode!r}")
-        self.top_k = int(top_k)
-        self.branch_m = int(branch_m)
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"gamma must be in [0, 1], got {gamma}")
+        if not 0.0 < w_min <= 1.0:
+            raise ValueError(f"w_min must be in (0, 1], got {w_min}")
+        if beta <= 0.0:
+            raise ValueError(f"beta must be positive, got {beta}")
+        if scan_backend not in {"parallel", "reference"}:
+            raise ValueError(f"Unknown Bellman scan backend {scan_backend!r}")
+        self.gamma = float(gamma)
+        self.w_min = float(w_min)
+        self.beta = float(beta)
+        self.q_low = float(q_low)
+        self.q_high = float(q_high)
         self.eps = float(eps)
-        self.delta_mode = delta_mode
+        self.scan_backend = scan_backend
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def compute_scores(
         self,
-        student_probs: torch.Tensor,
-        teacher_probs: torch.Tensor,
+        local_teachability: torch.Tensor,
+        student_sampled_log_probs: torch.Tensor,
+        teacher_sampled_log_probs: torch.Tensor,
         valid_mask: torch.Tensor,
-        cplus_probe: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         *,
-        student_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
+        normalize: bool = True,
     ) -> SelectorOutput:
         if (
-            student_probs.shape != teacher_probs.shape
-            or student_probs.shape[:2] != valid_mask.shape
+            local_teachability.shape != valid_mask.shape
+            or student_sampled_log_probs.shape != valid_mask.shape
+            or teacher_sampled_log_probs.shape != valid_mask.shape
         ):
-            raise ValueError("RAC received incompatible probability/mask shapes")
-        flat_valid = valid_mask.reshape(-1)
-        flat_p = student_probs.reshape(-1, student_probs.shape[-1])
-        flat_q = teacher_probs.reshape(-1, teacher_probs.shape[-1])
-        p, q = (
-            (flat_p, flat_q)
-            if bool(flat_valid.all())
-            else (flat_p[flat_valid], flat_q[flat_valid])
+            raise ValueError("Bellman-RAC received incompatible score/mask shapes")
+        valid = valid_mask.bool()
+        g = torch.where(
+            valid,
+            local_teachability.detach().float().clamp(0.0, 1.0),
+            torch.zeros_like(local_teachability).float(),
         )
-        n_valid = p.shape[0]
-        if n_valid == 0:
-            zeros = torch.zeros_like(valid_mask, dtype=torch.float32)
-            return SelectorOutput(
-                zeros, {name: zeros for name in ("Delta", "A", "F", "B", "s_RAC")}
+        log_ratio = (
+            teacher_sampled_log_probs.detach().float()
+            - student_sampled_log_probs.detach().float()
+        )
+        alignment = torch.where(
+            valid,
+            torch.exp(log_ratio.clamp(min=-20.0, max=0.0)),
+            torch.zeros_like(log_ratio),
+        )
+        scan = (
+            bellman_parallel_scan
+            if self.scan_backend == "parallel"
+            else bellman_reference_scan
+        )
+        returns, masses, values = scan(g, alignment, valid, self.gamma, self.eps)
+        if normalize:
+            z_valid = robust_quantile_normalize(
+                values[valid], self.q_low, self.q_high, self.eps
             )
-
-        k = min(self.top_k, p.shape[-1])
-        if student_topk is None:
-            p_top_values, p_top_ids = torch.topk(p, k=k, dim=-1)
+            z = scatter_valid(z_valid, valid)
+            weights = scatter_valid(
+                self.w_min + (1.0 - self.w_min) * z_valid.pow(self.beta), valid
+            )
         else:
-            p_top_values, p_top_ids = student_topk
-            expected = (n_valid, k)
-            if p_top_values.shape != expected or p_top_ids.shape != expected:
-                raise ValueError(
-                    f"Precomputed student top-K must have shape {expected}, got "
-                    f"{p_top_values.shape} and {p_top_ids.shape}"
-                )
-        corrective_top = (q.gather(-1, p_top_ids) - p_top_values).clamp_min_(0.0)
-        if self.delta_mode == "full_vocab":
-            delta = (q - p).clamp_min_(0.0).sum(dim=-1)
-        else:
-            q_top_ids = torch.topk(q, k=k, dim=-1).indices
-            union_ids = torch.cat((p_top_ids, q_top_ids), dim=-1)
-            unique = ~torch.tril(
-                union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2)), diagonal=-1
-            ).any(dim=-1)
-            delta = 0.5 * (
-                (q.gather(-1, union_ids) - p.gather(-1, union_ids)).abs() * unique
-            ).sum(dim=-1)
-
-        accessible_mass = corrective_top.sum(dim=-1)
-        accessibility = (accessible_mass / (delta + self.eps)).clamp_(0.0, 1.0)
-        m = min(self.branch_m, k)
-        candidate_weights, candidate_offsets = torch.topk(corrective_top, k=m, dim=-1)
-        candidate_ids = p_top_ids.gather(-1, candidate_offsets)
-        candidate_mask = candidate_weights > 0
-        flat_mask = candidate_mask.reshape(-1)
-        branch_rows = (
-            torch.arange(n_valid, device=p.device)
-            .unsqueeze(1)
-            .expand(-1, m)
-            .reshape(-1)[flat_mask]
-        )
-        branch_tokens = candidate_ids.reshape(-1)[flat_mask]
-        cplus_flat = torch.zeros(n_valid * m, dtype=torch.float32, device=p.device)
-        if branch_tokens.numel() > 0:
-            probed = cplus_probe(branch_rows, branch_tokens).float()
-            if probed.shape != branch_tokens.shape:
-                raise ValueError(
-                    f"cplus_probe returned {probed.shape}; expected {branch_tokens.shape}"
-                )
-            if probed.requires_grad or probed.grad_fn is not None:
-                raise AssertionError(
-                    "RAC counterfactual probes must not carry an autograd graph"
-                )
-            cplus_flat[flat_mask] = probed.clamp(0.0, 1.0)
-        cplus = cplus_flat.view(n_valid, m)
-        weight_sum = (candidate_weights * candidate_mask).sum(dim=-1)
-        future = (candidate_weights * cplus * candidate_mask).sum(dim=-1) / (
-            weight_sum + self.eps
-        )
-        future = torch.where(
-            candidate_mask.any(dim=-1) & (delta > self.eps),
-            future,
-            torch.zeros_like(future),
-        )
-        recoverability = accessibility * future
-        score = delta * recoverability
-        values: dict[str, Any] = {
-            "Delta": delta,
-            "A": accessibility,
-            "F": future,
-            "B": recoverability,
-            "s_RAC": score,
-            "positive_reachable_candidates": candidate_mask.sum(dim=-1).float(),
-            "evaluated_branches": candidate_mask.sum(dim=-1).float(),
-            "mean_Cplus": (cplus * candidate_mask).sum(dim=-1)
-            / candidate_mask.sum(dim=-1).clamp_min(1),
-            "candidate_ids": candidate_ids,
-            "candidate_weights": candidate_weights,
-            "delta_mode": self.delta_mode,
-        }
+            z = torch.zeros_like(values)
+            weights = torch.zeros_like(values)
         diagnostics = {
-            key: scatter_valid(value, valid_mask)
-            if torch.is_tensor(value) and value.ndim == 1
-            else value
-            for key, value in values.items()
+            "g": g,
+            "alignment": alignment,
+            "R": returns,
+            "M": masses,
+            "V": values,
+            "z": z,
+            "w": weights,
+            "gamma": self.gamma,
+            "w_min": self.w_min,
+            "beta": self.beta,
+            "scan_backend": self.scan_backend,
         }
-        return SelectorOutput(diagnostics["s_RAC"], diagnostics)
+        for value in (g, alignment, returns, masses, values, z, weights):
+            if value.requires_grad or value.grad_fn is not None:
+                raise AssertionError("Bellman-RAC statistics must be detached")
+        return SelectorOutput(weights, diagnostics)

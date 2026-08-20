@@ -32,8 +32,9 @@ def _controlled_config(method: str = "ta") -> dict:
         },
         "selector": {
             "top_k": 16,
-            "branch_m": 2,
-            "rac_delta_mode": "full_vocab",
+            "rac_gamma": 0.995,
+            "rac_w_min": 0.1,
+            "rac_beta": 2.0,
         },
         "token_budget": {"rho": 0.10},
         "training": {
@@ -111,6 +112,17 @@ class ResumeTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "experiment.method"):
                 validate_resume_config(checkpoint, _controlled_config("rac"))
+
+    def test_auto_resume_uses_latest_complete_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for step in (50, 100):
+                checkpoint = root / f"checkpoint-{step:06d}"
+                checkpoint.mkdir()
+                (checkpoint / "config.json").write_text("{}\n", encoding="utf-8")
+                torch.save({"step": step, "optimizer": {}}, checkpoint / "optimizer.pt")
+            resolved = resolve_resume_checkpoint("auto", root)
+            self.assertEqual(resolved.name, "checkpoint-000100")
 
 
 if __name__ == "__main__":

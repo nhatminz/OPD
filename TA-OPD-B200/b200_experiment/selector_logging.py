@@ -52,7 +52,7 @@ class SelectedTokenLogger:
                 ],
                 "score_fields": ["D", "C", "D_norm", "C_norm", "s_TA"]
                 if method == "ta"
-                else ["Delta", "A", "F", "B", "s_RAC"],
+                else ["g", "alignment", "R", "M", "V", "z", "w"],
             }
             if self.rank == 0:
                 with (self.root / "manifest.json").open(
@@ -89,7 +89,7 @@ class SelectedTokenLogger:
         keys = (
             ("D", "C", "D_norm", "C_norm", "s_TA")
             if self.method == "ta"
-            else ("Delta", "A", "F", "B", "s_RAC")
+            else ("g", "alignment", "R", "M", "V", "z", "w")
         )
         values = {
             key: diagnostics[key][selected_mask].detach().float().cpu().tolist()
@@ -113,3 +113,119 @@ class SelectedTokenLogger:
                     json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
                 )
         return len(token_ids)
+
+
+class TokenScoreStatsLogger:
+    """Compact all-valid-token histograms, quantiles, and bounded samples."""
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        method: str,
+        interval: int = 50,
+        bins: int = 64,
+        raw_sample_size: int = 2048,
+        enabled: bool = True,
+    ):
+        self.root = Path(output_dir) / "token_score_stats"
+        self.method = method
+        self.interval = max(1, int(interval))
+        self.bins = max(2, int(bins))
+        self.raw_sample_size = max(0, int(raw_sample_size))
+        self.enabled = bool(enabled)
+        self.ranges = (
+            {"D": (0.0, 10.0), "C": (0.0, 1.0), "s_TA": (0.0, 1.0)}
+            if method == "ta"
+            else {
+                key: (0.0, 1.0)
+                for key in ("g", "alignment", "V", "z", "w")
+            }
+        )
+        if self.enabled:
+            self.root.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "format": "one JSON file per logged optimizer step",
+                "scope": "all valid response positions in the global rollout batch",
+                "method": method,
+                "logged_steps": "step 1, every configured interval, and final step",
+                "bins": self.bins,
+                "histogram_ranges": self.ranges,
+                "raw_sample_size_max": self.raw_sample_size,
+                "note": "D values outside [0,10] are counted in underflow/overflow; normalized quantities use [0,1].",
+            }
+            (self.root / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+    def should_log(self, step: int, final_step: int) -> bool:
+        return self.enabled and (
+            step == 1 or step == final_step or step % self.interval == 0
+        )
+
+    def write(
+        self, step: int, final_step: int, diagnostics: dict[str, Any]
+    ) -> Path | None:
+        if not self.should_log(step, final_step):
+            return None
+        payload: dict[str, Any] = {
+            "step": int(step),
+            "method": self.method,
+            "scope": "global_valid_response_tokens",
+            "scores": {},
+        }
+        quantile_levels = torch.tensor(
+            [0.05, 0.25, 0.50, 0.75, 0.95],
+            device=next(
+                value.device for value in diagnostics.values() if torch.is_tensor(value)
+            ),
+        )
+        for key, (low, high) in self.ranges.items():
+            values = diagnostics[key].detach().float().reshape(-1)
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                continue
+            clipped = values.clamp(low, high)
+            counts = torch.histc(clipped, bins=self.bins, min=low, max=high)
+            edges = torch.linspace(
+                low, high, self.bins + 1, device=values.device, dtype=torch.float32
+            )
+            quantiles = torch.quantile(values, quantile_levels)
+            sample_count = min(values.numel(), self.raw_sample_size)
+            if sample_count:
+                indices = torch.linspace(
+                    0,
+                    values.numel() - 1,
+                    sample_count,
+                    device=values.device,
+                ).long()
+                sample = values.index_select(0, indices)
+            else:
+                sample = values.new_empty((0,))
+            payload["scores"][key] = {
+                "count": int(values.numel()),
+                "mean": float(values.mean()),
+                "min": float(values.min()),
+                "max": float(values.max()),
+                "quantiles": {
+                    name: float(value)
+                    for name, value in zip(
+                        ("q05", "q25", "q50", "q75", "q95"), quantiles
+                    )
+                },
+                "histogram": {
+                    "edges": edges.cpu().tolist(),
+                    "counts": counts.long().cpu().tolist(),
+                    "underflow": int((values < low).sum()),
+                    "overflow": int((values > high).sum()),
+                },
+                "sample": sample.cpu().tolist(),
+            }
+        destination = self.root / f"step-{step:06d}.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+        return destination

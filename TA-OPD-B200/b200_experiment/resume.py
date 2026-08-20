@@ -24,10 +24,40 @@ class ResumeState:
     step: int
 
 
-def resolve_resume_checkpoint(value: str | Path | None) -> Path | None:
+def resolve_resume_checkpoint(
+    value: str | Path | None, output_dir: str | Path | None = None
+) -> Path | None:
     if value is None or not str(value).strip():
         return None
-    checkpoint = Path(value).expanduser().resolve()
+    if str(value).strip().lower() == "auto":
+        if output_dir is None:
+            raise ValueError("RESUME=auto requires an existing run output directory")
+        root = Path(output_dir).expanduser().resolve()
+        latest = root / "latest.json"
+        checkpoint = None
+        if latest.is_file():
+            payload = json.loads(latest.read_text(encoding="utf-8"))
+            candidate = Path(payload["checkpoint"])
+            checkpoint = candidate if candidate.is_absolute() else root / candidate
+        if checkpoint is None or not checkpoint.is_dir():
+            candidates = sorted(
+                (
+                    path
+                    for path in root.glob("checkpoint-*")
+                    if path.is_dir() and (path / "optimizer.pt").is_file()
+                ),
+                key=lambda path: int(path.name.rsplit("-", 1)[-1]),
+            )
+            if (root / "final/optimizer.pt").is_file():
+                candidates.append(root / "final")
+            if not candidates:
+                raise FileNotFoundError(
+                    f"RESUME=auto found no complete checkpoint under {root}"
+                )
+            checkpoint = candidates[-1]
+        checkpoint = checkpoint.resolve()
+    else:
+        checkpoint = Path(value).expanduser().resolve()
     if not (checkpoint / "config.json").is_file():
         raise FileNotFoundError(
             f"Resume checkpoint is missing config.json: {checkpoint}"
@@ -76,6 +106,10 @@ def restore_optimizer(
         for key, item in state.items():
             if torch.is_tensor(item):
                 state[key] = item.to(device)
+    if "torch_rng_state" in payload:
+        torch.set_rng_state(payload["torch_rng_state"].cpu())
+    if device.type == "cuda" and "cuda_rng_state_all" in payload:
+        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
     return ResumeState(checkpoint, optimizer_path, step)
 
 
@@ -184,8 +218,9 @@ def validate_resume_config(
         "rollout.top_p",
         "rollout.seed",
         "selector.top_k",
-        "selector.branch_m",
-        "selector.rac_delta_mode",
+        "selector.rac_gamma",
+        "selector.rac_w_min",
+        "selector.rac_beta",
         "token_budget.rho",
         "training.learning_rate",
         "training.adam_betas",

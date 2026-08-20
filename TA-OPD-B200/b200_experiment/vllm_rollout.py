@@ -298,7 +298,7 @@ class VLLMRolloutEngine:
                 "Not enough free VRAM to wake the colocated vLLM rollout engine: "
                 f"need about {required_bytes / 2**30:.1f} GiB, have "
                 f"{free_after / 2**30:.1f} GiB. Lower "
-                "ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION or TRAIN_BATCH_SIZE."
+                "ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION or GLOBAL_BATCH_SIZE."
             )
         return True, elapsed
 
