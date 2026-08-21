@@ -74,8 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     progress_plot = commands.add_parser("plot-training-progress")
     progress_plot.add_argument("--results", required=True)
-    progress_plot.add_argument("--ta-output", required=True)
-    progress_plot.add_argument("--rac-output", required=True)
+    progress_plot.add_argument(
+        "--method",
+        default="both",
+        choices=("both", "ta", "ta-opd", "rac", "bellman-rac"),
+        help="Plot both methods (default), TA-OPD only, or Bellman-RAC only",
+    )
+    progress_plot.add_argument("--ta-output")
+    progress_plot.add_argument("--rac-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
     progress_plot.add_argument("--plot-name")
     return parser
@@ -118,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             args.rac_output,
             args.smoothing_window,
             args.plot_name,
+            method=args.method,
         )
     else:
         raise AssertionError(args.command)

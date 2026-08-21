@@ -14,6 +14,27 @@ import numpy as np
 from .evaluation import BENCHMARK_ORDER, MODEL_ORDER
 
 
+_PROGRESS_METHOD_ALIASES = {
+    "both": "both",
+    "ta": "ta",
+    "ta-opd": "ta",
+    "rac": "rac",
+    "bellman-rac": "rac",
+}
+_PROGRESS_METHODS = {
+    "ta": {
+        "label": "TA-OPD",
+        "slug": "ta_opd",
+        "output_argument": "--ta-output",
+    },
+    "rac": {
+        "label": "Bellman-RAC",
+        "slug": "rac",
+        "output_argument": "--rac-output",
+    },
+}
+
+
 def _plot_directory(results_dir: Path, plot_name: str | None) -> Path:
     name = plot_name or f"plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if not name.replace("-", "").replace(".", "").replace("_", "").isalnum():
@@ -31,6 +52,44 @@ def _save_figure(fig, path: Path) -> None:
 def _read_jsonl(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _normalize_progress_method(method: str) -> str:
+    normalized = method.strip().lower()
+    if normalized not in _PROGRESS_METHOD_ALIASES:
+        choices = ", ".join(_PROGRESS_METHOD_ALIASES)
+        raise ValueError(f"Unknown plot method {method!r}; expected one of: {choices}")
+    return _PROGRESS_METHOD_ALIASES[normalized]
+
+
+def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
+    spec = _PROGRESS_METHODS[method]
+    if output is None:
+        raise ValueError(
+            f"{spec['output_argument']} is required when plotting {spec['label']}"
+        )
+    history_path = Path(output).resolve() / "eval_history.jsonl"
+    if not history_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {spec['label']} evaluation history: {history_path}"
+        )
+    rows = _read_jsonl(history_path)
+    if not rows:
+        raise ValueError(f"{spec['label']} evaluation history is empty: {history_path}")
+    rows.sort(key=lambda row: int(row["step"]))
+    for row in rows:
+        missing = [
+            benchmark
+            for benchmark in BENCHMARK_ORDER
+            if benchmark not in row.get("benchmarks", {})
+            or "accuracy" not in row["benchmarks"][benchmark]
+        ]
+        if missing:
+            raise ValueError(
+                f"{spec['label']} evaluation at step {row.get('step')} is missing "
+                f"accuracy for: {', '.join(missing)}"
+            )
+    return rows
 
 
 def _moving_average(values: list[float], window: int) -> np.ndarray:
@@ -68,7 +127,9 @@ def _plot_loss_comparison(
             label=f"{label} MA({smoothing_window})",
         )
         if any("unweighted_opd_loss" in row for row in metrics):
-            unweighted = [float(row.get("unweighted_opd_loss", row["loss"])) for row in metrics]
+            unweighted = [
+                float(row.get("unweighted_opd_loss", row["loss"])) for row in metrics
+            ]
             axis.plot(
                 steps,
                 _moving_average(unweighted, smoothing_window),
@@ -141,9 +202,7 @@ def _plot_token_score_distributions(
                 edges = np.asarray(histogram["edges"], dtype=float)
                 counts = np.asarray(histogram["counts"], dtype=float)
                 counts /= max(counts.sum(), 1.0)
-                axis.stairs(
-                    counts, edges, linewidth=1.7, label=f"step {row['step']}"
-                )
+                axis.stairs(counts, edges, linewidth=1.7, label=f"step {row['step']}")
             axis.set_title(title)
             axis.set_xlabel("Score")
             axis.grid(alpha=0.25)
@@ -183,25 +242,114 @@ def _plot_token_score_distributions(
     return result
 
 
+def _plot_single_method_accuracy(
+    plots_dir: Path, method: str, rows: list[dict]
+) -> Path:
+    spec = _PROGRESS_METHODS[method]
+    colors = {
+        "MATH-500": "tab:blue",
+        "AIME24": "tab:orange",
+        "AIME25": "tab:green",
+    }
+    line_styles = {
+        "MATH-500": "-",
+        "AIME24": "--",
+        "AIME25": "-.",
+    }
+    steps = [int(row["step"]) for row in rows]
+    fig, axis = plt.subplots(figsize=(9, 5.5))
+    for benchmark in BENCHMARK_ORDER:
+        values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
+        axis.plot(
+            steps,
+            values,
+            color=colors[benchmark],
+            linestyle=line_styles[benchmark],
+            marker="o",
+            markersize=4.5,
+            linewidth=2,
+            label=benchmark,
+        )
+    axis.set_xlabel("Optimizer step")
+    axis.set_ylabel("Accuracy")
+    axis.set_ylim(0.0, 1.05)
+    axis.set_title(f"{spec['label']} evaluation accuracy during training")
+    axis.grid(alpha=0.25)
+    axis.legend(title="Dataset")
+    fig.tight_layout()
+    path = plots_dir / f"{spec['slug']}_accuracy_over_steps.png"
+    _save_figure(fig, path)
+    plt.close(fig)
+    return path
+
+
+def _write_training_history(
+    results_dir: Path,
+    histories: dict[str, list[dict]],
+    base_accuracy: dict[str, float],
+    filename_prefix: str = "",
+) -> tuple[Path, Path]:
+    combined_rows = []
+    if all(benchmark in base_accuracy for benchmark in BENCHMARK_ORDER):
+        combined_rows.append(
+            {
+                "Method": "Base",
+                "Step": 0,
+                **{
+                    benchmark: base_accuracy[benchmark] for benchmark in BENCHMARK_ORDER
+                },
+            }
+        )
+    for method, rows in histories.items():
+        for row in rows:
+            combined_rows.append(
+                {
+                    "Method": method,
+                    "Step": int(row["step"]),
+                    **{
+                        benchmark: float(row["benchmarks"][benchmark]["accuracy"])
+                        for benchmark in BENCHMARK_ORDER
+                    },
+                }
+            )
+    csv_path = results_dir / f"{filename_prefix}training_eval_history.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("Method", "Step", *BENCHMARK_ORDER))
+        writer.writeheader()
+        writer.writerows(combined_rows)
+    json_path = results_dir / f"{filename_prefix}training_eval_history.json"
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {"base_accuracy": base_accuracy, "histories": histories},
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+        handle.write("\n")
+    return csv_path, json_path
+
+
 def plot_training_progress(
     results_dir: str | Path,
-    ta_output: str | Path,
-    rac_output: str | Path,
+    ta_output: str | Path | None = None,
+    rac_output: str | Path | None = None,
     smoothing_window: int = 10,
     plot_name: str | None = None,
     _plots_dir: Path | None = None,
+    method: str = "both",
 ):
-    """Plot checkpoint accuracy trajectories and the constant step-0 base."""
+    """Plot eval accuracy for both methods or one method over all benchmarks."""
     results_dir = Path(results_dir).resolve()
     plots_dir = _plots_dir or _plot_directory(results_dir, plot_name)
+    selected_method = _normalize_progress_method(method)
+    selected_methods = (
+        ("ta", "rac") if selected_method == "both" else (selected_method,)
+    )
+    outputs = {"ta": ta_output, "rac": rac_output}
     histories = {
-        "TA-OPD": _read_jsonl(Path(ta_output).resolve() / "eval_history.jsonl"),
-        "Bellman-RAC": _read_jsonl(Path(rac_output).resolve() / "eval_history.jsonl"),
+        _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
+        for item in selected_methods
     }
-    for method, rows in histories.items():
-        if not rows:
-            raise ValueError(f"{method} evaluation history is empty")
-        rows.sort(key=lambda row: int(row["step"]))
 
     base_accuracy: dict[str, float] = {}
     for benchmark in BENCHMARK_ORDER:
@@ -211,11 +359,25 @@ def plot_training_progress(
             if int(rows[0]["step"]) == 0
         ]
         if candidates:
-            if max(candidates) - min(candidates) > 1e-12:
+            if selected_method == "both" and max(candidates) - min(candidates) > 1e-12:
                 raise ValueError(
                     f"Step-0 base accuracy differs between TA/RAC for {benchmark}: {candidates}"
                 )
             base_accuracy[benchmark] = candidates[0]
+
+    if selected_method != "both":
+        rows = next(iter(histories.values()))
+        progress_path = _plot_single_method_accuracy(plots_dir, selected_method, rows)
+        prefix = f"{_PROGRESS_METHODS[selected_method]['slug']}_"
+        history_csv, history_json = _write_training_history(
+            results_dir, histories, base_accuracy, filename_prefix=prefix
+        )
+        return {
+            "method": _PROGRESS_METHODS[selected_method]["label"],
+            "accuracy_over_steps": str(progress_path),
+            "history_csv": str(history_csv),
+            "history_json": str(history_json),
+        }
 
     fig, axes = plt.subplots(1, len(BENCHMARK_ORDER), figsize=(15, 4.8), sharey=True)
     colors = {"TA-OPD": "tab:blue", "Bellman-RAC": "tab:orange"}
@@ -268,45 +430,9 @@ def plot_training_progress(
     _save_figure(fig, progress_path)
     plt.close(fig)
 
-    combined_rows = []
-    if all(benchmark in base_accuracy for benchmark in BENCHMARK_ORDER):
-        combined_rows.append(
-            {
-                "Method": "Base",
-                "Step": 0,
-                **{
-                    benchmark: base_accuracy[benchmark] for benchmark in BENCHMARK_ORDER
-                },
-            }
-        )
-    for method, rows in histories.items():
-        for row in rows:
-            combined_rows.append(
-                {
-                    "Method": method,
-                    "Step": int(row["step"]),
-                    **{
-                        benchmark: float(row["benchmarks"][benchmark]["accuracy"])
-                        for benchmark in BENCHMARK_ORDER
-                    },
-                }
-            )
-    with (results_dir / "training_eval_history.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=("Method", "Step", *BENCHMARK_ORDER))
-        writer.writeheader()
-        writer.writerows(combined_rows)
-    with (results_dir / "training_eval_history.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(
-            {"base_accuracy": base_accuracy, "histories": histories},
-            handle,
-            indent=2,
-            ensure_ascii=False,
-        )
-        handle.write("\n")
+    history_csv, history_json = _write_training_history(
+        results_dir, histories, base_accuracy
+    )
     loss_path = _plot_loss_comparison(
         plots_dir, ta_output, rac_output, smoothing_window
     )
@@ -316,8 +442,8 @@ def plot_training_progress(
     return {
         "accuracy_over_steps": str(progress_path),
         "loss": str(loss_path),
-        "history_csv": str(results_dir / "training_eval_history.csv"),
-        "history_json": str(results_dir / "training_eval_history.json"),
+        "history_csv": str(history_csv),
+        "history_json": str(history_json),
         **token_plots,
     }
 

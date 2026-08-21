@@ -138,6 +138,19 @@ TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh
 ```
 
+Vẽ riêng một phương pháp để báo cáo, với ba đường MATH-500/AIME24/AIME25 trong cùng một ảnh:
+
+```bash
+RUN_NAME="$TA_RUN_NAME" PLOT_METHOD=ta \
+  bash scripts/plot_training_progress.sh --plot-name ta_report
+
+RUN_NAME="$RAC_RUN_NAME" PLOT_METHOD=rac \
+  bash scripts/plot_training_progress.sh --plot-name rac_report
+```
+
+`PLOT_METHOD` nhận `both` (mặc định), `ta` hoặc `rac`. Chế độ riêng chỉ cần
+`eval_history.jsonl` của method đã chọn và sinh cả PNG/PDF cùng CSV/JSON số liệu.
+
 Sau final aggregate:
 
 ```bash
@@ -145,7 +158,8 @@ TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_results.sh
 ```
 
-Mỗi launch tạo `results/<ta>_vs_<rac>/plots/plot_YYYYMMDD_HHMMSS/`. Override tên folder:
+Chế độ so sánh tạo `results/<ta>_vs_<rac>/plots/plot_YYYYMMDD_HHMMSS/`; chế độ riêng tạo
+`results/<run>/plots/plot_YYYYMMDD_HHMMSS/`. Override tên folder:
 
 ```bash
 TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \

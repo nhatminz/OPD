@@ -150,6 +150,8 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
 cho accuracy, loss, TA score distribution, Bellman-RAC `g/V/w`, và mean alignment/V/weight.
+`plot_training_progress.sh` hỗ trợ `PLOT_METHOD=both` để so sánh hoặc `PLOT_METHOD=ta|rac` để vẽ
+riêng ba đường accuracy MATH-500/AIME24/AIME25 của một phương pháp.
 
 ## Validation
 

@@ -70,6 +70,18 @@ TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh
 ```
 
+Vẽ riêng accuracy của một method trên cả ba bộ eval (ba đường trong cùng một ảnh):
+
+```bash
+RUN_NAME="$TA_RUN_NAME" PLOT_METHOD=ta \
+  bash scripts/plot_training_progress.sh --plot-name ta_report
+
+RUN_NAME="$RAC_RUN_NAME" PLOT_METHOD=rac \
+  bash scripts/plot_training_progress.sh --plot-name rac_report
+```
+
+Không đặt `PLOT_METHOD` (hoặc đặt `both`) để giữ biểu đồ so sánh TA-OPD với RAC như trước.
+
 Manual eval riêng checkpoint RAC:
 
 ```bash
