@@ -130,19 +130,16 @@ class ResumeTests(unittest.TestCase):
             target_model = torch.nn.Linear(3, 2)
             target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
 
-            with (
-                mock.patch(
-                    "b200_experiment.resume.torch.load",
-                    return_value={
-                        "step": 650,
-                        "optimizer": source_optimizer.state_dict(),
-                        "cuda_rng_state_all": [saved_rng_state],
-                    },
-                ),
-                mock.patch(
-                    "b200_experiment.resume.torch.cuda.set_rng_state"
-                ) as set_rng_state,
-            ):
+            with mock.patch(
+                "b200_experiment.resume.torch.load",
+                return_value={
+                    "step": 650,
+                    "optimizer": source_optimizer.state_dict(),
+                    "cuda_rng_state_all": [saved_rng_state],
+                },
+            ), mock.patch(
+                "b200_experiment.resume.torch.cuda.set_rng_state"
+            ) as set_rng_state:
                 restore_optimizer(target_optimizer, checkpoint, torch.device("cuda", 3))
 
             restored_rng_state = set_rng_state.call_args.args[0]

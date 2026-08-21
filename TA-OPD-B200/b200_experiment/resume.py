@@ -211,10 +211,9 @@ def _stage_csv_rewind(
     retained_last_step = None
     removed_rows = 0
     try:
-        with (
-            path.open(newline="", encoding="utf-8") as source,
-            temporary.open("x", newline="", encoding="utf-8") as target,
-        ):
+        with path.open(newline="", encoding="utf-8") as source, temporary.open(
+            "x", newline="", encoding="utf-8"
+        ) as target:
             reader = csv.DictReader(source)
             if not reader.fieldnames or "step" not in reader.fieldnames:
                 raise ValueError(f"Cannot resume safely: {path} has no step column")
@@ -252,10 +251,9 @@ def _stage_selector_rewind(
     retained_rows = 0
     removed_rows = 0
     try:
-        with (
-            gzip.open(path, "rt", encoding="utf-8") as source,
-            gzip.open(temporary, "xt", encoding="utf-8", compresslevel=6) as target,
-        ):
+        with gzip.open(path, "rt", encoding="utf-8") as source, gzip.open(
+            temporary, "xt", encoding="utf-8", compresslevel=6
+        ) as target:
             for line_number, line in enumerate(source, start=1):
                 if not line.strip():
                     continue
