@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import gzip
 import json
 import re
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,8 @@ _CHECKPOINT_PATTERN = re.compile(r"^checkpoint-(\d+)$")
 _SELECTOR_CHUNK_PATTERN = re.compile(
     r"^selected_steps_(\d+)_(\d+)(?:_rank-\d+)?\.jsonl\.gz$"
 )
+_STEP_JSON_PATTERN = re.compile(r"^step-(\d+)\.json$")
+_STEP_DIRECTORY_PATTERN = re.compile(r"^step-(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -151,74 +156,267 @@ def restore_optimizer(
     return ResumeState(checkpoint, optimizer_path, step)
 
 
-def _last_jsonl_step(path: Path) -> int | None:
+def _temporary_sibling(path: Path) -> Path:
+    return path.with_name(f".{path.name}.resume-rewind-{uuid.uuid4().hex}.tmp")
+
+
+def _stage_jsonl_rewind(
+    path: Path, resume_step: int, step_field: str
+) -> tuple[Path | None, int | None, int]:
     if not path.is_file():
-        return None
-    last = None
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-                last = int(row["step"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-                raise ValueError(
-                    f"Cannot resume safely: malformed {path} line {line_number}"
-                ) from error
-    return last
+        return None, None, 0
+    temporary = _temporary_sibling(path)
+    retained_last_step = None
+    removed_rows = 0
+    try:
+        with path.open(encoding="utf-8") as source, temporary.open(
+            "x", encoding="utf-8"
+        ) as target:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    target.write(line)
+                    continue
+                try:
+                    step = int(json.loads(line)[step_field])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Cannot resume safely: malformed {path} line {line_number}"
+                    ) from error
+                if step <= resume_step:
+                    target.write(line)
+                    if not line.endswith("\n"):
+                        target.write("\n")
+                    retained_last_step = (
+                        step
+                        if retained_last_step is None
+                        else max(retained_last_step, step)
+                    )
+                else:
+                    removed_rows += 1
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if removed_rows == 0:
+        temporary.unlink()
+        return None, retained_last_step, 0
+    return temporary, retained_last_step, removed_rows
 
 
-def _selector_steps_after(root: Path, resume_step: int) -> list[tuple[Path, int]]:
-    offending: list[tuple[Path, int]] = []
-    if not root.is_dir():
-        return offending
-    for path in sorted(root.glob("selected_steps_*.jsonl.gz")):
-        match = _SELECTOR_CHUNK_PATTERN.match(path.name)
-        if match is not None and int(match.group(2)) <= resume_step:
-            continue
-        try:
-            with gzip.open(path, "rt", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
+def _stage_csv_rewind(
+    path: Path, resume_step: int
+) -> tuple[Path | None, int | None, int]:
+    if not path.is_file():
+        return None, None, 0
+    temporary = _temporary_sibling(path)
+    retained_last_step = None
+    removed_rows = 0
+    try:
+        with (
+            path.open(newline="", encoding="utf-8") as source,
+            temporary.open("x", newline="", encoding="utf-8") as target,
+        ):
+            reader = csv.DictReader(source)
+            if not reader.fieldnames or "step" not in reader.fieldnames:
+                raise ValueError(f"Cannot resume safely: {path} has no step column")
+            writer = csv.DictWriter(target, fieldnames=reader.fieldnames)
+            writer.writeheader()
+            for line_number, row in enumerate(reader, start=2):
+                try:
+                    step = int(row["step"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Cannot resume safely: malformed {path} line {line_number}"
+                    ) from error
+                if step <= resume_step:
+                    writer.writerow(row)
+                    retained_last_step = (
+                        step
+                        if retained_last_step is None
+                        else max(retained_last_step, step)
+                    )
+                else:
+                    removed_rows += 1
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if removed_rows == 0:
+        temporary.unlink()
+        return None, retained_last_step, 0
+    return temporary, retained_last_step, removed_rows
+
+
+def _stage_selector_rewind(
+    path: Path, resume_step: int
+) -> tuple[Path | None, bool, int]:
+    temporary = _temporary_sibling(path)
+    retained_rows = 0
+    removed_rows = 0
+    try:
+        with (
+            gzip.open(path, "rt", encoding="utf-8") as source,
+            gzip.open(temporary, "xt", encoding="utf-8", compresslevel=6) as target,
+        ):
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                try:
                     step = int(json.loads(line)["training_step"])
-                    if step > resume_step:
-                        offending.append((path, step))
-                        break
-        except (OSError, EOFError, json.JSONDecodeError, KeyError, ValueError) as error:
-            raise ValueError(
-                f"Cannot resume safely: unreadable selector log {path}"
-            ) from error
-    return offending
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Cannot resume safely: malformed {path} line {line_number}"
+                    ) from error
+                if step <= resume_step:
+                    target.write(line)
+                    if not line.endswith("\n"):
+                        target.write("\n")
+                    retained_rows += 1
+                else:
+                    removed_rows += 1
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if removed_rows == 0:
+        temporary.unlink()
+        return None, False, 0
+    if retained_rows == 0:
+        temporary.unlink()
+        return None, True, removed_rows
+    return temporary, False, removed_rows
 
 
-def validate_append_history(output_dir: str | Path, resume_step: int) -> dict[str, Any]:
-    """Refuse to append behind already-logged or partially-logged later work."""
+def _step_paths_after(root: Path, pattern: re.Pattern, resume_step: int) -> list[Path]:
+    if not root.is_dir():
+        return []
+    stale = []
+    for path in root.iterdir():
+        match = pattern.match(path.name)
+        if match is not None and int(match.group(1)) > resume_step:
+            stale.append(path)
+    return sorted(stale)
+
+
+def validate_append_history(
+    output_dir: str | Path,
+    resume_step: int,
+    resume_checkpoint: str | Path | None = None,
+) -> dict[str, Any]:
+    """Atomically rewind append-only outputs to the selected checkpoint step."""
+    if resume_step < 0:
+        raise ValueError(f"Resume step must be non-negative, got {resume_step}")
     output_dir = Path(output_dir).resolve()
-    metrics_step = _last_jsonl_step(output_dir / "metrics.jsonl")
-    evaluation_step = _last_jsonl_step(output_dir / "eval_history.jsonl")
-    later_selector = _selector_steps_after(output_dir / "selector_scores", resume_step)
-    later = {
-        "metrics.jsonl": metrics_step,
-        "eval_history.jsonl": evaluation_step,
-    }
-    later = {
-        name: step
-        for name, step in later.items()
-        if step is not None and step > resume_step
-    }
-    if later or later_selector:
-        details = [f"{name}: step {step}" for name, step in later.items()]
-        details.extend(f"{path}: step {step}" for path, step in later_selector)
-        raise ValueError(
-            "Cannot append this resume without duplicating/rewinding logs beyond "
-            f"checkpoint step {resume_step}: " + "; ".join(details)
+    replacements: list[tuple[Path, Path]] = []
+    deletions: set[Path] = set()
+    removed_rows: dict[str, int] = {}
+    metrics_step = None
+    evaluation_step = None
+    selector_removed_rows = 0
+
+    try:
+        for filename, kind in (
+            ("metrics.jsonl", "jsonl"),
+            ("eval_history.jsonl", "jsonl"),
+            ("train_metrics.csv", "csv"),
+            ("eval_metrics.csv", "csv"),
+        ):
+            path = output_dir / filename
+            if kind == "jsonl":
+                temporary, retained_step, removed = _stage_jsonl_rewind(
+                    path, resume_step, "step"
+                )
+            else:
+                temporary, retained_step, removed = _stage_csv_rewind(path, resume_step)
+            if filename == "metrics.jsonl":
+                metrics_step = retained_step
+            elif filename == "eval_history.jsonl":
+                evaluation_step = retained_step
+            if temporary is not None:
+                replacements.append((temporary, path))
+            if removed:
+                removed_rows[filename] = removed
+
+        selector_root = output_dir / "selector_scores"
+        if selector_root.is_dir():
+            for path in sorted(selector_root.glob("selected_steps_*.jsonl.gz")):
+                if _SELECTOR_CHUNK_PATTERN.match(path.name) is None:
+                    continue
+                temporary, delete_path, removed = _stage_selector_rewind(
+                    path, resume_step
+                )
+                if temporary is not None:
+                    replacements.append((temporary, path))
+                if delete_path:
+                    deletions.add(path)
+                selector_removed_rows += removed
+
+        deletions.update(
+            _step_paths_after(
+                output_dir / "token_score_stats", _STEP_JSON_PATTERN, resume_step
+            )
         )
+        deletions.update(
+            _step_paths_after(
+                output_dir / "training_eval", _STEP_DIRECTORY_PATTERN, resume_step
+            )
+        )
+        deletions.update(
+            _step_paths_after(output_dir, _CHECKPOINT_PATTERN, resume_step)
+        )
+
+        checkpoint = (
+            Path(resume_checkpoint).expanduser().resolve()
+            if resume_checkpoint is not None
+            else None
+        )
+        final_checkpoint = output_dir / "final"
+        if final_checkpoint.is_dir() and checkpoint != final_checkpoint.resolve():
+            deletions.add(final_checkpoint)
+        summary = output_dir / "summary.json"
+        if summary.is_file():
+            deletions.add(summary)
+
+        if checkpoint is not None:
+            try:
+                checkpoint_value = str(checkpoint.relative_to(output_dir))
+            except ValueError:
+                checkpoint_value = str(checkpoint)
+            latest = output_dir / "latest.json"
+            latest_temporary = _temporary_sibling(latest)
+            latest_temporary.write_text(
+                json.dumps(
+                    {
+                        "step": resume_step,
+                        "checkpoint": checkpoint_value,
+                        "final": checkpoint.name == "final",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            replacements.append((latest_temporary, latest))
+
+        for temporary, destination in replacements:
+            temporary.replace(destination)
+        for path in sorted(deletions, key=lambda item: len(item.parts), reverse=True):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+    except BaseException:
+        for temporary, _ in replacements:
+            temporary.unlink(missing_ok=True)
+        raise
+
+    removed_paths = [str(path.relative_to(output_dir)) for path in sorted(deletions)]
     return {
         "metrics_last_step": metrics_step,
         "evaluation_last_step": evaluation_step,
         "selector_logs_checked": True,
+        "rewound": bool(removed_rows or selector_removed_rows or removed_paths),
+        "resume_step": resume_step,
+        "removed_rows": removed_rows,
+        "selector_rows_removed": selector_removed_rows,
+        "removed_paths": removed_paths,
     }
 
 

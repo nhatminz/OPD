@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import csv
 import json
 import tempfile
 import unittest
@@ -129,16 +130,19 @@ class ResumeTests(unittest.TestCase):
             target_model = torch.nn.Linear(3, 2)
             target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
 
-            with mock.patch(
-                "b200_experiment.resume.torch.load",
-                return_value={
-                    "step": 650,
-                    "optimizer": source_optimizer.state_dict(),
-                    "cuda_rng_state_all": [saved_rng_state],
-                },
-            ), mock.patch(
-                "b200_experiment.resume.torch.cuda.set_rng_state"
-            ) as set_rng_state:
+            with (
+                mock.patch(
+                    "b200_experiment.resume.torch.load",
+                    return_value={
+                        "step": 650,
+                        "optimizer": source_optimizer.state_dict(),
+                        "cuda_rng_state_all": [saved_rng_state],
+                    },
+                ),
+                mock.patch(
+                    "b200_experiment.resume.torch.cuda.set_rng_state"
+                ) as set_rng_state,
+            ):
                 restore_optimizer(target_optimizer, checkpoint, torch.device("cuda", 3))
 
             restored_rng_state = set_rng_state.call_args.args[0]
@@ -147,14 +151,85 @@ class ResumeTests(unittest.TestCase):
                 set_rng_state.call_args.kwargs["device"], torch.device("cuda", 3)
             )
 
-    def test_resume_refuses_logs_ahead_of_checkpoint(self):
+    def test_resume_rewinds_logs_and_artifacts_ahead_of_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            checkpoint = root / "checkpoint-000100"
+            checkpoint.mkdir()
             (root / "metrics.jsonl").write_text(
-                json.dumps({"step": 101}) + "\n", encoding="utf-8"
+                "".join(
+                    json.dumps({"step": step}) + "\n" for step in (99, 100, 101, 127)
+                ),
+                encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "step 101"):
-                validate_append_history(root, 100)
+            (root / "eval_history.jsonl").write_text(
+                "".join(json.dumps({"step": step}) + "\n" for step in (0, 100, 120)),
+                encoding="utf-8",
+            )
+            for filename, steps in (
+                ("train_metrics.csv", (99, 100, 101, 127)),
+                ("eval_metrics.csv", (0, 100, 120)),
+            ):
+                with (root / filename).open(
+                    "w", newline="", encoding="utf-8"
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=("step", "value"))
+                    writer.writeheader()
+                    for step in steps:
+                        writer.writerow({"step": step, "value": f"step-{step}"})
+
+            stats = root / "token_score_stats"
+            stats.mkdir()
+            for step in (100, 127):
+                (stats / f"step-{step:06d}.json").write_text(
+                    json.dumps({"step": step}) + "\n", encoding="utf-8"
+                )
+            evaluations = root / "training_eval"
+            for step in (100, 120):
+                (evaluations / f"step-{step:06d}").mkdir(parents=True)
+            (root / "checkpoint-000120").mkdir()
+            (root / "final").mkdir()
+            (root / "summary.json").write_text("{}\n", encoding="utf-8")
+            (root / "latest.json").write_text(
+                json.dumps(
+                    {"step": 120, "checkpoint": "checkpoint-000120", "final": False}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = validate_append_history(root, 100, checkpoint)
+
+            with (root / "metrics.jsonl").open(encoding="utf-8") as handle:
+                self.assertEqual(
+                    [json.loads(line)["step"] for line in handle], [99, 100]
+                )
+            with (root / "eval_history.jsonl").open(encoding="utf-8") as handle:
+                self.assertEqual(
+                    [json.loads(line)["step"] for line in handle], [0, 100]
+                )
+            for filename, expected in (
+                ("train_metrics.csv", [99, 100]),
+                ("eval_metrics.csv", [0, 100]),
+            ):
+                with (root / filename).open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual(
+                        [int(row["step"]) for row in csv.DictReader(handle)], expected
+                    )
+            self.assertTrue((stats / "step-000100.json").is_file())
+            self.assertFalse((stats / "step-000127.json").exists())
+            self.assertTrue((evaluations / "step-000100").is_dir())
+            self.assertFalse((evaluations / "step-000120").exists())
+            self.assertFalse((root / "checkpoint-000120").exists())
+            self.assertFalse((root / "final").exists())
+            self.assertFalse((root / "summary.json").exists())
+            latest = json.loads((root / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["step"], 100)
+            self.assertEqual(latest["checkpoint"], "checkpoint-000100")
+            self.assertTrue(result["rewound"])
+            self.assertEqual(result["metrics_last_step"], 100)
+            self.assertEqual(result["evaluation_last_step"], 100)
+            self.assertEqual(result["removed_rows"]["metrics.jsonl"], 2)
 
     def test_resume_accepts_history_and_selector_logs_through_step_100(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -178,6 +253,47 @@ class ResumeTests(unittest.TestCase):
             result = validate_append_history(root, 100)
             self.assertEqual(result["metrics_last_step"], 100)
             self.assertEqual(result["evaluation_last_step"], 100)
+            self.assertFalse(result["rewound"])
+
+    def test_resume_rewrites_mixed_selector_chunk_and_deletes_later_chunk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selector_root = root / "selector_scores"
+            selector_root.mkdir()
+            mixed = selector_root / "selected_steps_000051_000150.jsonl.gz"
+            with gzip.open(mixed, "wt", encoding="utf-8") as handle:
+                for step in (99, 100, 101):
+                    handle.write(json.dumps({"training_step": step}) + "\n")
+            later = selector_root / "selected_steps_000151_000200.jsonl.gz"
+            with gzip.open(later, "wt", encoding="utf-8") as handle:
+                handle.write(json.dumps({"training_step": 151}) + "\n")
+
+            result = validate_append_history(root, 100)
+
+            with gzip.open(mixed, "rt", encoding="utf-8") as handle:
+                self.assertEqual(
+                    [json.loads(line)["training_step"] for line in handle], [99, 100]
+                )
+            self.assertFalse(later.exists())
+            self.assertEqual(result["selector_rows_removed"], 2)
+
+    def test_resume_rewind_does_not_modify_logs_when_validation_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_metrics = json.dumps({"step": 101}) + "\n"
+            (root / "metrics.jsonl").write_text(original_metrics, encoding="utf-8")
+            (root / "eval_history.jsonl").write_text(
+                "not-valid-json\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                validate_append_history(root, 100)
+
+            self.assertEqual(
+                (root / "metrics.jsonl").read_text(encoding="utf-8"),
+                original_metrics,
+            )
+            self.assertFalse(list(root.glob(".*.resume-rewind-*.tmp")))
 
     def test_resume_config_prevents_switching_ta_checkpoint_to_rac(self):
         with tempfile.TemporaryDirectory() as temporary:

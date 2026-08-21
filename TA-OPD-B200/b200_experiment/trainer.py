@@ -771,11 +771,13 @@ def run_training(
         else None
     )
     resume_step = resume_state.step if resume_state is not None else 0
-    resume_history = (
-        validate_append_history(output_dir, resume_step)
-        if resume_state is not None
-        else None
-    )
+    resume_history = None
+    if resume_state is not None:
+        if distributed.is_main:
+            resume_history = validate_append_history(
+                output_dir, resume_step, resume_state.checkpoint
+            )
+        distributed.barrier()
     if distributed.is_main:
         metadata = collect_metadata(
             Path(__file__).resolve().parents[1],
@@ -883,6 +885,14 @@ def run_training(
             f"Resuming {method.upper()}-OPD from optimizer step {resume_step}: "
             f"{resume_state.checkpoint}"
         )
+        if resume_history is not None and resume_history["rewound"]:
+            removed_row_count = sum(resume_history["removed_rows"].values())
+            removed_row_count += int(resume_history["selector_rows_removed"])
+            tqdm.write(
+                f"Rewound existing outputs to step {resume_step}: removed "
+                f"{removed_row_count} later log rows and "
+                f"{len(resume_history['removed_paths'])} stale paths."
+            )
     initial_evaluation = None
     if resume_step == 0 and should_run_training_evaluation(
         0, max_steps, training_eval_settings

@@ -102,7 +102,8 @@ RUN_NAME="$RAC_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
 ```
 
 `RESUME=auto` đọc `latest.json`, rồi fallback sang checkpoint hoàn chỉnh mới nhất. Resume validator
-từ chối đổi method/scientific config hoặc append đè log ở step mới hơn.
+từ chối đổi method/scientific config. Nếu output đã có log/checkpoint mới hơn checkpoint được chọn,
+resume sẽ tự rewind output về đúng step đó rồi ghi lại các step tiếp theo.
 
 ## Manual evaluation
 
