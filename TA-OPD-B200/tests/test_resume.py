@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import yaml
@@ -69,6 +70,82 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(state.step, 100)
             self.assertEqual(target_optimizer.param_groups[0]["lr"], 1e-5)
             self.assertTrue(target_optimizer.state)
+
+    def test_cuda_rng_restore_passes_a_cpu_byte_tensor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint-000650"
+            checkpoint.mkdir()
+            source_model = torch.nn.Linear(3, 2)
+            source_optimizer = torch.optim.SGD(source_model.parameters(), lr=1e-3)
+            saved_rng_state = torch.arange(32, dtype=torch.int64)
+            payload = {
+                "step": 650,
+                "optimizer": source_optimizer.state_dict(),
+                "cuda_rng_state_all": [saved_rng_state],
+            }
+            target_model = torch.nn.Linear(3, 2)
+            target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
+
+            with mock.patch(
+                "b200_experiment.resume.torch.load", return_value=payload
+            ) as load, mock.patch(
+                "b200_experiment.resume.torch.cuda.set_rng_state"
+            ) as set_rng_state:
+                state = restore_optimizer(
+                    target_optimizer, checkpoint, torch.device("cuda", 0)
+                )
+
+            self.assertEqual(state.step, 650)
+            load.assert_called_once_with(
+                checkpoint / "optimizer.pt",
+                map_location=torch.device("cuda", 0),
+                weights_only=True,
+            )
+            restored_rng_state = set_rng_state.call_args.args[0]
+            self.assertEqual(restored_rng_state.device.type, "cpu")
+            self.assertEqual(restored_rng_state.dtype, torch.uint8)
+            self.assertTrue(
+                torch.equal(restored_rng_state, saved_rng_state.to(torch.uint8))
+            )
+            self.assertEqual(
+                set_rng_state.call_args.kwargs["device"], torch.device("cuda", 0)
+            )
+
+    def test_single_saved_cuda_rng_state_can_restore_another_logical_device(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint-000650"
+            checkpoint.mkdir()
+            source_model = torch.nn.Linear(3, 2)
+            source_optimizer = torch.optim.SGD(source_model.parameters(), lr=1e-3)
+            saved_rng_state = torch.arange(16, dtype=torch.uint8)
+            torch.save(
+                {
+                    "step": 650,
+                    "optimizer": source_optimizer.state_dict(),
+                    "cuda_rng_state_all": [saved_rng_state],
+                },
+                checkpoint / "optimizer.pt",
+            )
+            target_model = torch.nn.Linear(3, 2)
+            target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
+
+            with mock.patch(
+                "b200_experiment.resume.torch.load",
+                return_value={
+                    "step": 650,
+                    "optimizer": source_optimizer.state_dict(),
+                    "cuda_rng_state_all": [saved_rng_state],
+                },
+            ), mock.patch(
+                "b200_experiment.resume.torch.cuda.set_rng_state"
+            ) as set_rng_state:
+                restore_optimizer(target_optimizer, checkpoint, torch.device("cuda", 3))
+
+            restored_rng_state = set_rng_state.call_args.args[0]
+            self.assertTrue(torch.equal(restored_rng_state, saved_rng_state))
+            self.assertEqual(
+                set_rng_state.call_args.kwargs["device"], torch.device("cuda", 3)
+            )
 
     def test_resume_refuses_logs_ahead_of_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:

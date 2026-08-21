@@ -76,6 +76,47 @@ def _torch_load(path: Path, device: torch.device):
         return torch.load(path, map_location=device)
 
 
+def _cpu_byte_rng_state(value: Any, name: str) -> torch.Tensor:
+    if not torch.is_tensor(value):
+        raise ValueError(f"Invalid {name}: expected a tensor")
+    state = value.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    if state.ndim != 1:
+        raise ValueError(f"Invalid {name}: expected a one-dimensional tensor")
+    return state
+
+
+def _restore_rng_states(payload: dict[str, Any], device: torch.device) -> None:
+    if "torch_rng_state" in payload:
+        torch.set_rng_state(
+            _cpu_byte_rng_state(payload["torch_rng_state"], "torch_rng_state")
+        )
+    if device.type != "cuda" or "cuda_rng_state_all" not in payload:
+        return
+
+    saved = payload["cuda_rng_state_all"]
+    # Accept the list produced by torch.cuda.get_rng_state_all() as well as a
+    # tensor from older single-GPU checkpoints.
+    if torch.is_tensor(saved):
+        saved_states = [saved]
+    elif isinstance(saved, (list, tuple)):
+        saved_states = list(saved)
+    else:
+        raise ValueError(
+            "Invalid cuda_rng_state_all: expected a tensor or a list of tensors"
+        )
+    if not saved_states:
+        raise ValueError("Invalid cuda_rng_state_all: no CUDA RNG states were saved")
+
+    target_index = device.index if device.index is not None else 0
+    # A checkpoint can be resumed with fewer/more visible GPUs. Restore the
+    # matching logical device when present, otherwise use the sole/main state.
+    source_index = target_index if target_index < len(saved_states) else 0
+    state = _cpu_byte_rng_state(
+        saved_states[source_index], f"cuda_rng_state_all[{source_index}]"
+    )
+    torch.cuda.set_rng_state(state, device=device)
+
+
 def restore_optimizer(
     optimizer, checkpoint: str | Path, device: torch.device
 ) -> ResumeState:
@@ -106,10 +147,7 @@ def restore_optimizer(
         for key, item in state.items():
             if torch.is_tensor(item):
                 state[key] = item.to(device)
-    if "torch_rng_state" in payload:
-        torch.set_rng_state(payload["torch_rng_state"].cpu())
-    if device.type == "cuda" and "cuda_rng_state_all" in payload:
-        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+    _restore_rng_states(payload, device)
     return ResumeState(checkpoint, optimizer_path, step)
 
 

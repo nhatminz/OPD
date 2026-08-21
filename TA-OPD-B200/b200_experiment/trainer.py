@@ -619,8 +619,10 @@ def _save_checkpoint(
                 {
                     "step": step,
                     "optimizer": optimizer.state_dict(),
-                    "torch_rng_state": torch.get_rng_state(),
-                    "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
+                    "torch_rng_state": torch.get_rng_state().cpu(),
+                    "cuda_rng_state_all": [
+                        state.cpu() for state in torch.cuda.get_rng_state_all()
+                    ],
                 },
                 temporary / "optimizer.pt",
             )
