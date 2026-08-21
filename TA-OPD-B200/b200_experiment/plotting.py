@@ -15,21 +15,33 @@ from .evaluation import BENCHMARK_ORDER, MODEL_ORDER
 
 
 _PROGRESS_METHOD_ALIASES = {
+    "all": "all",
+    "three": "all",
     "both": "both",
+    "opd": "opd",
+    "pure-opd": "opd",
     "ta": "ta",
     "ta-opd": "ta",
     "rac": "rac",
     "bellman-rac": "rac",
 }
 _PROGRESS_METHODS = {
+    "opd": {
+        "label": "OPD",
+        "slug": "opd",
+        "color": "tab:green",
+        "output_argument": "--opd-output",
+    },
     "ta": {
         "label": "TA-OPD",
         "slug": "ta_opd",
+        "color": "tab:blue",
         "output_argument": "--ta-output",
     },
     "rac": {
         "label": "Bellman-RAC",
         "slug": "rac",
+        "color": "tab:orange",
         "output_argument": "--rac-output",
     },
 }
@@ -60,6 +72,25 @@ def _normalize_progress_method(method: str) -> str:
         choices = ", ".join(_PROGRESS_METHOD_ALIASES)
         raise ValueError(f"Unknown plot method {method!r}; expected one of: {choices}")
     return _PROGRESS_METHOD_ALIASES[normalized]
+
+
+def _normalize_progress_methods(
+    method: str = "both", methods: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    requested = list(methods) if methods is not None else [method]
+    selected = []
+    for item in requested:
+        normalized = _normalize_progress_method(item)
+        expanded = {
+            "all": ("opd", "ta", "rac"),
+            "both": ("ta", "rac"),
+        }.get(normalized, (normalized,))
+        for candidate in expanded:
+            if candidate not in selected:
+                selected.append(candidate)
+    if not selected:
+        raise ValueError("At least one training method must be selected for plotting")
+    return tuple(selected)
 
 
 def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
@@ -104,16 +135,16 @@ def _moving_average(values: list[float], window: int) -> np.ndarray:
 
 def _plot_loss_comparison(
     plots_dir: Path,
-    ta_output: str | Path,
-    rac_output: str | Path,
+    outputs: dict[str, str | Path],
     smoothing_window: int,
 ) -> Path:
     fig, axis = plt.subplots(figsize=(9, 5.5))
-    for label, output, color in (
-        ("TA-OPD", ta_output, "tab:blue"),
-        ("Bellman-RAC", rac_output, "tab:orange"),
-    ):
+    for method, output in outputs.items():
+        spec = _PROGRESS_METHODS[method]
+        label, color = spec["label"], spec["color"]
         metrics = _read_jsonl(Path(output).resolve() / "metrics.jsonl")
+        if not metrics:
+            raise ValueError(f"{label} training metrics are empty")
         steps = [int(row["step"]) for row in metrics]
         losses = [float(row["loss"]) for row in metrics]
         axis.plot(
@@ -126,7 +157,7 @@ def _plot_loss_comparison(
             linewidth=2,
             label=f"{label} MA({smoothing_window})",
         )
-        if any("unweighted_opd_loss" in row for row in metrics):
+        if method != "opd" and any("unweighted_opd_loss" in row for row in metrics):
             unweighted = [
                 float(row.get("unweighted_opd_loss", row["loss"])) for row in metrics
             ]
@@ -140,7 +171,8 @@ def _plot_loss_comparison(
             )
     axis.set_xlabel("Optimizer step")
     axis.set_ylabel("OPD loss")
-    axis.set_title("TA-OPD vs RAC training loss")
+    axis.set_title(" vs ".join(_PROGRESS_METHODS[item]["label"] for item in outputs))
+    axis.set_title(axis.get_title() + " training loss")
     axis.grid(alpha=0.25)
     axis.legend()
     fig.tight_layout()
@@ -169,10 +201,15 @@ def _snapshot_rows(rows: list[dict]) -> list[dict]:
 
 
 def _plot_token_score_distributions(
-    plots_dir: Path, ta_output: Path, rac_output: Path
+    plots_dir: Path, outputs: dict[str, str | Path]
 ) -> dict[str, str]:
     result: dict[str, str] = {}
-    ta_rows, rac_rows = _read_token_stats(ta_output), _read_token_stats(rac_output)
+    ta_rows = (
+        _read_token_stats(Path(outputs["ta"]).resolve()) if "ta" in outputs else []
+    )
+    rac_rows = (
+        _read_token_stats(Path(outputs["rac"]).resolve()) if "rac" in outputs else []
+    )
     if ta_rows:
         fig, axis = plt.subplots(figsize=(8.5, 5.2))
         for row in _snapshot_rows(ta_rows):
@@ -337,15 +374,14 @@ def plot_training_progress(
     plot_name: str | None = None,
     _plots_dir: Path | None = None,
     method: str = "both",
+    opd_output: str | Path | None = None,
+    methods: list[str] | tuple[str, ...] | None = None,
 ):
-    """Plot eval accuracy for both methods or one method over all benchmarks."""
+    """Plot eval accuracy for any one, two, or all three training methods."""
     results_dir = Path(results_dir).resolve()
     plots_dir = _plots_dir or _plot_directory(results_dir, plot_name)
-    selected_method = _normalize_progress_method(method)
-    selected_methods = (
-        ("ta", "rac") if selected_method == "both" else (selected_method,)
-    )
-    outputs = {"ta": ta_output, "rac": rac_output}
+    selected_methods = _normalize_progress_methods(method, methods)
+    outputs = {"opd": opd_output, "ta": ta_output, "rac": rac_output}
     histories = {
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
         for item in selected_methods
@@ -359,13 +395,15 @@ def plot_training_progress(
             if int(rows[0]["step"]) == 0
         ]
         if candidates:
-            if selected_method == "both" and max(candidates) - min(candidates) > 1e-12:
+            if len(candidates) > 1 and max(candidates) - min(candidates) > 1e-12:
                 raise ValueError(
-                    f"Step-0 base accuracy differs between TA/RAC for {benchmark}: {candidates}"
+                    f"Step-0 base accuracy differs between methods for "
+                    f"{benchmark}: {candidates}"
                 )
             base_accuracy[benchmark] = candidates[0]
 
-    if selected_method != "both":
+    if len(selected_methods) == 1:
+        selected_method = selected_methods[0]
         rows = next(iter(histories.values()))
         progress_path = _plot_single_method_accuracy(plots_dir, selected_method, rows)
         prefix = f"{_PROGRESS_METHODS[selected_method]['slug']}_"
@@ -380,7 +418,11 @@ def plot_training_progress(
         }
 
     fig, axes = plt.subplots(1, len(BENCHMARK_ORDER), figsize=(15, 4.8), sharey=True)
-    colors = {"TA-OPD": "tab:blue", "Bellman-RAC": "tab:orange"}
+    colors = {
+        spec["label"]: spec["color"]
+        for item, spec in _PROGRESS_METHODS.items()
+        if item in selected_methods
+    }
     for axis, benchmark in zip(axes, BENCHMARK_ORDER):
         maximum_step = 0
         for method, rows in histories.items():
@@ -423,8 +465,17 @@ def plot_training_progress(
         axis.grid(alpha=0.25)
     axes[0].set_ylabel("Accuracy")
     handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
-    fig.suptitle("Evaluation accuracy during TA-OPD and RAC training", y=1.02)
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=len(selected_methods) + 1,
+        frameon=False,
+    )
+    compared_names = ", ".join(
+        _PROGRESS_METHODS[item]["label"] for item in selected_methods
+    )
+    fig.suptitle(f"Evaluation accuracy during {compared_names} training", y=1.02)
     fig.tight_layout()
     progress_path = plots_dir / "accuracy_over_steps.png"
     _save_figure(fig, progress_path)
@@ -433,13 +484,13 @@ def plot_training_progress(
     history_csv, history_json = _write_training_history(
         results_dir, histories, base_accuracy
     )
-    loss_path = _plot_loss_comparison(
-        plots_dir, ta_output, rac_output, smoothing_window
-    )
-    token_plots = _plot_token_score_distributions(
-        plots_dir, Path(ta_output).resolve(), Path(rac_output).resolve()
-    )
+    selected_outputs = {
+        item: outputs[item] for item in selected_methods if outputs[item] is not None
+    }
+    loss_path = _plot_loss_comparison(plots_dir, selected_outputs, smoothing_window)
+    token_plots = _plot_token_score_distributions(plots_dir, selected_outputs)
     return {
+        "methods": [_PROGRESS_METHODS[item]["label"] for item in selected_methods],
         "accuracy_over_steps": str(progress_path),
         "loss": str(loss_path),
         "history_csv": str(history_csv),
@@ -454,6 +505,7 @@ def plot_results(
     rac_output: str | Path,
     smoothing_window: int = 10,
     plot_name: str | None = None,
+    opd_output: str | Path | None = None,
 ):
     results_dir = Path(results_dir).resolve()
     plots_dir = _plot_directory(results_dir, plot_name)
@@ -461,22 +513,32 @@ def plot_results(
     with comparison_path.open(encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     by_method = {row["Method"]: row for row in rows}
-    if tuple(by_method) != MODEL_ORDER:
-        raise ValueError(f"comparison.csv must contain exactly {MODEL_ORDER}")
+    plotted_models = tuple(by_method)
+    expected_models = tuple(item for item in MODEL_ORDER if item in by_method)
+    if (
+        not plotted_models
+        or plotted_models[0] != "Base"
+        or plotted_models != expected_models
+    ):
+        raise ValueError(
+            f"comparison.csv must contain Base followed by an ordered subset of "
+            f"{MODEL_ORDER[1:]}; got {plotted_models}"
+        )
 
     x = np.arange(len(BENCHMARK_ORDER))
-    width = 0.24
+    width = min(0.8 / len(plotted_models), 0.24)
     fig, axis = plt.subplots(figsize=(9, 5.5))
-    for offset, method in enumerate(MODEL_ORDER):
+    center = (len(plotted_models) - 1) / 2
+    for offset, method in enumerate(plotted_models):
         values = [float(by_method[method][benchmark]) for benchmark in BENCHMARK_ORDER]
-        bars = axis.bar(x + (offset - 1) * width, values, width, label=method)
+        bars = axis.bar(x + (offset - center) * width, values, width, label=method)
         axis.bar_label(
             bars, labels=[f"{value:.3f}" for value in values], padding=3, fontsize=9
         )
     axis.set_xticks(x, BENCHMARK_ORDER)
     axis.set_ylim(0.0, 1.08)
     axis.set_ylabel("Accuracy")
-    axis.set_title("Qwen3-1.7B: Base vs TA-OPD vs RAC")
+    axis.set_title("Qwen3-1.7B: " + " vs ".join(plotted_models))
     axis.grid(axis="y", alpha=0.25)
     axis.legend()
     fig.tight_layout()
@@ -484,13 +546,25 @@ def plot_results(
     _save_figure(fig, accuracy_path)
     plt.close(fig)
 
-    loss_path = _plot_loss_comparison(
-        plots_dir, ta_output, rac_output, smoothing_window
-    )
+    training_outputs: dict[str, str | Path] = {
+        "ta": ta_output,
+        "rac": rac_output,
+    }
+    if opd_output is not None:
+        training_outputs = {"opd": opd_output, **training_outputs}
+    loss_path = _plot_loss_comparison(plots_dir, training_outputs, smoothing_window)
     result = {"accuracy": str(accuracy_path), "loss": str(loss_path)}
+    opd_history = (
+        Path(opd_output).resolve() / "eval_history.jsonl"
+        if opd_output is not None
+        else None
+    )
     ta_history = Path(ta_output).resolve() / "eval_history.jsonl"
     rac_history = Path(rac_output).resolve() / "eval_history.jsonl"
     if ta_history.is_file() and rac_history.is_file():
+        progress_methods = ["ta", "rac"]
+        if opd_history is not None and opd_history.is_file():
+            progress_methods.insert(0, "opd")
         result.update(
             plot_training_progress(
                 results_dir,
@@ -499,6 +573,8 @@ def plot_results(
                 smoothing_window,
                 plot_name=plot_name,
                 _plots_dir=plots_dir,
+                opd_output=opd_output,
+                methods=progress_methods,
             )
         )
     return result

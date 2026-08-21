@@ -31,7 +31,7 @@ export EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 export LOG_INTERVAL="${LOG_INTERVAL:-1}"
 export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 
-# Keep enabled when accuracy_over_steps.png is needed after both runs finish.
+# Keep enabled when accuracy-over-step plots are needed after training.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"

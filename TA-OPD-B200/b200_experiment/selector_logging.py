@@ -50,9 +50,11 @@ class SelectedTokenLogger:
                     "token_id",
                     "token_text",
                 ],
-                "score_fields": ["D", "C", "D_norm", "C_norm", "s_TA"]
-                if method == "ta"
-                else ["g", "alignment", "R", "M", "V", "z", "w"],
+                "score_fields": {
+                    "opd": ["w"],
+                    "ta": ["D", "C", "D_norm", "C_norm", "s_TA"],
+                    "rac": ["g", "alignment", "R", "M", "V", "z", "w"],
+                }[method],
             }
             if self.rank == 0:
                 with (self.root / "manifest.json").open(
@@ -86,11 +88,11 @@ class SelectedTokenLogger:
         coords_cpu = coordinates.detach().cpu()
         token_ids = response_ids[selected_mask].detach().cpu().tolist()
         token_texts = self.tokenizer.convert_ids_to_tokens(token_ids)
-        keys = (
-            ("D", "C", "D_norm", "C_norm", "s_TA")
-            if self.method == "ta"
-            else ("g", "alignment", "R", "M", "V", "z", "w")
-        )
+        keys = {
+            "opd": ("w",),
+            "ta": ("D", "C", "D_norm", "C_norm", "s_TA"),
+            "rac": ("g", "alignment", "R", "M", "V", "z", "w"),
+        }[self.method]
         values = {
             key: diagnostics[key][selected_mask].detach().float().cpu().tolist()
             for key in keys
@@ -133,14 +135,18 @@ class TokenScoreStatsLogger:
         self.bins = max(2, int(bins))
         self.raw_sample_size = max(0, int(raw_sample_size))
         self.enabled = bool(enabled)
-        self.ranges = (
-            {"D": (0.0, 10.0), "C": (0.0, 1.0), "s_TA": (0.0, 1.0)}
-            if method == "ta"
-            else {
-                key: (0.0, 1.0)
-                for key in ("g", "alignment", "V", "z", "w")
+        if method == "ta":
+            self.ranges = {
+                "D": (0.0, 10.0),
+                "C": (0.0, 1.0),
+                "s_TA": (0.0, 1.0),
             }
-        )
+        elif method == "rac":
+            self.ranges = {key: (0.0, 1.0) for key in ("g", "alignment", "V", "z", "w")}
+        elif method == "opd":
+            self.ranges = {"w": (0.0, 1.0)}
+        else:
+            raise ValueError(f"Unknown token-score method: {method!r}")
         if self.enabled:
             self.root.mkdir(parents=True, exist_ok=True)
             manifest = {

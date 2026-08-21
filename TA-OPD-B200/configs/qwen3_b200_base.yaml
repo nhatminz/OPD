@@ -1,5 +1,5 @@
 # Shared source of truth. Bash exposes independent global rollout-batch and
-# within-step micro-batch knobs; both methods inherit these same values.
+# within-step micro-batch knobs; all three methods inherit these same values.
 experiment:
   method: base
   seed: 42
@@ -8,7 +8,7 @@ experiment:
   allow_existing_output: false
   verbose_metrics: false
 
-# scripts/train_{ta,rac}_b200.sh automatically launches one DDP worker per
+# scripts/train_{opd,ta,rac}_b200.sh automatically launches one DDP worker per
 # CUDA_VISIBLE_DEVICES entry. rollout.batch_size and training.micro_batch_size
 # remain GLOBAL values, independent of GPU count.
 distributed:

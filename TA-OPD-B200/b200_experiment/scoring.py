@@ -93,9 +93,9 @@ def generate_on_policy(
         next_token = torch.where(
             active, next_token, torch.full_like(next_token, pad_token_id)
         )
-        log_prob = F.log_softmax(logits, dim=-1).gather(
-            -1, next_token[:, None]
-        ).squeeze(-1)
+        log_prob = (
+            F.log_softmax(logits, dim=-1).gather(-1, next_token[:, None]).squeeze(-1)
+        )
         response_tokens.append(next_token)
         response_valid.append(active.clone())
         response_log_probs.append(
@@ -135,7 +135,7 @@ def generate_on_policy(
 
 @dataclass
 class BaseScores:
-    response_logits: torch.Tensor
+    response_logits: torch.Tensor | None
     log_normalizers: torch.Tensor
     sampled_log_probs: torch.Tensor
     cache: object | None = None
@@ -147,8 +147,15 @@ def score_original_rollout(
     rollout: RolloutBatch,
     keep_cache: bool = False,
     score_chunk_steps: int = 128,
+    retain_response_logits: bool = True,
 ) -> BaseScores:
-    """Score original positions without retaining full-vocabulary FP32 probs."""
+    """Score original positions without retaining full-vocabulary FP32 probs.
+
+    Pure OPD needs only sampled-token log-probabilities, so callers may avoid
+    retaining a second full-vocabulary response-logit copy. TA/RAC retain the
+    BF16 logits because their local teachability computation requires top-K
+    student/teacher distributions.
+    """
     model.eval()
     output = model(
         input_ids=rollout.input_ids,
@@ -159,20 +166,25 @@ def score_original_rollout(
     )
     start = rollout.prompt_width - 1
     width = rollout.response_ids.shape[1]
-    # Clone only response logits so prompt logits/output storage can be freed.
     # Keep model dtype (BF16 on B200); FP32 reductions are chunked over time.
-    response_logits = output.logits[:, start : start + width, :].detach().clone()
+    response_logits_view = output.logits[:, start : start + width, :]
     normalizer_chunks, sampled_chunks = [], []
     chunk_steps = max(1, int(score_chunk_steps))
     for begin in range(0, width, chunk_steps):
         end = min(begin + chunk_steps, width)
-        chunk = response_logits[:, begin:end].float()
+        chunk = response_logits_view[:, begin:end].float()
         normalizers = torch.logsumexp(chunk, dim=-1)
-        sampled = chunk.gather(
-            -1, rollout.response_ids[:, begin:end].unsqueeze(-1)
-        ).squeeze(-1) - normalizers
+        sampled = (
+            chunk.gather(-1, rollout.response_ids[:, begin:end].unsqueeze(-1)).squeeze(
+                -1
+            )
+            - normalizers
+        )
         normalizer_chunks.append(normalizers)
         sampled_chunks.append(sampled)
+    response_logits = (
+        response_logits_view.detach().clone() if retain_response_logits else None
+    )
     return BaseScores(
         response_logits,
         torch.cat(normalizer_chunks, dim=1),

@@ -15,6 +15,7 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
+OPD_CONFIG="${REPO_DIR}/configs/qwen3_b200_opd.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/qwen3_b200_autotuned.yaml}"
@@ -22,24 +23,29 @@ PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight.json}"
 
 resolve_run_paths() {
   RUN_NAME="${RUN_NAME:-run01}"
+  local opd_name="${OPD_RUN_NAME:-${RUN_NAME}}"
   local ta_name="${TA_RUN_NAME:-${RUN_NAME}}"
   local rac_name="${RAC_RUN_NAME:-${RUN_NAME}}"
   if [[ -n "${COMPARISON_NAME:-}" ]]; then
     COMPARISON_NAME="${COMPARISON_NAME}"
+  elif [[ -n "${OPD_RUN_NAME:-}" ]]; then
+    COMPARISON_NAME="${opd_name}_vs_${ta_name}_vs_${rac_name}"
   elif [[ -n "${TA_RUN_NAME:-}" || -n "${RAC_RUN_NAME:-}" ]]; then
     COMPARISON_NAME="${ta_name}_vs_${rac_name}"
   else
     COMPARISON_NAME="${RUN_NAME}"
   fi
-  for name in "${RUN_NAME}" "${ta_name}" "${rac_name}" "${COMPARISON_NAME}"; do
+  for name in "${RUN_NAME}" "${opd_name}" "${ta_name}" "${rac_name}" "${COMPARISON_NAME}"; do
     if ! [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       echo "Run names may contain only letters, numbers, dot, underscore, and dash: ${name}" >&2
       return 1
     fi
   done
+  OPD_RUN_NAME="${opd_name}"
   TA_RUN_NAME="${ta_name}"
   RAC_RUN_NAME="${rac_name}"
   OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
+  OPD_RUN_OUTPUT="${OPD_OUTPUT_DIR:-${OUTPUT_ROOT}/${OPD_RUN_NAME}/opd}"
   TA_RUN_OUTPUT="${TA_OUTPUT_DIR:-${OUTPUT_ROOT}/${TA_RUN_NAME}/ta_opd}"
   RAC_RUN_OUTPUT="${RAC_OUTPUT_DIR:-${OUTPUT_ROOT}/${RAC_RUN_NAME}/rac_opd}"
   RUN_RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/results/${COMPARISON_NAME}}"

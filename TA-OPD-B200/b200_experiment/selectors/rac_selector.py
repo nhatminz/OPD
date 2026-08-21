@@ -84,9 +84,7 @@ def bellman_parallel_scan(
         next_returns = returns.clone()
         next_masses = masses.clone()
         next_coefficients = coefficients.clone()
-        next_returns[:, :-offset] = (
-            returns[:, :-offset] + left_c * returns[:, offset:]
-        )
+        next_returns[:, :-offset] = returns[:, :-offset] + left_c * returns[:, offset:]
         next_masses[:, :-offset] = masses[:, :-offset] + left_c * masses[:, offset:]
         next_coefficients[:, :-offset] = left_c * coefficients[:, offset:]
         returns, masses, coefficients = (

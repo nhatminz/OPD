@@ -47,10 +47,7 @@ class TASelector:
             zeros = torch.zeros_like(valid_mask, dtype=torch.float32)
             return SelectorOutput(
                 zeros,
-                {
-                    name: zeros
-                    for name in ("D", "C", "D_norm", "C_norm", "s_TA")
-                },
+                {name: zeros for name in ("D", "C", "D_norm", "C_norm", "s_TA")},
             )
 
         k = min(self.top_k, p.shape[-1])
@@ -121,10 +118,7 @@ class TASelector:
             zeros = torch.zeros_like(valid_mask, dtype=torch.float32)
             return SelectorOutput(
                 zeros,
-                {
-                    name: zeros
-                    for name in ("D", "C", "D_norm", "C_norm", "s_TA")
-                },
+                {name: zeros for name in ("D", "C", "D_norm", "C_norm", "s_TA")},
             )
 
         flat_p = student_logits.reshape(-1, student_logits.shape[-1])

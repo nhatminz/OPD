@@ -34,12 +34,13 @@ CUDA_VISIBLE_DEVICES=0 python -m b200_experiment.cli preflight \
   --output results/preflight.json
 ```
 
-## Controlled full TA and Bellman-RAC runs
+## Controlled full OPD, TA-OPD và Bellman-RAC runs
 
-Tạo một pair ID rồi giữ mọi shared knob giống hệt nhau:
+Tạo một comparison ID rồi giữ mọi shared knob giống hệt nhau:
 
 ```bash
 PAIR=$(date +%Y%m%d_%H%M%S)
+export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
 export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
 export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
 
@@ -59,16 +60,27 @@ export EVAL_INTERVAL=50
 export SAVE_INTERVAL=50
 export SEED=42
 
-RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
+RUN_NAME="$OPD_RUN_NAME" bash scripts/train_opd_b200.sh
+RUN_NAME="$TA_RUN_NAME"  bash scripts/train_ta_b200.sh
 RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 ```
+
+Ba YAML method chỉ khác `experiment.method` và `experiment.output_dir`. OPD thuần dùng uniform
+weight `1` trên mọi valid response token; cả ba launcher đi qua cùng `common_b200.sh`, do đó dùng
+cùng vLLM rollout, data order, model, seed, batch/micro-batch, LR, optimizer, checkpoint và lịch
+eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
+tài nguyên giữa các run.
 
 Không export `MAX_STEPS`, hoặc đặt `MAX_STEPS=-1`, để consume full configured epoch. `MAX_STEPS=N`
 chỉ dành cho debug/explicit total target; nó không phải số step chạy thêm sau resume.
 
-Một override hợp lệ, áp giống nhau cho hai method:
+Một override hợp lệ phải áp giống nhau cho cả ba method.
 
 ```bash
+LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
+RUN_NAME="$OPD_RUN_NAME" bash scripts/train_opd_b200.sh
+LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
+RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
 LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
 RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 ```
@@ -83,6 +95,10 @@ là fit guarantee.
 Explicit checkpoint:
 
 ```bash
+RUN_NAME="$OPD_RUN_NAME" \
+RESUME_FROM_CHECKPOINT="outputs/$OPD_RUN_NAME/opd/checkpoint-000100" \
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_opd_b200.sh
+
 RUN_NAME="$TA_RUN_NAME" \
 RESUME_FROM_CHECKPOINT="outputs/$TA_RUN_NAME/ta_opd/checkpoint-000100" \
 CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_ta_b200.sh
@@ -95,6 +111,8 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/train_rac_b200.sh
 Automatic latest complete checkpoint:
 
 ```bash
+RUN_NAME="$OPD_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/train_opd_b200.sh
 RUN_NAME="$TA_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
   bash scripts/train_ta_b200.sh
 RUN_NAME="$RAC_RUN_NAME" RESUME=auto CUDA_VISIBLE_DEVICES=0,1 \
@@ -115,10 +133,10 @@ RAC_CHECKPOINT="outputs/$RAC_RUN_NAME/rac_opd/checkpoint-000100" \
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 ```
 
-Eval Base, TA final và RAC final rồi aggregate:
+Eval Base, OPD, TA và RAC final rồi aggregate:
 
 ```bash
-TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
 ```
 
@@ -126,21 +144,43 @@ Evaluation mặc định là vLLM greedy (`n=1`, `temperature=0`) và lưu raw g
 Fallback: `EVAL_BACKEND=hf`. Tensor parallel example:
 
 ```bash
-TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
 CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
 bash scripts/eval_all_b200.sh
 ```
 
-## Plot one pair
+## Plot periodic training evaluation
+
+So sánh cả ba phương pháp:
 
 ```bash
-TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  PLOT_METHODS="opd ta rac" \
   bash scripts/plot_training_progress.sh
+```
+
+So sánh hai phương pháp bất kỳ (đổi danh sách theo nhu cầu):
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  PLOT_METHODS="opd rac" \
+  bash scripts/plot_training_progress.sh --plot-name opd_vs_rac
+
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" \
+  PLOT_METHODS="opd ta" \
+  bash scripts/plot_training_progress.sh --plot-name opd_vs_ta
+
+TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  PLOT_METHODS="ta rac" \
+  bash scripts/plot_training_progress.sh --plot-name ta_vs_rac
 ```
 
 Vẽ riêng một phương pháp để báo cáo, với ba đường MATH-500/AIME24/AIME25 trong cùng một ảnh:
 
 ```bash
+RUN_NAME="$OPD_RUN_NAME" PLOT_METHODS=opd \
+  bash scripts/plot_training_progress.sh --plot-name opd_report
+
 RUN_NAME="$TA_RUN_NAME" PLOT_METHOD=ta \
   bash scripts/plot_training_progress.sh --plot-name ta_report
 
@@ -148,17 +188,18 @@ RUN_NAME="$RAC_RUN_NAME" PLOT_METHOD=rac \
   bash scripts/plot_training_progress.sh --plot-name rac_report
 ```
 
-`PLOT_METHOD` nhận `both` (mặc định), `ta` hoặc `rac`. Chế độ riêng chỉ cần
-`eval_history.jsonl` của method đã chọn và sinh cả PNG/PDF cùng CSV/JSON số liệu.
+`PLOT_METHODS` nhận danh sách cách nhau bởi dấu cách hoặc dấu phẩy. Chế độ riêng chỉ cần
+`eval_history.jsonl`; chế độ so sánh còn đọc `metrics.jsonl` để vẽ loss. Mọi chế độ sinh cả
+PNG/PDF cùng CSV/JSON số liệu. `PLOT_METHOD=both` cũ vẫn có nghĩa `ta rac`.
 
 Sau final aggregate:
 
 ```bash
-TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_results.sh
 ```
 
-Chế độ so sánh tạo `results/<ta>_vs_<rac>/plots/plot_YYYYMMDD_HHMMSS/`; chế độ riêng tạo
+Chế độ so sánh tạo `results/<run1>_vs_<run2>.../plots/plot_YYYYMMDD_HHMMSS/`; chế độ riêng tạo
 `results/<run>/plots/plot_YYYYMMDD_HHMMSS/`. Override tên folder:
 
 ```bash
@@ -183,5 +224,4 @@ outputs/<run>/<method>/
   token_score_stats/        # compact all-valid-token histograms/quantiles/samples
 ```
 
-Không kết luận TA hay Bellman-RAC tốt hơn cho tới khi hai controlled B200 run và full evaluation hoàn
-tất.
+Không kết luận method nào tốt hơn cho tới khi cả ba controlled B200 run và full evaluation hoàn tất.

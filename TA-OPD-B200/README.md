@@ -1,13 +1,15 @@
-# TA-OPD vs Bellman-RAC trên NVIDIA B200
+# Pure OPD vs TA-OPD vs Bellman-RAC trên NVIDIA B200
 
-Project độc lập này huấn luyện cùng student Qwen3-1.7B từ teacher Qwen3-4B bằng hai phương pháp:
+Project độc lập này huấn luyện cùng student Qwen3-1.7B từ teacher Qwen3-4B bằng ba phương pháp:
 
+- **OPD thuần**: mọi valid response token có uniform weight `1`.
 - **TA-OPD gốc**: local teachability và hard top-`rho` token budget.
 - **Bellman-RAC**: cùng local teachability, truyền thông tin tương lai theo transition thực tế mà
   teacher ủng hộ, rồi weight mềm mọi response token.
 
-Hai phương pháp dùng chung data order, rollout, teacher/student scoring, sampled-token PPO-clipped
-OPD loss, optimizer, checkpoint và evaluation. Chỉ cơ chế phân bổ supervision token khác nhau.
+Ba phương pháp dùng chung data order, vLLM rollout, teacher/student sampled-token scoring,
+sampled-token PPO-clipped OPD loss, optimizer, checkpoint và evaluation. Chỉ cơ chế phân bổ
+supervision token khác nhau.
 Xem lệnh đầy đủ từ shell mới trong [`RUN_B200.md`](RUN_B200.md), hoặc bản tiếng Việt ngắn trong
 [`HUONG_DAN_CHAY.md`](HUONG_DAN_CHAY.md).
 
@@ -34,6 +36,21 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 Training luôn đọc toàn bộ split `all`; batch cuối không được pad hay lặp. Loader hỗ trợ parquet,
 JSON và JSONL. Evaluation chọn file hỗ trợ theo thứ tự xác định, xác minh schema question/answer và
 lưu schema đã dùng trong output.
+
+## Định nghĩa OPD thuần
+
+OPD thuần dùng đúng cùng elementwise PPO-clipped OPD loss với TA/RAC, nhưng không select hoặc
+reweight theo score. Mọi valid response token có mask `1`. Để khớp Full OPD trong implementation
+TA-OPD gốc, loss lấy mean token trong từng response rồi mean trên global sample batch:
+
+```text
+L_OPD = (1 / B) * sum_i [sum_t valid_it * ell_it_OPD / sum_t valid_it]
+```
+
+Đây chính là TA-OPD với full valid-token mask thay vì hard top-`rho`; RAC giữ normalization theo
+global soft-weight mass do objective RAC định nghĩa như vậy. OPD vẫn chạy cùng persistent vLLM
+on-policy rollout và mỗi student/teacher vẫn score original trajectory đúng một lần; chỉ bỏ phép
+tính TA top-K/Bellman không thuộc thuật toán OPD thuần.
 
 ## Định nghĩa TA-OPD
 
@@ -87,8 +104,8 @@ trong shared config để audit fairness.
 
 - Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server;
   HF fallback có thể bật bằng `ROLLOUT_BACKEND=hf`.
-- Student và frozen teacher mỗi model score original trajectory đúng một lần; RAC không yêu cầu
-  KV cache hay second-generation pass.
+- Student và frozen teacher mỗi model score original trajectory đúng một lần cho cả ba method;
+  RAC không yêu cầu KV cache hay second-generation pass.
 - TA top-K/KL, actual-token log-prob ratio, global quantiles, RAC weights và loss weighting đều là
   tensor operations trên GPU, với FP32 cho score/reduction nhạy số.
 - Bellman mặc định dùng associative affine suffix scan O(log T), vector hóa theo batch. Backend
@@ -102,15 +119,16 @@ allocated/reserved VRAM.
 
 ## Config công bằng
 
-Ba config hiện có:
+Bốn config hiện có:
 
 ```text
 configs/qwen3_b200_base.yaml
+configs/qwen3_b200_opd.yaml
 configs/qwen3_b200_ta.yaml
 configs/qwen3_b200_rac.yaml
 ```
 
-Hai method config chỉ override `experiment.method` và `experiment.output_dir`; toàn bộ model, data,
+Ba method config chỉ override `experiment.method` và `experiment.output_dir`; toàn bộ model, data,
 rollout, seed, batch, optimizer, schedule và evaluation settings được kế thừa từ cùng base config.
 Các launcher đều expose:
 
@@ -124,7 +142,7 @@ EVAL_INTERVAL SAVE_INTERVAL LOG_INTERVAL SEED
 Defaults là BF16, full-parameter student, `LR=1e-6`, một epoch, global batch 8, micro-batch 1,
 prompt/response `2048/8192`, eval/save mỗi 50 step. Đây là điểm bắt đầu thận trọng nhưng **không phải
 cam kết fit** cho mọi driver/package/GPU layout; chạy preflight và điều chỉnh batch/length/memory
-fraction đối xứng cho TA và RAC.
+fraction đối xứng cho OPD, TA và RAC.
 
 <!-- B200_AUTOTUNE_RESULT_START -->
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
@@ -135,6 +153,7 @@ fraction đối xứng cho TA và RAC.
 Fresh launch tự tạo tên:
 
 ```text
+opd_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
 ta_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
 rac_bellman_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
 ```
@@ -150,12 +169,14 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
 cho accuracy, loss, TA score distribution, Bellman-RAC `g/V/w`, và mean alignment/V/weight.
-`plot_training_progress.sh` hỗ trợ `PLOT_METHOD=both` để so sánh hoặc `PLOT_METHOD=ta|rac` để vẽ
-riêng ba đường accuracy MATH-500/AIME24/AIME25 của một phương pháp.
+`plot_training_progress.sh` hỗ trợ `PLOT_METHODS='opd ta rac'` với một, hai hoặc cả ba method.
+Một method tạo ba đường MATH-500/AIME24/AIME25; từ hai method trở lên tạo ba subplot benchmark,
+mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn tương thích và có nghĩa TA+RAC.
 
 ## Validation
 
-Các test nhẹ bao phủ literal TA formula, robust normalization, Bellman recurrence tính tay,
+Các test nhẹ bao phủ uniform pure-OPD allocation, literal TA formula, robust normalization,
+Bellman recurrence tính tay,
 padding/trajectory reset, bounds, detachment, gradient path, optimized/reference equivalence,
 global DDP normalization/budget, resume, eval schedule, loaders, vLLM wrappers và plotting.
 
@@ -166,4 +187,5 @@ bash -n scripts/*.sh
 ```
 
 `scripts/smoke_test_b200.sh` chạy unit tests rồi preflight model/data/GPU; nó không tự bắt đầu full
-training trừ khi chủ động bật batch autotune.
+training trừ khi chủ động bật batch autotune. Khi autotune được bật, step đầu của OPD/TA/RAC còn
+phải có cùng rollout hash và đúng allocation policy trước khi batch candidate được chấp nhận.

@@ -17,7 +17,7 @@ from .models import choose_attention_implementation, model_dtype_kwargs
 transformers_logging.disable_progress_bar()
 
 BENCHMARK_ORDER = ("MATH-500", "AIME24", "AIME25")
-MODEL_ORDER = ("Base", "TA-OPD", "RAC")
+MODEL_ORDER = ("Base", "OPD", "TA-OPD", "RAC")
 QUESTION_ALIASES = ("problem", "question", "prompt", "input", "query")
 ANSWER_ALIASES = (
     "answer",
@@ -422,12 +422,21 @@ def evaluate_suite(
 def aggregate_evaluations(
     model_result_dirs: dict[str, str | Path], output_dir: str | Path
 ):
-    if tuple(model_result_dirs) != MODEL_ORDER:
-        raise ValueError(f"Aggregation requires exactly this order: {MODEL_ORDER}")
+    requested_order = tuple(model_result_dirs)
+    expected_order = tuple(item for item in MODEL_ORDER if item in model_result_dirs)
+    if (
+        not requested_order
+        or requested_order[0] != "Base"
+        or requested_order != expected_order
+    ):
+        raise ValueError(
+            f"Aggregation requires Base followed by an ordered subset of {MODEL_ORDER[1:]}; "
+            f"got {requested_order}"
+        )
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, details = [], {}
-    for model_name in MODEL_ORDER:
+    for model_name in requested_order:
         source = Path(model_result_dirs[model_name]).resolve() / "summary.json"
         result = json.loads(source.read_text(encoding="utf-8"))
         details[model_name] = result

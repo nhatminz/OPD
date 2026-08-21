@@ -51,9 +51,16 @@ from .scoring import (
     score_original_rollout,
 )
 from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
-from .selectors import RACSelector, TASelector, top_budget_mask
+from .selectors import OPDSelector, RACSelector, TASelector, top_budget_mask
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
 from .vllm_rollout import VLLMRolloutEngine
+
+
+METHOD_DISPLAY_NAMES = {
+    "opd": "OPD",
+    "ta": "TA-OPD",
+    "rac": "Bellman-RAC",
+}
 
 
 def seed_everything(seed: int) -> None:
@@ -140,6 +147,18 @@ def _gather_selector_diagnostics(
     return gathered, layout[0], layout[1]
 
 
+def _globalize_opd_output(
+    local: SelectorOutput,
+    valid_mask: torch.Tensor,
+    distributed: DistributedContext,
+) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
+    """Gather uniform pure-OPD weights for global metrics and auditing."""
+    gathered, start, end = _gather_selector_diagnostics(
+        local.diagnostics, valid_mask, ("w",), distributed
+    )
+    return local, gathered, start, end
+
+
 def _globalize_rac_output(
     local: SelectorOutput,
     valid_mask: torch.Tensor,
@@ -211,7 +230,9 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=True) + "\n")
 
 
-def _append_csv_row(path: Path, row: dict[str, Any], fieldnames: tuple[str, ...]) -> None:
+def _append_csv_row(
+    path: Path, row: dict[str, Any], fieldnames: tuple[str, ...]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.is_file() and path.stat().st_size > 0
     with path.open("a", newline="", encoding="utf-8") as handle:
@@ -383,7 +404,8 @@ def _run_training_evaluation(
         "vllm": settings.get("vllm", {}),
     }
     started = time.perf_counter()
-    model_name = "Base student" if step == 0 else f"{method.upper()}-OPD step {step}"
+    method_name = METHOD_DISPLAY_NAMES[method]
+    model_name = "Base student" if step == 0 else f"{method_name} step {step}"
     backend = runtime_settings["backend"]
     if backend == "vllm":
         source_path = (
@@ -473,6 +495,17 @@ def _make_optimizer(parameters, training: dict[str, Any]):
     return torch.optim.AdamW(parameters, **kwargs), False
 
 
+def _sum_per_response_masked_means(
+    elementwise: torch.Tensor, allocation: torch.Tensor
+) -> torch.Tensor:
+    """Released Full/TA-OPD reduction before global sample averaging."""
+    allocation = allocation.detach().float()
+    return (
+        (elementwise * allocation).sum(-1)
+        / allocation.sum(-1).clamp_min(1.0)
+    ).sum()
+
+
 def _opd_train_step(
     model,
     optimizer,
@@ -506,7 +539,7 @@ def _opd_train_step(
         )
         global_weight_mass = distributed.sum_float(local_weight_mass)
         if global_weight_mass <= 0.0:
-            raise ValueError("RAC soft token weights must have positive global mass")
+            raise ValueError("Soft token weights must have positive global mass")
     optimizer.zero_grad(set_to_none=True)
     model.train()
     unwrap_model(model).config.use_cache = False
@@ -559,12 +592,11 @@ def _opd_train_step(
                     distributed.world_size / float(global_weight_mass)
                 )
             else:
-                # Preserve the original TA-OPD per-response selected-token
-                # mean followed by a global sample mean.
-                loss = (
-                    (elementwise * allocation).sum(-1)
-                    / allocation.sum(-1).clamp_min(1.0)
-                ).sum() * (distributed.world_size / global_batch_size)
+                # Preserve the released OPD/TA-OPD reduction: per-response
+                # selected-token mean followed by a global sample mean.
+                loss = _sum_per_response_masked_means(
+                    elementwise, allocation
+                ) * (distributed.world_size / global_batch_size)
             cuda_sync(device)
             forward_seconds += time.perf_counter() - started
             finite_or_raise("OPD loss", loss.detach().reshape(1))
@@ -662,8 +694,8 @@ def run_training(
     torch.backends.cuda.matmul.allow_tf32 = True
     experiment, training = config["experiment"], config["training"]
     method = str(experiment["method"]).lower()
-    if method not in {"ta", "rac"}:
-        raise ValueError(f"Training method must be ta or rac, got {method!r}")
+    if method not in {"opd", "ta", "rac"}:
+        raise ValueError(f"Training method must be opd, ta, or rac, got {method!r}")
     seed = int(experiment.get("seed", 1234))
     seed_everything(seed)
     resume_checkpoint = resolve_resume_checkpoint(
@@ -711,7 +743,7 @@ def run_training(
 
     setup_progress = tqdm(
         total=4,
-        desc=f"Setup {method.upper()}-OPD",
+        desc=f"Setup {METHOD_DISPLAY_NAMES[method]}",
         unit="stage",
         dynamic_ncols=True,
         leave=False,
@@ -797,9 +829,10 @@ def run_training(
             "strategy": "ddp" if distributed.enabled else "single_process",
             "world_size": distributed.world_size,
             "global_batch_preserved": True,
-            "global_ta_normalization": True,
+            "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method == "ta",
             "global_rac_weight_normalization": method == "rac",
+            "uniform_full_response_mask": method == "opd",
         }
         metadata["resume"] = (
             {
@@ -822,6 +855,7 @@ def run_training(
     setup_progress.update(1)
     setup_progress.close()
     selector_cfg = config["selector"]
+    opd_selector = OPDSelector()
     ta_selector = TASelector(
         int(selector_cfg.get("top_k", 16)),
         float(selector_cfg.get("q_low", 0.05)),
@@ -882,7 +916,7 @@ def run_training(
         )
     if resume_state is not None and distributed.is_main:
         tqdm.write(
-            f"Resuming {method.upper()}-OPD from optimizer step {resume_step}: "
+            f"Resuming {METHOD_DISPLAY_NAMES[method]} from optimizer step {resume_step}: "
             f"{resume_state.checkpoint}"
         )
         if resume_history is not None and resume_history["rewound"]:
@@ -914,7 +948,7 @@ def run_training(
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
         range(resume_step, max_steps),
-        desc=f"{method.upper()}-OPD B200",
+        desc=f"{METHOD_DISPLAY_NAMES[method]} B200",
         unit="step",
         dynamic_ncols=True,
         leave=True,
@@ -983,6 +1017,7 @@ def run_training(
             rollout,
             False,
             int(selector_cfg.get("score_chunk_steps", 128)),
+            retain_response_logits=method != "opd",
         )
         if distributed.is_main:
             progress.set_postfix_str("stage=score-teacher", refresh=True)
@@ -993,78 +1028,114 @@ def run_training(
             rollout,
             False,
             int(selector_cfg.get("score_chunk_steps", 128)),
+            retain_response_logits=method != "opd",
         )
         valid = rollout.valid_mask
-        finite_or_raise("student sampled log-probs", student_scores.sampled_log_probs[valid])
-        finite_or_raise("teacher sampled log-probs", teacher_scores.sampled_log_probs[valid])
-        ta_raw, ta_raw_time = _timed(
-            device,
-            ta_selector.compute_scores_from_logits,
-            student_scores.response_logits,
-            teacher_scores.response_logits,
-            student_scores.log_normalizers,
-            teacher_scores.log_normalizers,
-            valid,
-            normalize=False,
-            token_chunk_size=int(selector_cfg.get("ta_vocab_chunk_tokens", 2048)),
+        finite_or_raise(
+            "student sampled log-probs", student_scores.sampled_log_probs[valid]
         )
-        ta_globalized, ta_normalization_time = _timed(
-            device,
-            _globalize_ta_output,
-            ta_raw,
-            valid,
-            ta_selector,
-            distributed,
+        finite_or_raise(
+            "teacher sampled log-probs", teacher_scores.sampled_log_probs[valid]
         )
-        ta_output, global_ta_diagnostics, ta_start, ta_end = ta_globalized
-        ta_time = ta_raw_time + ta_normalization_time
         cross_diagnostics = {}
-        if method == "rac":
+        ta_raw = ta_output = None
+        global_ta_diagnostics: dict[str, torch.Tensor] = {}
+        if method == "opd":
             if distributed.is_main:
-                progress.set_postfix_str("stage=selector-Bellman-RAC", refresh=True)
-            rac_raw, bellman_scan_time = _timed(
+                progress.set_postfix_str("stage=selector-OPD-uniform", refresh=True)
+            opd_raw, opd_selector_time = _timed(
                 device,
-                rac_selector.compute_scores,
-                ta_output.scores,
-                student_scores.sampled_log_probs,
-                teacher_scores.sampled_log_probs,
+                opd_selector.compute_scores,
                 valid,
-                normalize=False,
             )
-            rac_globalized, rac_normalization_time = _timed(
+            opd_globalized, opd_gather_time = _timed(
                 device,
-                _globalize_rac_output,
-                rac_raw,
+                _globalize_opd_output,
+                opd_raw,
                 valid,
-                rac_selector,
                 distributed,
             )
             primary, global_primary_diagnostics, primary_start, primary_end = (
-                rac_globalized
+                opd_globalized
             )
-            del rac_raw
-            if (primary_start, primary_end) != (ta_start, ta_end):
-                raise AssertionError("TA/RAC distributed token layouts differ")
-            cross_diagnostics.update(
-                correlations(
-                    global_ta_diagnostics["s_TA"],
-                    global_primary_diagnostics,
-                    torch.ones_like(global_ta_diagnostics["s_TA"], dtype=torch.bool),
-                )
-            )
-            selector_time = bellman_scan_time + rac_normalization_time
+            del opd_raw
+            ta_time = bellman_scan_time = 0.0
+            selector_time = opd_selector_time + opd_gather_time
         else:
-            if distributed.is_main:
-                progress.set_postfix_str("stage=selector-TA", refresh=True)
-            primary, selector_time, bellman_scan_time = (
-                ta_output,
-                ta_time,
-                0.0,
+            if (
+                student_scores.response_logits is None
+                or teacher_scores.response_logits is None
+            ):
+                raise AssertionError("TA/RAC scoring must retain response logits")
+            ta_raw, ta_raw_time = _timed(
+                device,
+                ta_selector.compute_scores_from_logits,
+                student_scores.response_logits,
+                teacher_scores.response_logits,
+                student_scores.log_normalizers,
+                teacher_scores.log_normalizers,
+                valid,
+                normalize=False,
+                token_chunk_size=int(selector_cfg.get("ta_vocab_chunk_tokens", 2048)),
             )
-            global_primary_diagnostics = global_ta_diagnostics
-            primary_start, primary_end = ta_start, ta_end
+            ta_globalized, ta_normalization_time = _timed(
+                device,
+                _globalize_ta_output,
+                ta_raw,
+                valid,
+                ta_selector,
+                distributed,
+            )
+            ta_output, global_ta_diagnostics, ta_start, ta_end = ta_globalized
+            ta_time = ta_raw_time + ta_normalization_time
+            if method == "rac":
+                if distributed.is_main:
+                    progress.set_postfix_str("stage=selector-Bellman-RAC", refresh=True)
+                rac_raw, bellman_scan_time = _timed(
+                    device,
+                    rac_selector.compute_scores,
+                    ta_output.scores,
+                    student_scores.sampled_log_probs,
+                    teacher_scores.sampled_log_probs,
+                    valid,
+                    normalize=False,
+                )
+                rac_globalized, rac_normalization_time = _timed(
+                    device,
+                    _globalize_rac_output,
+                    rac_raw,
+                    valid,
+                    rac_selector,
+                    distributed,
+                )
+                primary, global_primary_diagnostics, primary_start, primary_end = (
+                    rac_globalized
+                )
+                del rac_raw
+                if (primary_start, primary_end) != (ta_start, ta_end):
+                    raise AssertionError("TA/RAC distributed token layouts differ")
+                cross_diagnostics.update(
+                    correlations(
+                        global_ta_diagnostics["s_TA"],
+                        global_primary_diagnostics,
+                        torch.ones_like(
+                            global_ta_diagnostics["s_TA"], dtype=torch.bool
+                        ),
+                    )
+                )
+                selector_time = bellman_scan_time + rac_normalization_time
+            else:
+                if distributed.is_main:
+                    progress.set_postfix_str("stage=selector-TA", refresh=True)
+                primary, selector_time, bellman_scan_time = (
+                    ta_output,
+                    ta_time,
+                    0.0,
+                )
+                global_primary_diagnostics = global_ta_diagnostics
+                primary_start, primary_end = ta_start, ta_end
         finite_or_raise(f"{method} selector", primary.scores[valid])
-        score_key = "w" if method == "rac" else "s_TA"
+        score_key = "s_TA" if method == "ta" else "w"
         if method == "ta":
             selected, global_selected = _local_mask_from_global_budget(
                 global_primary_diagnostics[score_key],
@@ -1081,15 +1152,13 @@ def run_training(
                 global_primary_diagnostics[score_key], dtype=torch.bool
             )
             expected = global_primary_diagnostics[score_key].numel()
-            token_allocation = primary.scores
+            token_allocation = selected if method == "opd" else primary.scores
         if distributed.sum_int(int(selected.sum().item())) != expected:
             raise AssertionError(f"{method} supervised-token count is incorrect")
         if not torch.equal(original_rollout, rollout.input_ids):
             raise AssertionError("Selector changed the original rollout")
         token_score_stats_path = (
-            score_stats_logger.write(
-                step, max_steps, global_primary_diagnostics
-            )
+            score_stats_logger.write(step, max_steps, global_primary_diagnostics)
             if distributed.is_main
             else None
         )
@@ -1181,9 +1250,7 @@ def run_training(
             "training_forward_time": distributed.max_float(
                 train_metrics["training_forward_time"]
             ),
-            "backward_time": distributed.max_float(
-                train_metrics["backward_time"]
-            ),
+            "backward_time": distributed.max_float(train_metrics["backward_time"]),
             "optimizer_time": distributed.max_float(train_metrics["optimizer_time"]),
             "global_weight_mass": train_metrics["global_weight_mass"],
         }
@@ -1210,9 +1277,20 @@ def run_training(
                 "ddp" if distributed.enabled else "single_process"
             ),
             "global_batch_preserved": True,
-            "global_ta_normalization": True,
+            "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method == "ta",
-            "all_response_tokens_supervised": method == "rac",
+            "uniform_full_response_mask": method == "opd",
+            "all_response_tokens_supervised": method in {"opd", "rac"},
+            "token_allocation_policy": {
+                "opd": "uniform_all_valid_response_tokens",
+                "ta": "hard_global_top_rho",
+                "rac": "bellman_soft_all_valid_response_tokens",
+            }[method],
+            "objective_normalization": (
+                "global_soft_token_weight_mass"
+                if method == "rac"
+                else "per_response_mean_then_global_sample_mean"
+            ),
             "fused_optimizer": fused_optimizer,
             "lr": float(optimizer.param_groups[0]["lr"]),
             **aggregated_train_metrics,

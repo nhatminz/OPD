@@ -63,7 +63,9 @@ def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, A
 def resolve_runtime_paths(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve all B200 assets from one configurable storage root."""
     result = copy.deepcopy(config)
-    root = Path(result.get("paths", {}).get("storage_root", "/workspace/storage-shared"))
+    root = Path(
+        result.get("paths", {}).get("storage_root", "/workspace/storage-shared")
+    )
 
     def resolved(value: str) -> str:
         path = Path(value).expanduser()

@@ -10,6 +10,7 @@ cd "${REPO_DIR}"
 
 if batch_autotune_enabled; then
   TUNE_ARGS=(
+    --opd-config "${OPD_CONFIG}"
     --ta-config "${TA_CONFIG}"
     --rac-config "${RAC_CONFIG}"
     --output "${REPO_DIR}/outputs/autotune"

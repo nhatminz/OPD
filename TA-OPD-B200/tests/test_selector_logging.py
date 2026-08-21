@@ -88,6 +88,15 @@ class SelectorLoggingTests(unittest.TestCase):
             self.assertEqual(len(payload["scores"]["V"]["sample"]), 7)
             self.assertIsNone(logger.write(2, 100, diagnostics))
 
+    def test_compact_opd_stats_record_uniform_all_token_weights(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logger = TokenScoreStatsLogger(temporary, "opd", interval=50, bins=10)
+            path = logger.write(1, 100, {"w": torch.ones(17)})
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(tuple(payload["scores"]), ("w",))
+            self.assertEqual(payload["scores"]["w"]["count"], 17)
+            self.assertEqual(payload["scores"]["w"]["mean"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

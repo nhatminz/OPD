@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from b200_experiment.selectors import (
+    OPDSelector,
     RACSelector,
     TASelector,
     bellman_parallel_scan,
@@ -48,6 +49,14 @@ class SelectorTests(unittest.TestCase):
             torch.allclose(output.diagnostics["C"][self.valid], expected_c, atol=1e-7)
         )
 
+    def test_pure_opd_uniformly_supervises_every_valid_token(self):
+        output = OPDSelector().compute_scores(self.valid)
+        self.assertTrue(torch.equal(output.scores, self.valid.float()))
+        self.assertTrue(torch.equal(output.diagnostics["w"], self.valid.float()))
+        self.assertEqual(int(output.scores.sum()), int(self.valid.sum()))
+        self.assertFalse(output.scores.requires_grad)
+        self.assertIsNone(output.scores.grad_fn)
+
     def test_compact_logits_path_matches_probability_reference(self):
         student_logits = self.p.log()
         teacher_logits = self.q.log()
@@ -77,9 +86,7 @@ class SelectorTests(unittest.TestCase):
         g = torch.tensor([[0.2, 0.4, 1.0]])
         alignment = torch.tensor([[0.5, 1.0, 0.25]])
         valid = torch.ones_like(g, dtype=torch.bool)
-        returns, masses, values = bellman_reference_scan(
-            g, alignment, valid, gamma=0.5
-        )
+        returns, masses, values = bellman_reference_scan(g, alignment, valid, gamma=0.5)
         expected_r = torch.tensor([[0.425, 0.9, 1.0]])
         expected_m = torch.tensor([[1.375, 1.5, 1.0]])
         self.assertTrue(torch.allclose(returns, expected_r))
@@ -104,16 +111,22 @@ class SelectorTests(unittest.TestCase):
         for expected, actual in zip(reference, optimized):
             self.assertTrue(torch.allclose(actual, expected, atol=2e-6, rtol=2e-6))
         # The gap at position 2 must prevent positions 3-4 leaking backward.
-        isolated = bellman_parallel_scan(g[:, :2], alignment[:, :2], valid[:, :2], 0.995)
+        isolated = bellman_parallel_scan(
+            g[:, :2], alignment[:, :2], valid[:, :2], 0.995
+        )
         self.assertTrue(torch.allclose(optimized[2][2, :2], isolated[2][2, :2]))
 
     def test_bellman_rac_bounds_padding_and_detachment(self):
         g = TASelector(top_k=8).compute_scores(self.p, self.q, self.valid).scores
         student_logp = torch.log(
-            self.p.gather(-1, torch.zeros((*self.p.shape[:2], 1), dtype=torch.long)).squeeze(-1)
+            self.p.gather(
+                -1, torch.zeros((*self.p.shape[:2], 1), dtype=torch.long)
+            ).squeeze(-1)
         ).requires_grad_()
         teacher_logp = torch.log(
-            self.q.gather(-1, torch.zeros((*self.q.shape[:2], 1), dtype=torch.long)).squeeze(-1)
+            self.q.gather(
+                -1, torch.zeros((*self.q.shape[:2], 1), dtype=torch.long)
+            ).squeeze(-1)
         )
         output = RACSelector().compute_scores(
             g.detach().clone().requires_grad_(), student_logp, teacher_logp, self.valid
@@ -130,17 +143,26 @@ class SelectorTests(unittest.TestCase):
         self.assertGreaterEqual(float(weights.min()), 0.10 - 1e-6)
         self.assertLessEqual(float(weights.max()), 1.0 + 1e-6)
         for key in ("g", "alignment", "R", "M", "V", "z", "w"):
-            self.assertTrue(torch.equal(diagnostics[key][~self.valid], torch.zeros_like(diagnostics[key][~self.valid])))
+            self.assertTrue(
+                torch.equal(
+                    diagnostics[key][~self.valid],
+                    torch.zeros_like(diagnostics[key][~self.valid]),
+                )
+            )
             self.assertFalse(diagnostics[key].requires_grad)
             self.assertIsNone(diagnostics[key].grad_fn)
 
     def test_rac_weighted_loss_only_backpropagates_through_opd_losses(self):
-        weights = RACSelector(w_min=0.2).compute_scores(
-            torch.tensor([[0.0, 0.5, 1.0]]),
-            torch.tensor([[-1.0, -1.0, -1.0]]),
-            torch.tensor([[-1.0, -2.0, -0.5]]),
-            torch.ones(1, 3, dtype=torch.bool),
-        ).scores
+        weights = (
+            RACSelector(w_min=0.2)
+            .compute_scores(
+                torch.tensor([[0.0, 0.5, 1.0]]),
+                torch.tensor([[-1.0, -1.0, -1.0]]),
+                torch.tensor([[-1.0, -2.0, -0.5]]),
+                torch.ones(1, 3, dtype=torch.bool),
+            )
+            .scores
+        )
         opd = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
         loss = (weights * opd).sum() / weights.sum()
         loss.backward()
@@ -155,7 +177,9 @@ class SelectorTests(unittest.TestCase):
         tied = top_budget_mask(torch.zeros_like(ta), self.valid, 0.33).reshape(-1)
         indices = self.valid.reshape(-1).nonzero().squeeze(-1)
         self.assertTrue(
-            torch.equal(tied.nonzero().squeeze(-1), indices[: math.ceil(0.33 * len(indices))])
+            torch.equal(
+                tied.nonzero().squeeze(-1), indices[: math.ceil(0.33 * len(indices))]
+            )
         )
 
 

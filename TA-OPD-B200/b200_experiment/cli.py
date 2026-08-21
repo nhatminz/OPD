@@ -23,7 +23,7 @@ def _configured(args):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Standalone B200 TA-OPD versus RAC experiment"
+        description="Standalone B200 OPD, TA-OPD, and Bellman-RAC experiment"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--output", required=True)
 
     tune = commands.add_parser("autotune-batch")
+    tune.add_argument("--opd-config")
     tune.add_argument("--ta-config", required=True)
     tune.add_argument("--rac-config", required=True)
     tune.add_argument("--output", required=True)
@@ -55,18 +56,22 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--set", action="append", default=[], dest="overrides", metavar="KEY=VALUE"
     )
-    evaluate.add_argument("--name", required=True, choices=("Base", "TA-OPD", "RAC"))
+    evaluate.add_argument(
+        "--name", required=True, choices=("Base", "OPD", "TA-OPD", "RAC")
+    )
     evaluate.add_argument("--model", required=True)
     evaluate.add_argument("--output", required=True)
 
     aggregate = commands.add_parser("aggregate-eval")
     aggregate.add_argument("--base-dir", required=True)
+    aggregate.add_argument("--opd-dir")
     aggregate.add_argument("--ta-dir", required=True)
     aggregate.add_argument("--rac-dir", required=True)
     aggregate.add_argument("--output", required=True)
 
     plot = commands.add_parser("plot")
     plot.add_argument("--results", required=True)
+    plot.add_argument("--opd-output")
     plot.add_argument("--ta-output", required=True)
     plot.add_argument("--rac-output", required=True)
     plot.add_argument("--smoothing-window", type=int, default=10)
@@ -77,9 +82,25 @@ def build_parser() -> argparse.ArgumentParser:
     progress_plot.add_argument(
         "--method",
         default="both",
-        choices=("both", "ta", "ta-opd", "rac", "bellman-rac"),
-        help="Plot both methods (default), TA-OPD only, or Bellman-RAC only",
+        choices=(
+            "all",
+            "both",
+            "opd",
+            "pure-opd",
+            "ta",
+            "ta-opd",
+            "rac",
+            "bellman-rac",
+        ),
+        help="Legacy single selector: all, both=TA+RAC, or one method",
     )
+    progress_plot.add_argument(
+        "--methods",
+        nargs="+",
+        choices=("opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac"),
+        help="One or more methods to plot in the requested order",
+    )
+    progress_plot.add_argument("--opd-output")
     progress_plot.add_argument("--ta-output")
     progress_plot.add_argument("--rac-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
@@ -101,12 +122,17 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             args.generated_config,
             args.candidates,
+            opd_config=args.opd_config,
         )
     elif args.command == "evaluate":
         result = evaluate_suite(args.name, args.model, _configured(args), args.output)
     elif args.command == "aggregate-eval":
+        model_dirs = {"Base": args.base_dir}
+        if args.opd_dir:
+            model_dirs["OPD"] = args.opd_dir
+        model_dirs.update({"TA-OPD": args.ta_dir, "RAC": args.rac_dir})
         result = aggregate_evaluations(
-            {"Base": args.base_dir, "TA-OPD": args.ta_dir, "RAC": args.rac_dir},
+            model_dirs,
             args.output,
         )
     elif args.command == "plot":
@@ -116,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             args.rac_output,
             args.smoothing_window,
             args.plot_name,
+            opd_output=args.opd_output,
         )
     elif args.command == "plot-training-progress":
         result = plot_training_progress(
@@ -125,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
             args.smoothing_window,
             args.plot_name,
             method=args.method,
+            opd_output=args.opd_output,
+            methods=args.methods,
         )
     else:
         raise AssertionError(args.command)

@@ -64,6 +64,44 @@ class PlottingTests(unittest.TestCase):
             self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
             self.assertTrue(Path(paths["history_csv"]).is_file())
 
+    def test_final_plot_accepts_base_and_all_three_trained_methods(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            results = root / "results"
+            results.mkdir()
+            with (results / "comparison.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=("Method", "MATH-500", "AIME24", "AIME25")
+                )
+                writer.writeheader()
+                for index, method in enumerate(("Base", "OPD", "TA-OPD", "RAC")):
+                    writer.writerow(
+                        {
+                            "Method": method,
+                            "MATH-500": 0.1 + index / 10,
+                            "AIME24": 0.2 + index / 10,
+                            "AIME25": 0.3 + index / 10,
+                        }
+                    )
+            outputs = {}
+            for method, accuracy in (("opd", 0.2), ("ta", 0.3), ("rac", 0.4)):
+                outputs[method] = root / method
+                self._write_training_output(outputs[method], accuracy)
+
+            paths = plot_results(
+                results,
+                outputs["ta"],
+                outputs["rac"],
+                smoothing_window=2,
+                opd_output=outputs["opd"],
+            )
+
+            self.assertEqual(paths["methods"], ["OPD", "TA-OPD", "Bellman-RAC"])
+            self.assertTrue(Path(paths["accuracy"]).is_file())
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+
     def test_single_method_plot_contains_all_benchmarks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -113,10 +151,66 @@ class PlottingTests(unittest.TestCase):
                 "rac_accuracy_over_steps.png",
             )
 
+    def test_single_opd_plot_does_not_require_ta_or_rac_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            opd_output = root / "opd"
+            self._write_training_output(opd_output, 0.20)
+
+            paths = plot_training_progress(
+                root / "results", opd_output=opd_output, methods=["opd"]
+            )
+
+            self.assertEqual(paths["method"], "OPD")
+            self.assertEqual(
+                Path(paths["accuracy_over_steps"]).name,
+                "opd_accuracy_over_steps.png",
+            )
+
+    def test_any_two_or_all_three_methods_can_be_compared(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outputs = {}
+            for method, accuracy in (("opd", 0.2), ("ta", 0.3), ("rac", 0.4)):
+                outputs[method] = root / method
+                self._write_training_output(outputs[method], accuracy)
+
+            pair = plot_training_progress(
+                root / "pair-results",
+                opd_output=outputs["opd"],
+                rac_output=outputs["rac"],
+                methods=["opd", "rac"],
+                plot_name="opd_vs_rac",
+            )
+            all_methods = plot_training_progress(
+                root / "all-results",
+                opd_output=outputs["opd"],
+                ta_output=outputs["ta"],
+                rac_output=outputs["rac"],
+                methods=["opd", "ta", "rac"],
+                plot_name="all_three",
+            )
+
+            self.assertEqual(pair["methods"], ["OPD", "Bellman-RAC"])
+            self.assertEqual(all_methods["methods"], ["OPD", "TA-OPD", "Bellman-RAC"])
+            self.assertTrue(Path(pair["accuracy_over_steps"]).is_file())
+            self.assertTrue(Path(all_methods["accuracy_over_steps"]).is_file())
+            with Path(pair["history_csv"]).open(newline="", encoding="utf-8") as handle:
+                pair_rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                {row["Method"] for row in pair_rows},
+                {"Base", "OPD", "Bellman-RAC"},
+            )
+
     def test_selected_method_requires_its_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(ValueError, "--rac-output is required"):
                 plot_training_progress(Path(temporary), method="rac")
+
+    def test_all_methods_require_opd_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "--opd-output is required"):
+                plot_training_progress(Path(temporary), method="all")
 
 
 if __name__ == "__main__":

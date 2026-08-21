@@ -62,9 +62,7 @@ def tensor_summary(
         "max": float(finite.max()),
         **{
             name: float(value)
-            for name, value in zip(
-                ("q05", "q25", "q50", "q75", "q95"), quantiles
-            )
+            for name, value in zip(("q05", "q25", "q50", "q75", "q95"), quantiles)
         },
     }
 
@@ -75,10 +73,10 @@ def selector_summary(
     valid_mask: torch.Tensor,
     selected: torch.Tensor,
 ):
-    keys = (
-        ("D", "C", "D_norm", "C_norm", "s_TA")
-        if method == "ta"
-        else (
+    if method == "ta":
+        keys = ("D", "C", "D_norm", "C_norm", "s_TA")
+    elif method == "rac":
+        keys = (
             "g",
             "alignment",
             "R",
@@ -87,7 +85,10 @@ def selector_summary(
             "z",
             "w",
         )
-    )
+    elif method == "opd":
+        keys = ("w",)
+    else:
+        raise ValueError(f"Unknown selector-summary method: {method!r}")
     result: dict[str, Any] = {}
     for key in keys:
         value = diagnostics.get(key)
@@ -102,7 +103,7 @@ def selector_summary(
     )
     if method == "ta" and selected_count:
         result["selection_threshold"] = float(diagnostics["s_TA"][selected].min())
-    if method == "rac" and "w" in diagnostics:
+    if method in {"opd", "rac"} and "w" in diagnostics:
         weights = diagnostics["w"][valid_mask].detach().float()
         weight_sum = weights.sum()
         result.update(

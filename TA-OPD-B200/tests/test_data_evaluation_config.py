@@ -9,10 +9,34 @@ import pandas as pd
 
 from b200_experiment.config import load_config, resolve_runtime_paths
 from b200_experiment.data import epoch_batch_indices, read_records
-from b200_experiment.evaluation import load_benchmark
+from b200_experiment.evaluation import aggregate_evaluations, load_benchmark
 
 
 class DataEvaluationConfigTests(unittest.TestCase):
+    def test_aggregation_includes_pure_opd_in_controlled_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_dirs = {}
+            for index, method in enumerate(("Base", "OPD", "TA-OPD", "RAC")):
+                output = root / method.lower().replace("-", "_")
+                output.mkdir()
+                (output / "summary.json").write_text(
+                    json.dumps(
+                        {
+                            "benchmarks": {
+                                benchmark: {"accuracy": 0.1 * (index + 1)}
+                                for benchmark in ("MATH-500", "AIME24", "AIME25")
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                model_dirs[method] = output
+
+            rows = aggregate_evaluations(model_dirs, root / "results")
+
+            self.assertEqual([row["Method"] for row in rows], list(model_dirs))
+            self.assertEqual(rows[1]["MATH-500"], 0.2)
     def test_epoch_batches_cover_full_dataset_without_repetition(self):
         batches = [epoch_batch_indices(10, 4, step, 1234) for step in range(3)]
         flattened = [item for batch in batches for item in batch]
@@ -58,6 +82,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
     def test_configs_have_exact_paths_and_fair_shared_settings(self):
         root = Path(__file__).resolve().parents[1]
         base = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_base.yaml"))
+        opd = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_opd.yaml"))
         ta = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_ta.yaml"))
         rac = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_rac.yaml"))
         self.assertEqual(
@@ -89,6 +114,9 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(base["selector"]["rac_gamma"], 0.995)
         self.assertEqual(base["selector"]["rac_w_min"], 0.10)
         self.assertEqual(base["selector"]["rac_beta"], 2.0)
+        self.assertEqual(opd["experiment"]["method"], "opd")
+        self.assertEqual(ta["experiment"]["method"], "ta")
+        self.assertEqual(rac["experiment"]["method"], "rac")
         for section in (
             "models",
             "paths",
@@ -99,6 +127,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
             "training",
             "training_evaluation",
         ):
+            self.assertEqual(opd[section], ta[section], section)
             self.assertEqual(ta[section], rac[section], section)
 
 

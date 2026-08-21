@@ -68,6 +68,7 @@ def run_batch_autotune(
     output_root: str | Path,
     generated_config: str | Path,
     candidates: list[int] | None = None,
+    opd_config: str | Path | None = None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Batch autotune requires CUDA")
@@ -87,14 +88,18 @@ def run_batch_autotune(
     repo_root = Path(__file__).resolve().parents[1]
 
     # Monotonic memory use lets us binary-search the bounded candidate list.
-    # This limits the default smoke to at most three TA and three RAC steps.
+    # This limits the default smoke to at most three steps per compared method.
     low, high = 0, len(candidates) - 1
     while low <= high:
         candidate_index = (low + high) // 2
         batch_size = candidates[candidate_index]
         pair: dict[str, Any] = {"batch_size": batch_size, "methods": {}}
         pair_ok = True
-        for method, config_path in (("ta", ta_config), ("rac", rac_config)):
+        method_configs = []
+        if opd_config is not None:
+            method_configs.append(("opd", opd_config))
+        method_configs.extend((("ta", ta_config), ("rac", rac_config)))
+        for method, config_path in method_configs:
             output_dir = run_root / f"{method}_batch_{batch_size}"
             command = [
                 sys.executable,
@@ -149,14 +154,28 @@ def run_batch_autotune(
                 rac_metric["selector"]["selected_tokens"]
                 == rac_metric["selector"]["valid_tokens"]
             )
-            same_rollout = (
-                ta_metric["rollout_token_sha256"] == rac_metric["rollout_token_sha256"]
-            )
+            opd_all_tokens = True
+            if "opd" in pair["methods"]:
+                opd_metric = pair["methods"]["opd"]["metrics"]
+                opd_all_tokens = (
+                    opd_metric["selector"]["selected_tokens"]
+                    == opd_metric["selector"]["valid_tokens"]
+                )
+                opd_uniform = opd_metric["selector"]["w"]
+                opd_all_tokens = opd_all_tokens and all(
+                    abs(float(opd_uniform[key]) - 1.0) <= 1e-12
+                    for key in ("mean", "min", "max")
+                )
+            rollout_hashes = {
+                result["metrics"]["rollout_token_sha256"]
+                for result in pair["methods"].values()
+            }
+            same_rollout = len(rollout_hashes) == 1
             peak_ratio = max(
-                pair["methods"]["ta"]["peak_reserved_fraction"],
-                pair["methods"]["rac"]["peak_reserved_fraction"],
+                result["peak_reserved_fraction"] for result in pair["methods"].values()
             )
             pair.update(
+                opd_uniform_all_tokens=opd_all_tokens,
                 ta_hard_budget_valid=ta_budget_ok,
                 rac_all_tokens_supervised=rac_all_tokens,
                 identical_initial_rollout=same_rollout,
@@ -165,6 +184,7 @@ def run_batch_autotune(
             pair_ok = (
                 ta_budget_ok
                 and rac_all_tokens
+                and opd_all_tokens
                 and same_rollout
                 and peak_ratio <= max_reserved_fraction
             )
@@ -181,7 +201,7 @@ def run_batch_autotune(
 
     if selected is None:
         raise RuntimeError(
-            f"No batch candidate passed TA+RAC validation; see {run_root}"
+            f"No batch candidate passed controlled-method validation; see {run_root}"
         )
     report = {
         "status": "passed",
@@ -190,7 +210,7 @@ def run_batch_autotune(
         "candidate_policy": {
             "candidates": candidates,
             "max_reserved_fraction": max_reserved_fraction,
-            "selection": "largest tested TA+Bellman-RAC batch passing finite-loss, method-allocation, identical-rollout and memory-headroom checks",
+            "selection": "largest tested controlled-method batch passing finite-loss, method-allocation, identical-rollout and memory-headroom checks",
         },
         "selected_batch_size": selected,
         "selected_micro_batch_size": 1,
@@ -212,9 +232,9 @@ def run_batch_autotune(
         f"- GPU: `{report['gpu'][0]['name']}` ({report['gpu'][0]['memory_bytes'] / 2**30:.1f} GiB)\n"
         f"- Selected training batch: **{selected}**\n"
         "- Global micro-batch: **1** (accumulated within each rollout)\n"
-        f"- Peak reserved fraction (worst of TA/RAC): `{selected_peak_ratio:.3f}`\n"
+        f"- Peak reserved fraction (worst controlled method): `{selected_peak_ratio:.3f}`\n"
         f"- Full report: `{report_path}`\n"
-        "- Validation: both methods had finite loss and identical rollout hash; TA used its exact hard budget and Bellman-RAC supervised every valid token. No checkpoint/full run was started.\n",
+        "- Validation: all configured methods had finite loss and identical rollout hash; pure OPD used uniform unit weights, TA used its exact hard budget, and Bellman-RAC supervised every valid token. No checkpoint/full run was started.\n",
         encoding="utf-8",
     )
     _update_readme(

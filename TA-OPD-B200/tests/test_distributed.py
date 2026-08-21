@@ -21,6 +21,7 @@ from b200_experiment.trainer import (
     _globalize_ta_output,
     _local_mask_from_global_budget,
     _opd_train_step,
+    _sum_per_response_masked_means,
 )
 from b200_experiment.scoring import RolloutBatch
 
@@ -175,6 +176,19 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
 
 
 class DistributedInvariantTests(unittest.TestCase):
+    def test_full_opd_reduction_means_each_variable_length_response_first(self):
+        elementwise = torch.tensor([[1.0, 3.0, 99.0], [10.0, 20.0, 30.0]])
+        full_valid_mask = torch.tensor(
+            [[True, True, False], [True, True, True]], dtype=torch.bool
+        )
+
+        summed_response_means = _sum_per_response_masked_means(
+            elementwise, full_valid_mask
+        )
+
+        self.assertEqual(float(summed_response_means), 22.0)
+        self.assertEqual(float(summed_response_means / 2), 11.0)
+
     def test_variable_length_collective_uses_rank_order(self):
         if not dist.is_gloo_available():
             self.skipTest("PyTorch was built without Gloo")
