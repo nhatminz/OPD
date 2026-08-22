@@ -125,7 +125,7 @@ if batch != autotune["rollout"]["batch_size"] or micro <= 0:
 print(f"Autotuned B200 global batch size: {batch} (global micro-batch: {micro})")
 PY
   else
-    "${PYTHON_BIN}" - "${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}" "${MICRO_BATCH_SIZE:-1}" <<'PY'
+    "${PYTHON_BIN}" - "${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}" "${MICRO_BATCH_SIZE:-1}" <<'PY'
 import sys
 
 batch, micro = map(int, sys.argv[1:])
@@ -145,11 +145,14 @@ batch_autotune_enabled() {
 
 build_training_args() {
   local output_dir="$1"
+  local prompt_batch="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}"
+  local response_count="${NUM_RESPONSES:-4}"
+  local trajectory_batch=$((prompt_batch * response_count))
   COMMON_TRAIN_ARGS=(
     --set "experiment.output_dir=${output_dir}"
     --set "paths.storage_root=${STORAGE_ROOT}"
     --set "experiment.seed=${SEED:-${EXPERIMENT_SEED:-42}}"
-    --set "data.max_prompt_tokens=${MAX_PROMPT_LEN:-2048}"
+    --set "data.max_prompt_tokens=${MAX_PROMPT_LENGTH:-${MAX_PROMPT_LEN:-1024}}"
     --set "training.epochs=${NUM_EPOCHS:-${EPOCHS:-1}}"
     --set "training.learning_rate=${LR:-${LEARNING_RATE:-1.0e-6}}"
     --set "training.save_interval=${SAVE_INTERVAL:-50}"
@@ -157,14 +160,23 @@ build_training_args() {
     --set "distributed.bucket_cap_mb=${DDP_BUCKET_CAP_MB:-100}"
     --set "rollout.backend=${ROLLOUT_BACKEND:-vllm}"
     --set "rollout.seed=${ROLLOUT_SEED:-42}"
-    --set "rollout.max_new_tokens=${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-8192}}"
+    --set "rollout.num_responses=${response_count}"
+    --set "rollout.max_new_tokens=${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-7168}}}"
+    --set "rollout.temperature=${ROLLOUT_TEMPERATURE:-1.0}"
+    --set "rollout.top_p=${ROLLOUT_TOP_P:-1.0}"
     --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
-    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}}"
-    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-12288}"
-    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}}"
+    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${trajectory_batch}}"
+    --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-9216}"
+    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${trajectory_batch}}"
     --set "rollout.vllm.wake_headroom_gib=${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
+    --set "rollout.vllm.logprob_sanity.enabled=${VLLM_LOGPROB_SANITY_ENABLED:-false}"
+    --set "rollout.vllm.logprob_sanity.max_tokens_per_rank=${VLLM_LOGPROB_SANITY_TOKENS:-32}"
+    --set "rollout.vllm.logprob_sanity.tolerance=${VLLM_LOGPROB_SANITY_TOLERANCE:-0.05}"
+    --set "rollout.vllm.logprob_sanity.fail_on_mismatch=${VLLM_LOGPROB_SANITY_FAIL:-false}"
+    --set "opd.teacher_temperature=${TEACHER_TEMPERATURE:-1.0}"
     --set "token_budget.rho=${TA_RHO:-${RHO:-0.10}}"
     --set "selector.top_k=${TOP_K:-16}"
+    --set "selector.score_micro_batch_size=${SCORE_MICRO_BATCH_SIZE:-1}"
     --set "selector.score_chunk_steps=${SCORE_CHUNK_STEPS:-128}"
     --set "selector.ta_vocab_chunk_tokens=${TA_VOCAB_CHUNK_TOKENS:-2048}"
     --set "selector.rac_gamma=${RAC_GAMMA:-0.995}"
@@ -175,23 +187,25 @@ build_training_args() {
     --set "logging.log_interval=${LOG_INTERVAL:-1}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
-    --set "training_evaluation.temperature=${TRAIN_EVAL_TEMPERATURE:-1.0}"
+    --set "training_evaluation.temperature=${TRAIN_EVAL_TEMPERATURE:-0.7}"
+    --set "training_evaluation.top_p=${TRAIN_EVAL_TOP_P:-0.95}"
+    --set "training_evaluation.num_responses=${TRAIN_EVAL_NUM_RESPONSES:-16}"
     --set "training_evaluation.target_evaluations=null"
     --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "training_evaluation.limit=null"
-    --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-16}"
-    --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"
+    --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-1}"
+    --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-7168}"
     --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
     --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
     --set "training_evaluation.vllm.gpu_headroom_gib=${VLLM_GPU_HEADROOM_GIB:-4}"
     --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-256}"
-    --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-12288}"
+    --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-9216}"
   )
   if batch_autotune_enabled; then
     COMMON_TRAIN_ARGS=(--overlay "${AUTOTUNE_CONFIG}" "${COMMON_TRAIN_ARGS[@]}")
   else
     COMMON_TRAIN_ARGS+=(
-      --set "rollout.batch_size=${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-8}}"
+      --set "rollout.batch_size=${prompt_batch}"
       --set "training.micro_batch_size=${MICRO_BATCH_SIZE:-1}"
     )
   fi

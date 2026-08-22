@@ -447,11 +447,17 @@ def validate_resume_config(
         "data.split",
         "rollout.backend",
         "rollout.batch_size",
+        "rollout.num_responses",
         "rollout.max_new_tokens",
         "rollout.temperature",
         "rollout.top_p",
         "rollout.seed",
         "selector.top_k",
+        "opd.adv_estimator",
+        "opd.top_k_strategy",
+        "opd.reward_weight_mode",
+        "opd.loss_agg_mode",
+        "opd.teacher_temperature",
         "selector.rac_gamma",
         "selector.rac_w_min",
         "selector.rac_beta",
@@ -461,6 +467,7 @@ def validate_resume_config(
         "training.weight_decay",
         "training.ppo_clip_low",
         "training.ppo_clip_high",
+        "training.ppo_dual_clip",
     )
     mismatches = {
         key: {"checkpoint": _get(source, key), "current": _get(current, key)}

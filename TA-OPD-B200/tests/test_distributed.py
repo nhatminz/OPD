@@ -21,8 +21,8 @@ from b200_experiment.trainer import (
     _globalize_ta_output,
     _local_mask_from_global_budget,
     _opd_train_step,
-    _sum_per_response_masked_means,
 )
+from b200_experiment.opd_core import topk_reference_from_logits, weighted_token_sums
 from b200_experiment.scoring import RolloutBatch
 
 
@@ -58,6 +58,8 @@ def _tiny_batch(start: int, end: int) -> RolloutBatch:
 
 def _tiny_config() -> dict:
     return {
+        "rollout": {"temperature": 1.0},
+        "selector": {"score_chunk_steps": 2},
         "training": {
             "micro_batch_size": 3,
             "ppo_clip_low": 0.2,
@@ -65,6 +67,22 @@ def _tiny_config() -> dict:
             "max_grad_norm": 100.0,
         }
     }
+
+
+@torch.no_grad()
+def _tiny_reference(model: nn.Module, rollout: RolloutBatch):
+    output = model(
+        input_ids=rollout.input_ids,
+        attention_mask=rollout.attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    width = rollout.response_ids.shape[1]
+    logits = output.logits[:, rollout.prompt_width - 1 :][:, :width]
+    teacher_bias = torch.linspace(-0.2, 0.2, logits.shape[-1])
+    return topk_reference_from_logits(
+        logits, logits + teacher_bias, rollout.valid_mask, top_k=5
+    )
 
 
 def _parameters(model: nn.Module) -> torch.Tensor:
@@ -87,20 +105,17 @@ def _ddp_step_worker(rank: int, rendezvous: str, output_root: str) -> None:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
         start, end = contiguous_partition(3, rank, 2)
         rollout = _tiny_batch(start, end)
-        old = torch.zeros_like(rollout.response_ids, dtype=torch.float32)
-        teacher = torch.full_like(old, 0.2)
+        opd_reference = _tiny_reference(model, rollout)
         context = DistributedContext(rank, rank, 2, torch.device("cpu"))
         _opd_train_step(
             wrapped,
             optimizer,
             rollout,
             rollout.valid_mask,
-            old,
-            teacher,
+            opd_reference,
             _tiny_config(),
             torch.device("cpu"),
             context,
-            3,
         )
         torch.save(_parameters(model), Path(output_root) / f"rank-{rank}.pt")
     finally:
@@ -176,18 +191,19 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
 
 
 class DistributedInvariantTests(unittest.TestCase):
-    def test_full_opd_reduction_means_each_variable_length_response_first(self):
+    def test_full_opd_reduction_is_global_token_mean(self):
         elementwise = torch.tensor([[1.0, 3.0, 99.0], [10.0, 20.0, 30.0]])
         full_valid_mask = torch.tensor(
             [[True, True, False], [True, True, True]], dtype=torch.bool
         )
 
-        summed_response_means = _sum_per_response_masked_means(
-            elementwise, full_valid_mask
+        numerator, denominator = weighted_token_sums(
+            elementwise, full_valid_mask.float(), full_valid_mask
         )
 
-        self.assertEqual(float(summed_response_means), 22.0)
-        self.assertEqual(float(summed_response_means / 2), 11.0)
+        self.assertEqual(float(numerator), 64.0)
+        self.assertEqual(float(denominator), 5.0)
+        self.assertAlmostEqual(float(numerator / denominator), 12.8, places=6)
 
     def test_variable_length_collective_uses_rank_order(self):
         if not dist.is_gloo_available():
@@ -203,19 +219,16 @@ class DistributedInvariantTests(unittest.TestCase):
         reference = _TinyCausalLM()
         optimizer = torch.optim.SGD(reference.parameters(), lr=0.05)
         rollout = _tiny_batch(0, 3)
-        old = torch.zeros_like(rollout.response_ids, dtype=torch.float32)
-        teacher = torch.full_like(old, 0.2)
+        opd_reference = _tiny_reference(reference, rollout)
         _opd_train_step(
             reference,
             optimizer,
             rollout,
             rollout.valid_mask,
-            old,
-            teacher,
+            opd_reference,
             _tiny_config(),
             torch.device("cpu"),
             DistributedContext(0, 0, 1, torch.device("cpu")),
-            3,
         )
         expected = _parameters(reference)
         with tempfile.TemporaryDirectory() as temporary:

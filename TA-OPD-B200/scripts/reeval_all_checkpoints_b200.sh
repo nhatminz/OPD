@@ -15,13 +15,15 @@ ARGS=(
   --opd-output "${OPD_RUN_OUTPUT}"
   --ta-output "${TA_RUN_OUTPUT}"
   --rac-output "${RAC_RUN_OUTPUT}"
-  --temperature 1.0
-  --max-new-tokens "${REEVAL_MAX_NEW_TOKENS:-8192}"
+  --temperature "${REEVAL_TEMPERATURE:-0.7}"
+  --top-p "${REEVAL_TOP_P:-0.95}"
+  --num-responses "${REEVAL_NUM_RESPONSES:-16}"
+  --max-new-tokens "${REEVAL_MAX_NEW_TOKENS:-7168}"
   --tensor-parallel-size "${REEVAL_VLLM_TENSOR_PARALLEL_SIZE:-${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}}"
   --gpu-memory-utilization "${REEVAL_VLLM_GPU_MEMORY_UTILIZATION:-${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-auto}}"
   --gpu-headroom-gib "${REEVAL_VLLM_GPU_HEADROOM_GIB:-${EVAL_VLLM_GPU_HEADROOM_GIB:-4}}"
   --max-num-seqs "${REEVAL_VLLM_MAX_NUM_SEQS:-${EVAL_VLLM_MAX_NUM_SEQS:-256}}"
-  --max-model-len "${REEVAL_VLLM_MAX_MODEL_LEN:-${EVAL_VLLM_MAX_MODEL_LEN:-12288}}"
+  --max-model-len "${REEVAL_VLLM_MAX_MODEL_LEN:-${EVAL_VLLM_MAX_MODEL_LEN:-9216}}"
   --seed "${REEVAL_SEED:-1234}"
 )
 
@@ -40,7 +42,7 @@ case "${REEVAL_DRY_RUN:-false}" in
 esac
 
 echo "Re-evaluating every saved OPD, TA-OPD, and RAC checkpoint."
-echo "Temperature: 1.0; backend: vLLM; seed: ${REEVAL_SEED:-1234}"
+echo "avg@16: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."
 else

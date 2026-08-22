@@ -24,6 +24,7 @@ def rollout_batch_from_token_ids(
     prompt_attention_mask: torch.Tensor,
     response_token_ids: list[list[int]],
     pad_token_id: int,
+    response_log_probs: list[list[float]] | None = None,
 ) -> RolloutBatch:
     if len(response_token_ids) != prompt_ids.shape[0]:
         raise ValueError("vLLM response count does not match the prompt batch")
@@ -38,18 +39,26 @@ def rollout_batch_from_token_ids(
         device=device,
     )
     valid = torch.zeros_like(responses, dtype=torch.bool)
+    log_probs = torch.full_like(responses, torch.nan, dtype=torch.float32)
     for row, tokens in enumerate(response_token_ids):
         if tokens:
             values = torch.tensor(tokens, dtype=torch.long, device=device)
             responses[row, : values.numel()] = values
             valid[row, : values.numel()] = True
+            if response_log_probs is not None:
+                values_logp = response_log_probs[row]
+                if len(values_logp) != len(tokens):
+                    raise ValueError("vLLM token IDs and token log-probs do not align")
+                log_probs[row, : values.numel()] = torch.tensor(
+                    values_logp, dtype=torch.float32, device=device
+                )
     attention = torch.cat((prompt_attention_mask, valid.long()), dim=1)
     return RolloutBatch(
         input_ids=torch.cat((prompt_ids, responses), dim=1),
         attention_mask=attention,
         response_ids=responses,
         valid_mask=valid,
-        rollout_log_probs=torch.zeros_like(responses, dtype=torch.float32),
+        rollout_log_probs=log_probs,
         prompt_width=prompt_ids.shape[1],
     )
 
@@ -312,7 +321,7 @@ class VLLMRolloutEngine:
         top_p: float,
         eos_token_ids: list[int],
         seed: int,
-    ) -> tuple[int, list[int]]:
+    ) -> tuple[int, list[int], list[float] | None]:
         payload = {
             "model": self.served_model_name,
             "prompt": prompt_token_ids,
@@ -323,6 +332,7 @@ class VLLMRolloutEngine:
             "stop_token_ids": eos_token_ids,
             "return_token_ids": True,
             "skip_special_tokens": False,
+            "logprobs": 1,
         }
         response = requests.post(
             f"{self.base_url}/v1/completions",
@@ -336,7 +346,11 @@ class VLLMRolloutEngine:
             raise RuntimeError(
                 "vLLM response omitted token_ids; this project requires vLLM >=0.17.1"
             )
-        return index, [int(token) for token in tokens]
+        raw_log_probs = (choice.get("logprobs") or {}).get("token_logprobs")
+        token_log_probs = None
+        if raw_log_probs is not None and all(item is not None for item in raw_log_probs):
+            token_log_probs = [float(item) for item in raw_log_probs]
+        return index, [int(token) for token in tokens], token_log_probs
 
     def generate(
         self,
@@ -374,6 +388,7 @@ class VLLMRolloutEngine:
         self._wake_kv_cache()
         generate_started = time.perf_counter()
         responses: list[list[int] | None] = [None] * len(prompts)
+        response_log_probs: list[list[float] | None] = [None] * len(prompts)
         workers = min(
             len(prompts), int(self.settings.get("max_concurrent_requests", 128))
         )
@@ -402,8 +417,9 @@ class VLLMRolloutEngine:
                     disable=False,
                 )
                 for future in progress:
-                    index, tokens = future.result()
+                    index, tokens, token_log_probs = future.result()
                     responses[index] = tokens
+                    response_log_probs[index] = token_log_probs
         finally:
             sleep_started = time.perf_counter()
             self._sleep()
@@ -419,11 +435,17 @@ class VLLMRolloutEngine:
             "torch_cache_release_time": cache_release_seconds,
             "total_time": time.perf_counter() - started,
         }
+        complete_log_probs = (
+            [item for item in response_log_probs if item is not None]
+            if all(item is not None for item in response_log_probs)
+            else None
+        )
         return rollout_batch_from_token_ids(
             prompt_ids,
             prompt_attention_mask,
             [tokens for tokens in responses if tokens is not None],
             pad_token_id,
+            complete_log_probs,
         )
 
     def close(self) -> None:

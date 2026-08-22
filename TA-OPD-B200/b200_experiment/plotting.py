@@ -308,9 +308,9 @@ def _plot_single_method_accuracy(
             label=benchmark,
         )
     axis.set_xlabel("Optimizer step")
-    axis.set_ylabel("Accuracy")
+    axis.set_ylabel("avg@16")
     axis.set_ylim(0.0, 1.05)
-    axis.set_title(f"{spec['label']} evaluation accuracy during training")
+    axis.set_title(f"{spec['label']} evaluation avg@16 during training")
     axis.grid(alpha=0.25)
     axis.legend(title="Dataset")
     fig.tight_layout()
@@ -377,7 +377,7 @@ def plot_training_progress(
     opd_output: str | Path | None = None,
     methods: list[str] | tuple[str, ...] | None = None,
 ):
-    """Plot eval accuracy for any one, two, or all three training methods."""
+    """Plot eval avg@16 for any one, two, or all three training methods."""
     results_dir = Path(results_dir).resolve()
     plots_dir = _plots_dir or _plot_directory(results_dir, plot_name)
     selected_methods = _normalize_progress_methods(method, methods)
@@ -463,7 +463,7 @@ def plot_training_progress(
         axis.set_xlabel("Optimizer step")
         axis.set_ylim(0.0, 1.05)
         axis.grid(alpha=0.25)
-    axes[0].set_ylabel("Accuracy")
+    axes[0].set_ylabel("avg@16")
     handles, labels = axes[-1].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -475,7 +475,7 @@ def plot_training_progress(
     compared_names = ", ".join(
         _PROGRESS_METHODS[item]["label"] for item in selected_methods
     )
-    fig.suptitle(f"Evaluation accuracy during {compared_names} training", y=1.02)
+    fig.suptitle(f"Evaluation avg@16 during {compared_names} training", y=1.02)
     fig.tight_layout()
     progress_path = plots_dir / "accuracy_over_steps.png"
     _save_figure(fig, progress_path)
@@ -537,7 +537,7 @@ def plot_results(
         )
     axis.set_xticks(x, BENCHMARK_ORDER)
     axis.set_ylim(0.0, 1.08)
-    axis.set_ylabel("Accuracy")
+    axis.set_ylabel("avg@16")
     axis.set_title("Qwen3-1.7B: " + " vs ".join(plotted_models))
     axis.grid(axis="y", alpha=0.25)
     axis.legend()

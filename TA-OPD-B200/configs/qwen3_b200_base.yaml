@@ -1,5 +1,5 @@
-# Shared source of truth. Bash exposes independent global rollout-batch and
-# within-step micro-batch knobs; all three methods inherit these same values.
+# Shared source of truth. Bash exposes independent global prompt-batch and
+# within-step trajectory micro-batch knobs; all three methods inherit them.
 experiment:
   method: base
   seed: 42
@@ -9,8 +9,8 @@ experiment:
   verbose_metrics: false
 
 # scripts/train_{opd,ta,rac}_b200.sh automatically launches one DDP worker per
-# CUDA_VISIBLE_DEVICES entry. rollout.batch_size and training.micro_batch_size
-# remain GLOBAL values, independent of GPU count.
+# CUDA_VISIBLE_DEVICES entry. rollout.batch_size is the GLOBAL prompt count;
+# after n-way expansion, training.micro_batch_size remains a trajectory count.
 distributed:
   backend: nccl
   find_unused_parameters: false
@@ -36,7 +36,7 @@ data:
   split: all
   prompt_key: prompt
   prefer_source_prompt: false
-  max_prompt_tokens: 2048
+  max_prompt_tokens: 1024
   chat_template_kwargs:
     enable_thinking: true
 
@@ -44,8 +44,10 @@ rollout:
   # Default training rollout uses a persistent, same-GPU vLLM server. Student
   # weights are synchronized through CUDA IPC before every optimizer step.
   backend: vllm
-  batch_size: 8
-  max_new_tokens: 8192
+  # Prompt batch. n=4 expands 16 prompts to at most 64 trajectories.
+  batch_size: 16
+  num_responses: 4
+  max_new_tokens: 7168
   temperature: 1.0
   top_p: 1.0
   seed: 42
@@ -53,10 +55,10 @@ rollout:
     # This is a co-located engine reservation, not an evaluation sample limit.
     # It sleeps at level 2 while HF student/teacher scoring and backward run.
     gpu_memory_utilization: 0.25
-    max_num_seqs: 8
-    # 2048 prompt + 8192 generated tokens fit with context headroom.
-    max_model_len: 12288
-    max_concurrent_requests: 8
+    max_num_seqs: 64
+    # 1024 prompt + 7168 generated tokens, plus small serving headroom.
+    max_model_len: 9216
+    max_concurrent_requests: 64
     # Release the trainer CUDA cache only when the sleeping engine otherwise
     # cannot wake with this safety margin; avoid empty_cache on every step.
     wake_headroom_gib: 2
@@ -64,9 +66,29 @@ rollout:
     startup_timeout: 600
     control_timeout: 600
     generation_timeout: 3600
+    # Optional stale-weight diagnostic after CUDA-IPC synchronization.
+    logprob_sanity:
+      enabled: false
+      max_tokens_per_rank: 32
+      tolerance: 0.05
+      fail_on_mismatch: false
+
+# Common thunlp/OPD recipe. These semantics are validated at startup and are
+# shared by OPD, TA-OPD, and RAC; method selectors only supply position weights.
+opd:
+  upstream_repository: https://github.com/thunlp/OPD
+  upstream_commit: ac26e38d6f1572eb027597b48a9f4e01f6915ef8
+  adv_estimator: token_reward_direct
+  top_k_strategy: only_stu
+  reward_weight_mode: student_p
+  loss_agg_mode: token-mean
+  teacher_temperature: 1.0
 
 selector:
   top_k: 16
+  # Forward rows per scoring call; full-vocabulary logits are consumed and
+  # released one micro-batch at a time, never retained for the full rollout.
+  score_micro_batch_size: 1
   score_chunk_steps: 128
   ta_vocab_chunk_tokens: 2048
   eps: 1.0e-8
@@ -96,6 +118,7 @@ training:
   weight_decay: 0.0
   ppo_clip_low: 0.2
   ppo_clip_high: 0.28
+  ppo_dual_clip: 3.0
   max_grad_norm: 1.0
   use_lora: false
   gradient_checkpointing: false
@@ -120,15 +143,17 @@ logging:
 training_evaluation:
   enabled: true
   backend: vllm
-  temperature: 1.0
+  temperature: 0.7
+  top_p: 0.95
+  num_responses: 16
   target_evaluations: null
   interval_steps: 50
   eval_at_start: true
   eval_at_end: true
   benchmark_names: [MATH-500, AIME24, AIME25]
   # Used only by the Hugging Face fallback backend.
-  batch_size: 16
-  max_new_tokens: 8192
+  batch_size: 1
+  max_new_tokens: 7168
   limit: null
   output_subdir: training_eval
   vllm:
@@ -138,7 +163,7 @@ training_evaluation:
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
     max_num_seqs: 256
-    max_model_len: 12288
+    max_model_len: 9216
     enable_prefix_caching: true
     seed: 1234
 
@@ -151,16 +176,18 @@ autotune:
 
 evaluation:
   backend: vllm
-  temperature: 1.0
-  batch_size: 16
-  max_new_tokens: 8192
+  temperature: 0.7
+  top_p: 0.95
+  num_responses: 16
+  batch_size: 1
+  max_new_tokens: 7168
   limit: null
   vllm:
     tensor_parallel_size: 1
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
     max_num_seqs: 256
-    max_model_len: 12288
+    max_model_len: 9216
     enable_prefix_caching: true
     seed: 1234
   benchmarks:

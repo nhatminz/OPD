@@ -71,10 +71,31 @@ class SelectorTests(unittest.TestCase):
             self.valid,
             token_chunk_size=2,
         )
+        student_ids = torch.topk(student_logits, 8, dim=-1).indices
+        teacher_ids = torch.topk(teacher_logits, 8, dim=-1).indices
+        compact_topk = selector.compute_scores_from_topk(
+            student_ids,
+            teacher_ids,
+            student_logits.gather(-1, student_ids),
+            teacher_logits.gather(-1, student_ids),
+            teacher_logits.gather(-1, teacher_ids),
+            student_logits.gather(-1, teacher_ids),
+            self.valid,
+            token_chunk_size=2,
+        )
         for key in ("D", "C", "D_norm", "C_norm", "s_TA"):
             self.assertTrue(
                 torch.allclose(
                     compact.diagnostics[key],
+                    reference.diagnostics[key],
+                    atol=2e-6,
+                    rtol=2e-6,
+                ),
+                key,
+            )
+            self.assertTrue(
+                torch.allclose(
+                    compact_topk.diagnostics[key],
                     reference.diagnostics[key],
                     atol=2e-6,
                     rtol=2e-6,

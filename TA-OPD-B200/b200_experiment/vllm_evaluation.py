@@ -71,9 +71,15 @@ def evaluate_vllm_suite(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     max_new_tokens = int(runtime_settings.get("max_new_tokens", 2048))
-    temperature = float(runtime_settings.get("temperature", 1.0))
-    if temperature < 0:
-        raise ValueError("Evaluation temperature cannot be negative")
+    temperature = float(runtime_settings.get("temperature", 0.7))
+    top_p = float(runtime_settings.get("top_p", 0.95))
+    samples_per_problem = int(runtime_settings.get("num_responses", 16))
+    if temperature <= 0:
+        raise ValueError("avg@16 evaluation requires positive temperature")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("Evaluation top_p must be in (0, 1]")
+    if samples_per_problem <= 0:
+        raise ValueError("Evaluation num_responses must be positive")
     limit = runtime_settings.get("limit")
     benchmark_names = tuple(runtime_settings.get("benchmark_names", BENCHMARK_ORDER))
     unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
@@ -117,7 +123,12 @@ def evaluate_vllm_suite(
         f"Eval {model_name}: loading vLLM engine for {len(prompts)} full-dataset samples..."
     )
     engine = LLM(**engine_kwargs)
-    sampling = SamplingParams(temperature=temperature, max_tokens=max_new_tokens)
+    sampling = SamplingParams(
+        n=samples_per_problem,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_new_tokens,
+    )
     # One call produces one tqdm progress bar for all configured benchmarks.
     generated = engine.generate(prompts, sampling, use_tqdm=True) if prompts else []
     if len(generated) != len(prompt_rows):
@@ -135,15 +146,23 @@ def evaluate_vllm_suite(
             "limit": limit,
             "do_sample": temperature > 0,
             "temperature": temperature,
+            "top_p": top_p,
+            "num_responses": samples_per_problem,
+            "metric": f"avg@{samples_per_problem}",
             **{key: value for key, value in engine_kwargs.items() if key != "model"},
         },
     }
-    grouped: dict[str, list[tuple[dict[str, str], str]]] = {
+    grouped: dict[str, list[tuple[dict[str, str], list[str]]]] = {
         name: [] for name in benchmark_names
     }
     for (benchmark, row), request_output in zip(prompt_rows, generated):
-        response = request_output.outputs[0].text
-        grouped[benchmark].append((row, response))
+        if len(request_output.outputs) != samples_per_problem:
+            raise RuntimeError(
+                f"vLLM returned {len(request_output.outputs)} responses for one "
+                f"problem, expected {samples_per_problem}"
+            )
+        responses = [item.text for item in request_output.outputs]
+        grouped[benchmark].append((row, responses))
 
     grade_progress = tqdm(
         total=len(prompt_rows),
@@ -159,28 +178,45 @@ def evaluate_vllm_suite(
         prediction_path = output_dir / (
             f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
         )
-        correct = graded = 0
+        correct = graded = problems = 0
+        problem_score_sum = 0.0
         with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
-            for row, response in grouped[benchmark]:
-                passed = _grade(response, row["answer"])
-                correct += int(passed)
-                graded += 1
+            for row, responses in grouped[benchmark]:
+                correctness = [
+                    _grade(response, row["answer"]) for response in responses
+                ]
+                correct += sum(map(int, correctness))
+                graded += samples_per_problem
+                problems += 1
+                problem_score_sum += sum(correctness) / samples_per_problem
                 handle.write(
                     json.dumps(
-                        {**row, "response": response, "correct": passed},
+                        {
+                            **row,
+                            "responses": responses,
+                            "correct": correctness,
+                            "problem_score": sum(correctness)
+                            / samples_per_problem,
+                        },
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
                 grade_progress.set_postfix_str(
-                    f"{benchmark} accuracy={correct / max(graded, 1):.3f}",
+                    f"{benchmark} avg@{samples_per_problem}="
+                    f"{correct / max(graded, 1):.3f}",
                     refresh=False,
                 )
                 grade_progress.update(1)
+        avg_at_n = problem_score_sum / max(problems, 1)
         suite["benchmarks"][benchmark] = {
             "correct": correct,
-            "total": len(records),
-            "accuracy": correct / max(len(records), 1),
+            "total": graded,
+            "problems": len(records),
+            "samples_per_problem": samples_per_problem,
+            "avg_at_16": avg_at_n,
+            # Compatibility alias consumed by existing plotting/aggregation.
+            "accuracy": avg_at_n,
             "predictions": str(prediction_path),
             "schema": schema,
         }

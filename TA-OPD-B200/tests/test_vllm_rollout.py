@@ -87,7 +87,21 @@ class VLLMRolloutTests(unittest.TestCase):
             )
         )
         self.assertEqual(rollout.rollout_log_probs.dtype, torch.float32)
-        self.assertEqual(float(rollout.rollout_log_probs.sum()), 0.0)
+        self.assertTrue(torch.isnan(rollout.rollout_log_probs).all())
+
+    def test_server_log_probs_are_aligned_for_optional_sync_sanity(self):
+        rollout = rollout_batch_from_token_ids(
+            torch.tensor([[11, 12]]),
+            torch.ones(1, 2, dtype=torch.long),
+            [[31, 32]],
+            pad_token_id=0,
+            response_log_probs=[[-0.1, -0.2]],
+        )
+        self.assertTrue(
+            torch.allclose(
+                rollout.rollout_log_probs, torch.tensor([[-0.1, -0.2]])
+            )
+        )
 
     def test_server_command_enables_ipc_dummy_load_and_sleep(self):
         with tempfile.TemporaryDirectory() as temporary:

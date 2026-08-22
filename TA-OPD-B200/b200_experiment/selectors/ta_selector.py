@@ -21,6 +21,107 @@ class TASelector:
         self.eps = float(eps)
 
     @torch.inference_mode()
+    def compute_scores_from_topk(
+        self,
+        student_top_k_ids: torch.Tensor,
+        teacher_top_k_ids: torch.Tensor,
+        student_top_k_log_probs: torch.Tensor,
+        teacher_on_student_log_probs: torch.Tensor,
+        teacher_top_k_log_probs: torch.Tensor,
+        student_on_teacher_log_probs: torch.Tensor,
+        valid_mask: torch.Tensor,
+        *,
+        normalize: bool = True,
+        token_chunk_size: int = 2048,
+    ) -> SelectorOutput:
+        """Compute exact TA statistics from compact cross-scored Top-K sets.
+
+        Full-vocabulary log-probabilities differ from logits only by a constant
+        at each position. Renormalizing their union therefore produces exactly
+        the same D and C as ``compute_scores_from_logits`` without retaining a
+        [B,T,V] tensor for either model.
+        """
+        tensors = (
+            student_top_k_ids,
+            teacher_top_k_ids,
+            student_top_k_log_probs,
+            teacher_on_student_log_probs,
+            teacher_top_k_log_probs,
+            student_on_teacher_log_probs,
+        )
+        if any(value.ndim != 3 for value in tensors):
+            raise ValueError("Compact TA inputs must have shape [batch, time, K]")
+        if any(value.shape != tensors[0].shape for value in tensors[1:]):
+            raise ValueError("Compact TA Top-K inputs must share one shape")
+        if tensors[0].shape[:2] != valid_mask.shape:
+            raise ValueError("Compact TA inputs must align with valid_mask")
+        flat_valid = valid_mask.reshape(-1)
+        valid_indices = flat_valid.nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            zeros = torch.zeros_like(valid_mask, dtype=torch.float32)
+            return SelectorOutput(
+                zeros,
+                {name: zeros for name in ("D", "C", "D_norm", "C_norm", "s_TA")},
+            )
+
+        flattened = [value.reshape(-1, value.shape[-1]) for value in tensors]
+        disagreement_chunks, compatibility_chunks = [], []
+        chunk_size = max(1, int(token_chunk_size))
+        for begin in range(0, valid_indices.numel(), chunk_size):
+            indices = valid_indices[begin : begin + chunk_size]
+            stu_ids, tea_ids, stu_logp, tea_on_stu, tea_logp, stu_on_tea = [
+                value.index_select(0, indices) for value in flattened
+            ]
+            union_ids = torch.cat((stu_ids, tea_ids), dim=-1)
+            unique = ~torch.tril(
+                union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2)), diagonal=-1
+            ).any(dim=-1)
+            negative_infinity = torch.full_like(
+                union_ids, -torch.inf, dtype=torch.float32
+            )
+            student_union = torch.where(
+                unique,
+                torch.cat((stu_logp, stu_on_tea), dim=-1).float(),
+                negative_infinity,
+            )
+            teacher_union = torch.where(
+                unique,
+                torch.cat((tea_on_stu, tea_logp), dim=-1).float(),
+                negative_infinity,
+            )
+            p_norm = torch.softmax(student_union, dim=-1).clamp_min(self.eps)
+            q_norm = torch.softmax(teacher_union, dim=-1).clamp_min(self.eps)
+            disagreement_chunks.append(
+                (q_norm * (q_norm.log() - p_norm.log()) * unique).sum(dim=-1)
+            )
+            compatibility_chunks.append(
+                torch.exp(tea_on_stu.float()).sum(dim=-1).clamp_(0.0, 1.0)
+            )
+        disagreement = torch.cat(disagreement_chunks)
+        compatibility = torch.cat(compatibility_chunks)
+        if normalize:
+            d_norm = robust_quantile_normalize(
+                disagreement, self.q_low, self.q_high, self.eps
+            )
+            c_norm = robust_quantile_normalize(
+                compatibility, self.q_low, self.q_high, self.eps
+            )
+        else:
+            d_norm = torch.zeros_like(disagreement)
+            c_norm = torch.zeros_like(compatibility)
+        score = d_norm * c_norm
+        diagnostics = {
+            "D": scatter_valid(disagreement, valid_mask),
+            "C": scatter_valid(compatibility, valid_mask),
+            "D_norm": scatter_valid(d_norm, valid_mask),
+            "C_norm": scatter_valid(c_norm, valid_mask),
+            "s_TA": scatter_valid(score, valid_mask),
+            "compatibility_convention": "teacher_mass_on_student_topk",
+            "score_input": "compact_cross_scored_student_teacher_topk",
+        }
+        return SelectorOutput(diagnostics["s_TA"], diagnostics)
+
+    @torch.inference_mode()
     def compute_scores(
         self,
         student_probs: torch.Tensor,

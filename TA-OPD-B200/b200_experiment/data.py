@@ -146,6 +146,25 @@ def tokenize_prompts(
     return {key: value.to(device) for key, value in encoded.items()}, prompts
 
 
+def expand_prompt_batch(
+    encoded: dict[str, torch.Tensor],
+    dataset_indices: list[int],
+    num_responses: int,
+) -> tuple[dict[str, torch.Tensor], list[int], list[int]]:
+    """Interleave each prompt n times, matching thunlp/OPD rollout.n behavior."""
+    n = int(num_responses)
+    if n <= 0:
+        raise ValueError("num_responses must be positive")
+    if any(value.shape[0] != len(dataset_indices) for value in encoded.values()):
+        raise ValueError("Encoded prompt batch and dataset indices do not align")
+    expanded = {
+        key: value.repeat_interleave(n, dim=0) for key, value in encoded.items()
+    }
+    expanded_indices = [index for index in dataset_indices for _ in range(n)]
+    response_indices = list(range(n)) * len(dataset_indices)
+    return expanded, expanded_indices, response_indices
+
+
 def epoch_batch_indices(
     num_records: int, batch_size: int, step: int, seed: int
 ) -> list[int]:

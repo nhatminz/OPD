@@ -45,12 +45,13 @@ export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
 export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
 
 export CUDA_VISIBLE_DEVICES=0,1,2
-export GLOBAL_BATCH_SIZE=8
+export BATCH_SIZE=16
 export MICRO_BATCH_SIZE=1
+export NUM_RESPONSES=4
 export LR=1e-6
 export NUM_EPOCHS=1
-export MAX_PROMPT_LEN=2048
-export MAX_RESPONSE_LEN=8192
+export MAX_PROMPT_LENGTH=1024
+export MAX_RESPONSE_LENGTH=7168
 export TOP_K=16
 export TA_RHO=0.10
 export RAC_GAMMA=0.995
@@ -67,7 +68,8 @@ RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 
 Ba YAML method chỉ khác `experiment.method` và `experiment.output_dir`. OPD thuần dùng uniform
 weight `1` trên mọi valid response token; cả ba launcher đi qua cùng `common_b200.sh`, do đó dùng
-cùng vLLM rollout, data order, model, seed, batch/micro-batch, LR, optimizer, checkpoint và lịch
+cùng Top-K OPD core, vLLM rollout, data order, model, seed, batch/micro-batch, LR, optimizer,
+checkpoint và lịch
 eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
 tài nguyên giữa các run.
 
@@ -77,15 +79,15 @@ chỉ dành cho debug/explicit total target; nó không phải số step chạy 
 Một override hợp lệ phải áp giống nhau cho cả ba method.
 
 ```bash
-LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
+LR=5e-7 BATCH_SIZE=4 EVAL_INTERVAL=40 \
 RUN_NAME="$OPD_RUN_NAME" bash scripts/train_opd_b200.sh
-LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
+LR=5e-7 BATCH_SIZE=4 EVAL_INTERVAL=40 \
 RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
-LR=5e-7 GLOBAL_BATCH_SIZE=4 EVAL_INTERVAL=40 \
+LR=5e-7 BATCH_SIZE=4 EVAL_INTERVAL=40 \
 RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 ```
 
-Các OOM knob chính là `GLOBAL_BATCH_SIZE`, `MICRO_BATCH_SIZE`, `MAX_RESPONSE_LEN`,
+Các OOM knob chính là `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `MAX_RESPONSE_LENGTH`,
 `ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION`, `ROLLOUT_VLLM_MAX_NUM_SEQS` và
 `ROLLOUT_VLLM_MAX_MODEL_LEN`. Chưa có peak-memory measurement trên B200 local, nên không coi default
 là fit guarantee.
@@ -140,8 +142,8 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
 ```
 
-Evaluation mặc định dùng vLLM sampling (`n=1`, `temperature=1.0`, seed `1234`) và lưu raw
-generation/correctness.
+Evaluation mặc định dùng vLLM sampling (`n=16`, `temperature=0.7`, `top_p=0.95`,
+`max_new_tokens=7168`) và báo cáo `avg@16`; mỗi problem lưu đủ 16 generation/correctness.
 Fallback: `EVAL_BACKEND=hf`. Tensor parallel example:
 
 ```bash
@@ -150,10 +152,10 @@ CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
 bash scripts/eval_all_b200.sh
 ```
 
-## Re-eval mọi checkpoint đã lưu ở temperature 1
+## Re-eval mọi checkpoint đã lưu theo protocol avg@16
 
 Script dưới đây tìm `checkpoint-<step>` và `final/` trong cả ba output. Nó cũng eval lại base ở
-step 0 để toàn bộ đường accuracy dùng cùng temperature. Mỗi `training_eval/step-*` tương ứng,
+step 0 để toàn bộ đường avg@16 dùng cùng protocol. Mỗi `training_eval/step-*` tương ứng,
 `eval_history.jsonl` và `eval_metrics.csv` cũ sẽ bị thay thế; raw prediction và `summary.json`
 trong từng step cũng bị thay thế.
 
@@ -185,7 +187,7 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 
 Script chạy tuần tự một subprocess vLLM cho mỗi checkpoint để trả VRAM sau từng lượt. Nó từ chối
 ghi lịch sử mới nếu phát hiện thư mục eval cũ không có checkpoint tương ứng, tránh trộn kết quả
-temperature 0 và 1. Sau khi hoàn tất, chạy lại lệnh plot periodic training evaluation bên dưới.
+protocol cũ và mới. Sau khi hoàn tất, chạy lại lệnh plot periodic training evaluation bên dưới.
 
 ## Plot periodic training evaluation
 

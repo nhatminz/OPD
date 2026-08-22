@@ -215,6 +215,9 @@ def _write_history_atomically(
         "correct",
         "total",
         "accuracy",
+        "avg_at_16",
+        "problems",
+        "samples_per_problem",
         "evaluation_time_sec",
     )
     with metrics_temp.open("w", newline="", encoding="utf-8") as handle:
@@ -298,6 +301,8 @@ def _runtime_settings(config: dict[str, Any], args: argparse.Namespace) -> dict[
     return {
         "backend": "vllm",
         "temperature": float(args.temperature),
+        "top_p": float(args.top_p),
+        "num_responses": int(args.num_responses),
         "max_new_tokens": int(
             args.max_new_tokens
             if args.max_new_tokens is not None
@@ -388,6 +393,12 @@ def _reevaluate_method(
                     f"Evaluator reported temperature={actual_temperature}, expected "
                     f"{settings['temperature']}"
                 )
+            if float(suite["parameters"]["top_p"]) != float(settings["top_p"]):
+                raise AssertionError("Evaluator did not honor requested top_p")
+            if int(suite["parameters"]["num_responses"]) != int(
+                settings["num_responses"]
+            ):
+                raise AssertionError("Evaluator did not honor requested response count")
             if tuple(suite["benchmarks"]) != BENCHMARK_ORDER:
                 raise AssertionError(
                     f"Evaluator returned benchmarks {tuple(suite['benchmarks'])}, "
@@ -421,6 +432,9 @@ def _reevaluate_method(
                     "correct": result["correct"],
                     "total": result["total"],
                     "accuracy": result["accuracy"],
+                    "avg_at_16": result.get("avg_at_16", result["accuracy"]),
+                    "problems": result.get("problems"),
+                    "samples_per_problem": result.get("samples_per_problem", 16),
                 }
                 for name, result in suite["benchmarks"].items()
             },
@@ -454,6 +468,9 @@ def _reevaluate_method(
         "method": method,
         "display_name": display_name,
         "temperature": settings["temperature"],
+        "top_p": settings["top_p"],
+        "num_responses": settings["num_responses"],
+        "metric": "avg@16",
         "backend": "vllm",
         "full_benchmarks": list(BENCHMARK_ORDER),
         "history": str((run_output / "eval_history.jsonl").resolve()),
@@ -479,7 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--opd-output", required=True)
     parser.add_argument("--ta-output", required=True)
     parser.add_argument("--rac-output", required=True)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--num-responses", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--tensor-parallel-size", type=int)
     parser.add_argument("--gpu-memory-utilization")
@@ -497,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.temperature <= 0:
         raise ValueError("Checkpoint re-evaluation requires temperature > 0")
+    if not 0.0 < args.top_p <= 1.0:
+        raise ValueError("Checkpoint re-evaluation top_p must be in (0, 1]")
+    if args.num_responses <= 0:
+        raise ValueError("Checkpoint re-evaluation num_responses must be positive")
     requested = {
         "opd": Path(args.opd_output),
         "ta": Path(args.ta_output),

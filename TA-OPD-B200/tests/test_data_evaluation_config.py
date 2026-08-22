@@ -8,11 +8,25 @@ from pathlib import Path
 import pandas as pd
 
 from b200_experiment.config import load_config, resolve_runtime_paths
-from b200_experiment.data import epoch_batch_indices, read_records
+import torch
+
+from b200_experiment.data import epoch_batch_indices, expand_prompt_batch, read_records
 from b200_experiment.evaluation import aggregate_evaluations, load_benchmark
 
 
 class DataEvaluationConfigTests(unittest.TestCase):
+    def test_one_prompt_expands_to_four_independent_trajectory_entries(self):
+        encoded = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        }
+        expanded, indices, response_indices = expand_prompt_batch(
+            encoded, [17], 4
+        )
+        self.assertEqual(expanded["input_ids"].shape[0], 4)
+        self.assertEqual(indices, [17, 17, 17, 17])
+        self.assertEqual(response_indices, [0, 1, 2, 3])
+
     def test_aggregation_includes_pure_opd_in_controlled_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -103,16 +117,28 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertIsNone(base["training_evaluation"]["target_evaluations"])
         self.assertEqual(base["training_evaluation"]["interval_steps"], 50)
         self.assertEqual(base["training_evaluation"]["backend"], "vllm")
-        self.assertEqual(base["training_evaluation"]["temperature"], 1.0)
+        self.assertEqual(base["training_evaluation"]["temperature"], 0.7)
+        self.assertEqual(base["training_evaluation"]["top_p"], 0.95)
+        self.assertEqual(base["training_evaluation"]["num_responses"], 16)
         self.assertIsNone(base["training_evaluation"]["limit"])
         self.assertEqual(base["evaluation"]["backend"], "vllm")
-        self.assertEqual(base["evaluation"]["temperature"], 1.0)
+        self.assertEqual(base["evaluation"]["temperature"], 0.7)
+        self.assertEqual(base["evaluation"]["top_p"], 0.95)
+        self.assertEqual(base["evaluation"]["num_responses"], 16)
         self.assertIsNone(base["evaluation"]["limit"])
         self.assertEqual(base["rollout"]["backend"], "vllm")
-        self.assertEqual(base["rollout"]["batch_size"], 8)
+        self.assertEqual(base["rollout"]["batch_size"], 16)
+        self.assertEqual(base["rollout"]["num_responses"], 4)
+        self.assertEqual(base["rollout"]["temperature"], 1.0)
         self.assertEqual(base["training"]["micro_batch_size"], 1)
-        self.assertEqual(base["rollout"]["max_new_tokens"], 8192)
-        self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 12288)
+        self.assertEqual(base["data"]["max_prompt_tokens"], 1024)
+        self.assertEqual(base["rollout"]["max_new_tokens"], 7168)
+        self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 9216)
+        self.assertEqual(base["selector"]["top_k"], 16)
+        self.assertEqual(base["opd"]["top_k_strategy"], "only_stu")
+        self.assertEqual(base["opd"]["reward_weight_mode"], "student_p")
+        self.assertEqual(base["opd"]["adv_estimator"], "token_reward_direct")
+        self.assertEqual(base["opd"]["loss_agg_mode"], "token-mean")
         self.assertEqual(base["selector"]["rac_gamma"], 0.995)
         self.assertEqual(base["selector"]["rac_w_min"], 0.10)
         self.assertEqual(base["selector"]["rac_beta"], 2.0)
@@ -124,6 +150,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
             "paths",
             "data",
             "rollout",
+            "opd",
             "selector",
             "token_budget",
             "training",

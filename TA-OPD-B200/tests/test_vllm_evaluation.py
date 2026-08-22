@@ -35,7 +35,12 @@ class _LLM:
     def generate(self, prompts, sampling, use_tqdm):
         self.generate_calls.append((prompts, sampling, use_tqdm))
         return [
-            types.SimpleNamespace(outputs=[types.SimpleNamespace(text="1")])
+            types.SimpleNamespace(
+                outputs=[
+                    types.SimpleNamespace(text="1")
+                    for _ in range(sampling.kwargs.get("n", 1))
+                ]
+            )
             for _ in prompts
         ]
 
@@ -71,6 +76,8 @@ class VllmEvaluationTests(unittest.TestCase):
             settings = {
                 "max_new_tokens": 32,
                 "temperature": 1.0,
+                "top_p": 0.95,
+                "num_responses": 16,
                 "benchmark_names": list(benchmarks),
                 "vllm": {"max_num_seqs": 64, "gpu_memory_utilization": 0.4},
             }
@@ -94,11 +101,15 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertTrue(calls[0][2])
             self.assertEqual(_LLM.instances[0].kwargs["max_num_seqs"], 64)
             self.assertEqual(calls[0][1].kwargs["temperature"], 1.0)
+            self.assertEqual(calls[0][1].kwargs["top_p"], 0.95)
+            self.assertEqual(calls[0][1].kwargs["n"], 16)
             self.assertTrue(suite["parameters"]["do_sample"])
             self.assertEqual(
                 [suite["benchmarks"][name]["accuracy"] for name in benchmarks],
                 [1.0, 1.0, 1.0],
             )
+            self.assertEqual(suite["benchmarks"]["MATH-500"]["total"], 16)
+            self.assertEqual(suite["benchmarks"]["MATH-500"]["problems"], 1)
 
 
 if __name__ == "__main__":

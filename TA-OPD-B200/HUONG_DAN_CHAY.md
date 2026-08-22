@@ -39,11 +39,11 @@ trên mọi valid response token. Cả ba method dùng cùng vLLM rollout và ev
 final. Nếu cần hạ memory, đặt cùng giá trị cho cả ba lệnh.
 
 ```bash
-GLOBAL_BATCH_SIZE=4 MICRO_BATCH_SIZE=1 MAX_RESPONSE_LEN=4096 \
+BATCH_SIZE=4 MICRO_BATCH_SIZE=1 NUM_RESPONSES=4 MAX_RESPONSE_LENGTH=4096 \
   RUN_NAME="$OPD_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_opd_b200.sh
-GLOBAL_BATCH_SIZE=4 MICRO_BATCH_SIZE=1 MAX_RESPONSE_LEN=4096 \
+BATCH_SIZE=4 MICRO_BATCH_SIZE=1 NUM_RESPONSES=4 MAX_RESPONSE_LENGTH=4096 \
   RUN_NAME="$TA_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_ta_b200.sh
-GLOBAL_BATCH_SIZE=4 MICRO_BATCH_SIZE=1 MAX_RESPONSE_LEN=4096 \
+BATCH_SIZE=4 MICRO_BATCH_SIZE=1 NUM_RESPONSES=4 MAX_RESPONSE_LENGTH=4096 \
   RUN_NAME="$RAC_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_rac_b200.sh
 ```
 
@@ -89,7 +89,7 @@ OPD_RUN_NAME="$OPD_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh --plot-name opd_vs_rac
 ```
 
-Vẽ riêng accuracy của một method trên cả ba bộ eval (ba đường trong cùng một ảnh):
+Vẽ riêng avg@16 của một method trên cả ba bộ eval (ba đường trong cùng một ảnh):
 
 ```bash
 RUN_NAME="$OPD_RUN_NAME" PLOT_METHODS=opd \
@@ -116,8 +116,8 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
 không phải subset size.
 
-Eval lại toàn bộ checkpoint đã lưu với vLLM `temperature=1.0`, đồng thời ghi đè lịch sử/file eval
-cũ của OPD, TA-OPD và RAC:
+Eval lại toàn bộ checkpoint đã lưu với vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, metric
+`avg@16`, đồng thời ghi đè lịch sử/file eval cũ của OPD, TA-OPD và RAC:
 
 ```bash
 OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
@@ -130,4 +130,4 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 ```
 
 Dòng đầu chỉ kiểm tra danh sách; dòng thứ hai mới thực sự ghi đè. Script mặc định eval lại cả base
-step 0 để không trộn temperature giữa baseline và checkpoint.
+step 0 để không trộn protocol eval giữa baseline và checkpoint.

@@ -18,12 +18,17 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from tqdm.auto import tqdm
 
 from .config import save_config
-from .data import epoch_batch_indices, read_records, stable_sample_id, tokenize_prompts
+from .data import (
+    epoch_batch_indices,
+    expand_prompt_batch,
+    read_records,
+    stable_sample_id,
+    tokenize_prompts,
+)
 from .diagnostics import correlations, finite_or_raise, selector_summary
 from .distributed import (
     DistributedContext,
@@ -39,6 +44,19 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import load_models
+from .opd_core import (
+    UPSTREAM_ADV_ESTIMATOR,
+    UPSTREAM_LOSS_AGG_MODE,
+    UPSTREAM_OPD_COMMIT,
+    UPSTREAM_REWARD_WEIGHT_MODE,
+    UPSTREAM_TOP_K_STRATEGY,
+    TopKOPDReference,
+    build_topk_opd_reference,
+    gather_candidate_log_probs,
+    topk_candidate_ppo_loss,
+    topk_overlap_fraction,
+    weighted_token_sums,
+)
 from .resume import (
     resolve_resume_checkpoint,
     restore_optimizer,
@@ -266,13 +284,21 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "method",
         "lr",
         "train_loss",
+        "weighted_final_loss",
+        "base_topk_opd_loss",
         "unweighted_opd_loss",
         "grad_norm",
         "num_valid_tokens",
         "mean_response_length",
+        "min_response_length",
+        "max_response_length",
+        "response_clip_ratio",
+        "student_teacher_topk_overlap_ratio",
+        "student_teacher_topk_divergence",
         "throughput_tokens_per_sec",
         "rollout_time",
         "teacher_score_time_sec",
+        "student_cross_topk_scoring_time",
         "ta_local_score_time_sec",
         "bellman_scan_time_sec",
         "forward_backward_time_sec",
@@ -392,7 +418,15 @@ def _run_training_evaluation(
     runtime_settings = {
         "backend": str(settings.get("backend", "vllm")).lower(),
         "temperature": float(
-            settings.get("temperature", config["evaluation"].get("temperature", 1.0))
+            settings.get("temperature", config["evaluation"].get("temperature", 0.7))
+        ),
+        "top_p": float(
+            settings.get("top_p", config["evaluation"].get("top_p", 0.95))
+        ),
+        "num_responses": int(
+            settings.get(
+                "num_responses", config["evaluation"].get("num_responses", 16)
+            )
         ),
         "batch_size": int(
             settings.get("batch_size", config["evaluation"].get("batch_size", 16))
@@ -452,6 +486,9 @@ def _run_training_evaluation(
                 "correct": result["correct"],
                 "total": result["total"],
                 "accuracy": result["accuracy"],
+                "avg_at_16": result.get("avg_at_16", result["accuracy"]),
+                "problems": result.get("problems"),
+                "samples_per_problem": result.get("samples_per_problem", 16),
             }
             for name, result in suite["benchmarks"].items()
         },
@@ -478,6 +515,9 @@ def _run_training_evaluation(
                 "correct",
                 "total",
                 "accuracy",
+                "avg_at_16",
+                "problems",
+                "samples_per_problem",
                 "evaluation_time_sec",
             ),
         )
@@ -498,56 +538,38 @@ def _make_optimizer(parameters, training: dict[str, Any]):
     return torch.optim.AdamW(parameters, **kwargs), False
 
 
-def _sum_per_response_masked_means(
-    elementwise: torch.Tensor, allocation: torch.Tensor
-) -> torch.Tensor:
-    """Released Full/TA-OPD reduction before global sample averaging."""
-    allocation = allocation.detach().float()
-    return (
-        (elementwise * allocation).sum(-1)
-        / allocation.sum(-1).clamp_min(1.0)
-    ).sum()
-
-
 def _opd_train_step(
     model,
     optimizer,
     rollout,
-    token_allocation,
-    old_student_log_probs,
-    teacher_log_probs,
+    position_weights,
+    opd_reference: TopKOPDReference,
     config,
     device,
     distributed: DistributedContext,
-    global_batch_size: int,
 ):
     training = config["training"]
-    global_micro_batch = max(
-        1, int(training.get("micro_batch_size", global_batch_size))
-    )
+    global_micro_batch = max(1, int(training.get("micro_batch_size", 1)))
     micro_batch = max(1, math.ceil(global_micro_batch / distributed.world_size))
     local_batch_size = rollout.input_ids.shape[0]
-    if local_batch_size <= 0 or global_batch_size <= 0:
+    if local_batch_size <= 0:
         raise ValueError("OPD train step received an empty local/global batch")
     eps_low, eps_high = (
         float(training.get("ppo_clip_low", 0.2)),
         float(training.get("ppo_clip_high", 0.28)),
     )
-    advantage = (teacher_log_probs - old_student_log_probs).detach()
-    soft_weighting = token_allocation.dtype != torch.bool
-    global_weight_mass = None
-    if soft_weighting:
-        local_weight_mass = float(
-            token_allocation[rollout.valid_mask].detach().float().sum().item()
-        )
-        global_weight_mass = distributed.sum_float(local_weight_mass)
-        if global_weight_mass <= 0.0:
-            raise ValueError("Soft token weights must have positive global mass")
+    dual_clip = float(training.get("ppo_dual_clip", 3.0))
+    local_weight_mass = float(
+        position_weights[rollout.valid_mask].detach().float().sum().item()
+    )
+    global_weight_mass = distributed.sum_float(local_weight_mass)
+    if global_weight_mass <= 0.0:
+        raise ValueError("Position weights must have positive global mass")
     optimizer.zero_grad(set_to_none=True)
     model.train()
     unwrap_model(model).config.use_cache = False
     forward_seconds = backward_seconds = optimizer_seconds = loss_value = 0.0
-    unweighted_sum = 0.0
+    base_loss_sum = 0.0
     begins = list(range(0, local_batch_size, micro_batch))
     for chunk_index, begin in enumerate(begins):
         end = min(begin + micro_batch, local_batch_size)
@@ -568,38 +590,40 @@ def _opd_train_step(
             )
             width, start = rollout.response_ids.shape[1], rollout.prompt_width - 1
             logits = output.logits[:, start : start + width]
-            labels = rollout.response_ids[begin:end]
-            current = (
-                -F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    labels.reshape(-1),
-                    reduction="none",
-                )
-                .view_as(labels)
-                .float()
+            current = gather_candidate_log_probs(
+                logits,
+                opd_reference.candidate_ids[begin:end],
+                temperature=float(config["rollout"].get("temperature", 1.0)),
+                chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
             )
-            old, adv = old_student_log_probs[begin:end], advantage[begin:end]
-            ratio = torch.exp((current - old).clamp(-20.0, 20.0))
-            elementwise = torch.maximum(
-                -ratio * adv, -ratio.clamp(1.0 - eps_low, 1.0 + eps_high) * adv
+            chunk_reference = TopKOPDReference(
+                candidate_ids=opd_reference.candidate_ids[begin:end],
+                old_student_log_probs=opd_reference.old_student_log_probs[begin:end],
+                teacher_log_probs=opd_reference.teacher_log_probs[begin:end],
+                student_weights=opd_reference.student_weights[begin:end],
+                advantages=opd_reference.advantages[begin:end],
+            )
+            per_position_loss = topk_candidate_ppo_loss(
+                current,
+                chunk_reference,
+                clip_low=eps_low,
+                clip_high=eps_high,
+                dual_clip=dual_clip,
             )
             valid_chunk = rollout.valid_mask[begin:end]
-            allocation = token_allocation[begin:end].detach().float()
-            unweighted_sum += float(
-                elementwise.detach()[valid_chunk].float().sum().item()
+            local_numerator, _ = weighted_token_sums(
+                per_position_loss,
+                position_weights[begin:end],
+                valid_chunk,
             )
-            if soft_weighting:
-                # DDP averages gradients. Scale each rank's local numerator by
-                # world_size so the aggregate is exactly sum(w*l)/sum(w).
-                loss = (elementwise * allocation).sum() * (
-                    distributed.world_size / float(global_weight_mass)
-                )
-            else:
-                # Preserve the released OPD/TA-OPD reduction: per-response
-                # selected-token mean followed by a global sample mean.
-                loss = _sum_per_response_masked_means(
-                    elementwise, allocation
-                ) * (distributed.world_size / global_batch_size)
+            base_loss_sum += float(
+                per_position_loss.detach()[valid_chunk].float().sum().item()
+            )
+            # DDP averages rank gradients. Multiplication by world_size makes
+            # this exactly global sum(w_t*l_t) / global sum(w_t).
+            loss = local_numerator * (
+                distributed.world_size / float(global_weight_mass)
+            )
             cuda_sync(device)
             forward_seconds += time.perf_counter() - started
             finite_or_raise("OPD loss", loss.detach().reshape(1))
@@ -609,7 +633,7 @@ def _opd_train_step(
             cuda_sync(device)
             backward_seconds += time.perf_counter() - started
             loss_value += float(loss.detach().item())
-            del output, logits, current, ratio, elementwise, loss
+            del output, logits, current, per_position_loss, local_numerator, loss
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         float(training.get("max_grad_norm", 1.0)),
@@ -621,11 +645,13 @@ def _opd_train_step(
     optimizer_seconds = time.perf_counter() - started
     optimizer.zero_grad(set_to_none=True)
     global_loss = distributed.sum_float(loss_value) / distributed.world_size
-    global_unweighted_sum = distributed.sum_float(unweighted_sum)
+    global_base_loss_sum = distributed.sum_float(base_loss_sum)
     global_valid_tokens = distributed.sum_int(int(rollout.valid_mask.sum().item()))
     return {
         "loss": global_loss,
-        "unweighted_opd_loss": global_unweighted_sum / max(global_valid_tokens, 1),
+        "weighted_final_loss": global_loss,
+        "base_topk_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
+        "unweighted_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
         "gradient_norm": float(gradient_norm.detach().item()),
         "training_forward_time": forward_seconds,
         "backward_time": backward_seconds,
@@ -699,6 +725,33 @@ def run_training(
     method = str(experiment["method"]).lower()
     if method not in {"opd", "ta", "rac"}:
         raise ValueError(f"Training method must be opd, ta, or rac, got {method!r}")
+    opd_config = config.get("opd", {})
+    top_k_strategy = str(opd_config.get("top_k_strategy", "only_stu"))
+    reward_weight_mode = str(opd_config.get("reward_weight_mode", "student_p"))
+    advantage_estimator = str(
+        opd_config.get("adv_estimator", "token_reward_direct")
+    )
+    loss_aggregation = str(opd_config.get("loss_agg_mode", "token-mean"))
+    controlled_settings = {
+        "upstream_commit": (
+            str(opd_config.get("upstream_commit", UPSTREAM_OPD_COMMIT)),
+            UPSTREAM_OPD_COMMIT,
+        ),
+        "top_k_strategy": (top_k_strategy, UPSTREAM_TOP_K_STRATEGY),
+        "reward_weight_mode": (reward_weight_mode, UPSTREAM_REWARD_WEIGHT_MODE),
+        "adv_estimator": (advantage_estimator, UPSTREAM_ADV_ESTIMATOR),
+        "loss_agg_mode": (loss_aggregation, UPSTREAM_LOSS_AGG_MODE),
+    }
+    incompatible = {
+        key: actual
+        for key, (actual, expected) in controlled_settings.items()
+        if actual != expected
+    }
+    if incompatible:
+        raise ValueError(
+            "This controlled experiment supports only the pinned thunlp/OPD "
+            f"recipe; incompatible settings: {incompatible}"
+        )
     seed = int(experiment.get("seed", 1234))
     seed_everything(seed)
     resume_checkpoint = resolve_resume_checkpoint(
@@ -837,6 +890,14 @@ def run_training(
             "global_rac_weight_normalization": method == "rac",
             "uniform_full_response_mask": method == "opd",
         }
+        metadata["opd_upstream"] = {
+            "repository": "https://github.com/thunlp/OPD",
+            "commit": UPSTREAM_OPD_COMMIT,
+            "adv_estimator": advantage_estimator,
+            "top_k_strategy": top_k_strategy,
+            "reward_weight_mode": reward_weight_mode,
+            "loss_agg_mode": loss_aggregation,
+        }
         metadata["resume"] = (
             {
                 "checkpoint": str(resume_state.checkpoint),
@@ -858,9 +919,12 @@ def run_training(
     setup_progress.update(1)
     setup_progress.close()
     selector_cfg = config["selector"]
+    top_k = int(selector_cfg.get("top_k", 16))
+    if top_k <= 0:
+        raise ValueError("selector.top_k must be positive")
     opd_selector = OPDSelector()
     ta_selector = TASelector(
-        int(selector_cfg.get("top_k", 16)),
+        top_k,
         float(selector_cfg.get("q_low", 0.05)),
         float(selector_cfg.get("q_high", 0.95)),
         float(selector_cfg.get("eps", 1e-8)),
@@ -875,6 +939,9 @@ def run_training(
         scan_backend=str(selector_cfg.get("rac_scan_backend", "parallel")),
     )
     batch_size = int(config["rollout"]["batch_size"])
+    num_responses = int(config["rollout"].get("num_responses", 4))
+    if batch_size <= 0 or num_responses <= 0:
+        raise ValueError("Prompt batch size and rollout.num_responses must be positive")
     steps_per_epoch = math.ceil(len(records) / batch_size)
     configured_max_steps = training.get("max_steps")
     max_steps = (
@@ -974,9 +1041,15 @@ def run_training(
         local_start, local_end = contiguous_partition(
             len(global_indices), distributed.rank, distributed.world_size
         )
-        indices = global_indices[local_start:local_end]
+        prompt_indices = global_indices[local_start:local_end]
+        prompt_records = [records[index] for index in prompt_indices]
+        encoded, _ = tokenize_prompts(
+            prompt_records, tokenizer, config["data"], device
+        )
+        encoded, indices, response_indices = expand_prompt_batch(
+            encoded, prompt_indices, num_responses
+        )
         batch_records = [records[index] for index in indices]
-        encoded, _ = tokenize_prompts(batch_records, tokenizer, config["data"], device)
         rollout_function = (
             rollout_engine.generate
             if rollout_engine is not None
@@ -993,8 +1066,13 @@ def run_training(
             top_p=float(config["rollout"].get("top_p", 1.0)),
             eos_token_ids=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
-            seed=int(config["rollout"].get("seed", seed)) + step_index,
-            sample_seed_offset=local_start,
+            seed=int(config["rollout"].get("seed", seed)),
+            # Repeated prompts are separate requests with globally unique,
+            # deterministic seeds, so all n trajectories are independent.
+            sample_seed_offset=(
+                step_index * batch_size * num_responses
+                + local_start * num_responses
+            ),
         )
         rollout_backend_metrics = (
             dict(rollout_engine.last_metrics) if rollout_engine is not None else {}
@@ -1020,8 +1098,13 @@ def run_training(
             rollout,
             False,
             int(selector_cfg.get("score_chunk_steps", 128)),
-            retain_response_logits=method != "opd",
+            retain_response_logits=False,
+            top_k=top_k,
+            temperature=float(config["rollout"].get("temperature", 1.0)),
+            micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
         )
+        if student_scores.top_k_ids is None or student_scores.top_k_log_probs is None:
+            raise AssertionError("Student scoring did not produce the common Top-K support")
         if distributed.is_main:
             progress.set_postfix_str("stage=score-teacher", refresh=True)
         teacher_scores, teacher_base_time = _timed(
@@ -1031,8 +1114,18 @@ def run_training(
             rollout,
             False,
             int(selector_cfg.get("score_chunk_steps", 128)),
-            retain_response_logits=method != "opd",
+            retain_response_logits=False,
+            top_k=top_k,
+            candidate_ids=student_scores.top_k_ids,
+            temperature=float(opd_config.get("teacher_temperature", 1.0)),
+            micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
         )
+        if (
+            teacher_scores.candidate_log_probs is None
+            or teacher_scores.top_k_ids is None
+            or teacher_scores.top_k_log_probs is None
+        ):
+            raise AssertionError("Teacher scoring did not score the student Top-K IDs")
         valid = rollout.valid_mask
         finite_or_raise(
             "student sampled log-probs", student_scores.sampled_log_probs[valid]
@@ -1040,9 +1133,64 @@ def run_training(
         finite_or_raise(
             "teacher sampled log-probs", teacher_scores.sampled_log_probs[valid]
         )
+        opd_reference = build_topk_opd_reference(
+            student_scores.top_k_ids,
+            student_scores.top_k_log_probs,
+            teacher_scores.candidate_log_probs,
+            valid,
+        )
+        finite_or_raise("Top-K OPD advantages", opd_reference.advantages[valid])
+        overlap_values = topk_overlap_fraction(
+            student_scores.top_k_ids, teacher_scores.top_k_ids, valid
+        )
+        global_overlap_count = distributed.sum_int(overlap_values.numel())
+        student_teacher_topk_overlap = distributed.sum_float(
+            float(overlap_values.sum().item())
+        ) / max(global_overlap_count, 1)
+        local_divergence = -opd_reference.advantages.sum(dim=-1)[valid]
+        global_divergence_count = distributed.sum_int(local_divergence.numel())
+        student_teacher_topk_divergence = distributed.sum_float(
+            float(local_divergence.sum().item())
+        ) / max(global_divergence_count, 1)
+
+        vllm_logprob_sanity: dict[str, Any] = {"enabled": False}
+        sanity = dict(config["rollout"].get("vllm", {}).get("logprob_sanity", {}))
+        if rollout_backend == "vllm" and bool(sanity.get("enabled", False)):
+            comparable = valid & torch.isfinite(rollout.rollout_log_probs)
+            differences = (
+                rollout.rollout_log_probs[comparable]
+                - student_scores.sampled_log_probs[comparable]
+            ).abs()[: max(1, int(sanity.get("max_tokens_per_rank", 32)))]
+            if differences.numel() == 0:
+                raise RuntimeError(
+                    "vLLM log-prob sanity was enabled, but the server returned no "
+                    "token log-probabilities"
+                )
+            compared = distributed.sum_int(differences.numel())
+            mean_abs = distributed.sum_float(float(differences.sum().item())) / max(
+                compared, 1
+            )
+            max_abs = distributed.max_float(float(differences.max().item()))
+            tolerance = float(sanity.get("tolerance", 0.05))
+            vllm_logprob_sanity = {
+                "enabled": True,
+                "compared_tokens": compared,
+                "mean_abs_error": mean_abs,
+                "max_abs_error": max_abs,
+                "tolerance": tolerance,
+                "passed": max_abs <= tolerance,
+            }
+            if not vllm_logprob_sanity["passed"] and bool(
+                sanity.get("fail_on_mismatch", False)
+            ):
+                raise RuntimeError(
+                    "vLLM/HF student log-prob sanity failed after weight sync: "
+                    f"max_abs_error={max_abs:.6f} > tolerance={tolerance:.6f}"
+                )
         cross_diagnostics = {}
         ta_raw = ta_output = None
         global_ta_diagnostics: dict[str, torch.Tensor] = {}
+        student_cross_score_time = 0.0
         if method == "opd":
             if distributed.is_main:
                 progress.set_postfix_str("stage=selector-OPD-uniform", refresh=True)
@@ -1065,22 +1213,34 @@ def run_training(
             ta_time = bellman_scan_time = 0.0
             selector_time = opd_selector_time + opd_gather_time
         else:
-            if (
-                student_scores.response_logits is None
-                or teacher_scores.response_logits is None
-            ):
-                raise AssertionError("TA/RAC scoring must retain response logits")
+            student_on_teacher, student_cross_score_time = _timed(
+                device,
+                score_original_rollout,
+                student,
+                rollout,
+                False,
+                int(selector_cfg.get("score_chunk_steps", 128)),
+                retain_response_logits=False,
+                candidate_ids=teacher_scores.top_k_ids,
+                temperature=float(config["rollout"].get("temperature", 1.0)),
+                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
+            )
+            if student_on_teacher.candidate_log_probs is None:
+                raise AssertionError("Student did not score the teacher Top-K IDs")
             ta_raw, ta_raw_time = _timed(
                 device,
-                ta_selector.compute_scores_from_logits,
-                student_scores.response_logits,
-                teacher_scores.response_logits,
-                student_scores.log_normalizers,
-                teacher_scores.log_normalizers,
+                ta_selector.compute_scores_from_topk,
+                student_scores.top_k_ids,
+                teacher_scores.top_k_ids,
+                student_scores.top_k_log_probs,
+                teacher_scores.candidate_log_probs,
+                teacher_scores.top_k_log_probs,
+                student_on_teacher.candidate_log_probs,
                 valid,
                 normalize=False,
                 token_chunk_size=int(selector_cfg.get("ta_vocab_chunk_tokens", 2048)),
             )
+            del student_on_teacher
             ta_globalized, ta_normalization_time = _timed(
                 device,
                 _globalize_ta_output,
@@ -1090,7 +1250,9 @@ def run_training(
                 distributed,
             )
             ta_output, global_ta_diagnostics, ta_start, ta_end = ta_globalized
-            ta_time = ta_raw_time + ta_normalization_time
+            ta_time = (
+                student_cross_score_time + ta_raw_time + ta_normalization_time
+            )
             if method == "rac":
                 if distributed.is_main:
                     progress.set_postfix_str("stage=selector-Bellman-RAC", refresh=True)
@@ -1166,8 +1328,10 @@ def run_training(
             else None
         )
         sample_ids = [
-            stable_sample_id(record, index)
-            for record, index in zip(batch_records, indices)
+            f"{stable_sample_id(record, index)}::response-{response_index}"
+            for record, index, response_index in zip(
+                batch_records, indices, response_indices
+            )
         ]
         logged_selected = (
             token_logger.write(
@@ -1177,7 +1341,7 @@ def run_training(
                 response_ids=rollout.response_ids,
                 selected_mask=selected,
                 diagnostics=primary.diagnostics,
-                batch_index_offset=local_start,
+                batch_index_offset=local_start * num_responses,
             )
             if method == "ta"
             else 0
@@ -1193,8 +1357,6 @@ def run_training(
                 f"expected {expected}"
             )
 
-        old_student = student_scores.sampled_log_probs.detach().clone()
-        teacher_log_probs = teacher_scores.sampled_log_probs.detach().clone()
         del student_scores, teacher_scores
         # Let PyTorch reuse the released scoring-logit blocks for backward.
         # Emptying the CUDA allocator every step is materially slower on B200.
@@ -1207,12 +1369,10 @@ def run_training(
             optimizer,
             rollout,
             token_allocation,
-            old_student,
-            teacher_log_probs,
+            opd_reference,
             config,
             device,
             distributed,
-            len(global_indices),
         )
         checkpoint = None
         save_checkpoints = bool(training.get("save_checkpoints", True))
@@ -1236,10 +1396,21 @@ def run_training(
         cuda_sync(device)
         local_wall_time = time.perf_counter() - step_started
         local_valid_tokens = int(valid.sum().item())
+        response_lengths = valid.sum(dim=-1)
+        local_response_count = response_lengths.numel()
+        local_response_min = int(response_lengths.min().item())
+        local_response_max = int(response_lengths.max().item())
+        local_clipped_responses = int(
+            response_lengths.ge(int(config["rollout"]["max_new_tokens"])).sum().item()
+        )
         local_peak_allocated = torch.cuda.max_memory_allocated(device)
         local_peak_reserved = torch.cuda.max_memory_reserved(device)
         wall_time = distributed.max_float(local_wall_time)
         valid_tokens = distributed.sum_int(local_valid_tokens)
+        trajectory_count = distributed.sum_int(local_response_count)
+        response_min = -distributed.max_int(-local_response_min)
+        response_max = distributed.max_int(local_response_max)
+        clipped_responses = distributed.sum_int(local_clipped_responses)
         peak_allocated = distributed.max_int(local_peak_allocated)
         peak_reserved = distributed.max_int(local_peak_reserved)
         peak_allocated_total = distributed.sum_int(local_peak_allocated)
@@ -1247,6 +1418,8 @@ def run_training(
         aggregated_train_metrics = {
             "loss": train_metrics["loss"],
             "train_loss": train_metrics["loss"],
+            "weighted_final_loss": train_metrics["weighted_final_loss"],
+            "base_topk_opd_loss": train_metrics["base_topk_opd_loss"],
             "unweighted_opd_loss": train_metrics["unweighted_opd_loss"],
             "gradient_norm": distributed.max_float(train_metrics["gradient_norm"]),
             "grad_norm": distributed.max_float(train_metrics["gradient_norm"]),
@@ -1267,8 +1440,15 @@ def run_training(
             ),
             "resume_step": resume_step,
             "batch_size": len(global_indices),
-            "local_batch_size_rank0": len(global_indices) // distributed.world_size
-            + int(0 < len(global_indices) % distributed.world_size),
+            "prompt_batch_size": len(global_indices),
+            "num_responses_per_prompt": num_responses,
+            "trajectory_batch_size": len(global_indices) * num_responses,
+            "num_trajectories": trajectory_count,
+            "local_batch_size_rank0": (
+                len(global_indices) // distributed.world_size
+                + int(0 < len(global_indices) % distributed.world_size)
+            )
+            * num_responses,
             "configured_batch_size": batch_size,
             "micro_batch_size": int(training.get("micro_batch_size", batch_size)),
             "local_micro_batch_size": math.ceil(
@@ -1289,11 +1469,14 @@ def run_training(
                 "ta": "hard_global_top_rho",
                 "rac": "bellman_soft_all_valid_response_tokens",
             }[method],
-            "objective_normalization": (
-                "global_soft_token_weight_mass"
-                if method == "rac"
-                else "per_response_mean_then_global_sample_mean"
-            ),
+            "objective_normalization": "global_weighted_token_mean",
+            "opd_upstream_commit": UPSTREAM_OPD_COMMIT,
+            "opd_candidate_support": "student_top_k",
+            "opd_top_k": top_k,
+            "opd_top_k_strategy": top_k_strategy,
+            "opd_reward_weight_mode": reward_weight_mode,
+            "opd_adv_estimator": advantage_estimator,
+            "opd_loss_agg_mode": loss_aggregation,
             "fused_optimizer": fused_optimizer,
             "lr": float(optimizer.param_groups[0]["lr"]),
             **aggregated_train_metrics,
@@ -1314,9 +1497,13 @@ def run_training(
             "vllm_torch_cache_release_time": distributed.max_float(
                 rollout_backend_metrics.get("torch_cache_release_time", 0.0)
             ),
+            "vllm_logprob_sanity": vllm_logprob_sanity,
             "student_base_scoring_time": distributed.max_float(student_base_time),
             "teacher_base_scoring_time": distributed.max_float(teacher_base_time),
             "teacher_score_time_sec": distributed.max_float(teacher_base_time),
+            "student_cross_topk_scoring_time": distributed.max_float(
+                student_cross_score_time
+            ),
             "ta_diagnostic_time": distributed.max_float(ta_time),
             "ta_local_score_time_sec": distributed.max_float(ta_time),
             "selector_time": distributed.max_float(selector_time),
@@ -1331,7 +1518,12 @@ def run_training(
             "tokens_per_second": valid_tokens / max(wall_time, 1e-12),
             "throughput_tokens_per_sec": valid_tokens / max(wall_time, 1e-12),
             "num_valid_tokens": valid_tokens,
-            "mean_response_length": valid_tokens / max(len(global_indices), 1),
+            "mean_response_length": valid_tokens / max(trajectory_count, 1),
+            "min_response_length": response_min,
+            "max_response_length": response_max,
+            "response_clip_ratio": clipped_responses / max(trajectory_count, 1),
+            "student_teacher_topk_overlap_ratio": student_teacher_topk_overlap,
+            "student_teacher_topk_divergence": student_teacher_topk_divergence,
             "peak_gpu_allocated_bytes": peak_allocated,
             "peak_gpu_reserved_bytes": peak_reserved,
             "peak_gpu_allocated_gb": peak_allocated / 2**30,
@@ -1359,8 +1551,7 @@ def run_training(
             encoded,
             rollout,
             original_rollout,
-            old_student,
-            teacher_log_probs,
+            opd_reference,
             selected,
             token_allocation,
             primary,

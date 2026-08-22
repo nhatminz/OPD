@@ -238,10 +238,17 @@ def evaluate_loaded_suite(
     evaluation = {**config["evaluation"], **(runtime_settings or {})}
     batch_size = int(evaluation.get("batch_size", 16))
     max_new_tokens = int(evaluation.get("max_new_tokens", 2048))
-    temperature = float(evaluation.get("temperature", 1.0))
-    if temperature < 0:
-        raise ValueError("Evaluation temperature cannot be negative")
-    do_sample = temperature > 0
+    temperature = float(evaluation.get("temperature", 0.7))
+    top_p = float(evaluation.get("top_p", 0.95))
+    samples_per_problem = int(evaluation.get("num_responses", 16))
+    seed = int(evaluation.get("seed", 1234))
+    if temperature <= 0:
+        raise ValueError("avg@16 evaluation requires positive temperature")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("Evaluation top_p must be in (0, 1]")
+    if samples_per_problem <= 0:
+        raise ValueError("Evaluation num_responses must be positive")
+    do_sample = True
     limit = evaluation.get("limit")
     benchmark_names = tuple(evaluation.get("benchmark_names", BENCHMARK_ORDER))
     unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
@@ -267,6 +274,10 @@ def evaluate_loaded_suite(
             "limit": limit,
             "do_sample": do_sample,
             "temperature": temperature,
+            "top_p": top_p,
+            "num_responses": samples_per_problem,
+            "metric": f"avg@{samples_per_problem}",
+            "seed": seed,
         },
     }
     cpu_rng_state = torch.get_rng_state()
@@ -276,6 +287,9 @@ def evaluate_loaded_suite(
     previous_training = model.training
     previous_use_cache = model.config.use_cache
     model.eval()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     progress = tqdm(
         total=total_samples,
         desc=f"Eval {model_name}",
@@ -288,14 +302,16 @@ def evaluate_loaded_suite(
     try:
         for benchmark in benchmark_names:
             records, schema = loaded[benchmark]
-            correct, total = 0, 0
+            correct_generations = graded_generations = problems = 0
+            problem_score_sum = 0.0
             prediction_path = output_dir / (
                 f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
             )
             with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
                 for begin in range(0, len(records), batch_size):
                     progress.set_postfix_str(
-                        f"{benchmark} accuracy={correct / max(total, 1):.3f}"
+                        f"{benchmark} avg@{samples_per_problem}="
+                        f"{correct_generations / max(graded_generations, 1):.3f}"
                     )
                     batch = records[begin : begin + batch_size]
                     messages = [
@@ -330,40 +346,67 @@ def evaluate_loaded_suite(
                     ).to(device)
                     generation_kwargs = {
                         "do_sample": do_sample,
+                        "num_return_sequences": samples_per_problem,
                         "max_new_tokens": max_new_tokens,
                         "eos_token_id": tokenizer.eos_token_id,
                         "pad_token_id": tokenizer.pad_token_id,
                         "use_cache": True,
+                        "temperature": temperature,
+                        "top_p": top_p,
                     }
-                    if do_sample:
-                        generation_kwargs["temperature"] = temperature
                     generated = model.generate(
                         **encoded,
                         **generation_kwargs,
                     )
-                    responses = tokenizer.batch_decode(
+                    flat_responses = tokenizer.batch_decode(
                         generated[:, encoded.input_ids.shape[1] :],
                         skip_special_tokens=True,
                     )
-                    for row, response in zip(batch, responses):
-                        passed = _grade(response, row["answer"])
-                        correct += int(passed)
-                        total += 1
+                    expected_responses = len(batch) * samples_per_problem
+                    if len(flat_responses) != expected_responses:
+                        raise RuntimeError(
+                            f"HF generated {len(flat_responses)} responses, expected "
+                            f"{expected_responses}"
+                        )
+                    for row_index, row in enumerate(batch):
+                        begin_response = row_index * samples_per_problem
+                        responses = flat_responses[
+                            begin_response : begin_response + samples_per_problem
+                        ]
+                        correctness = [
+                            _grade(response, row["answer"]) for response in responses
+                        ]
+                        correct_generations += sum(map(int, correctness))
+                        graded_generations += samples_per_problem
+                        problems += 1
+                        problem_score_sum += sum(correctness) / samples_per_problem
                         handle.write(
                             json.dumps(
-                                {**row, "response": response, "correct": passed},
+                                {
+                                    **row,
+                                    "responses": responses,
+                                    "correct": correctness,
+                                    "problem_score": sum(correctness)
+                                    / samples_per_problem,
+                                },
                                 ensure_ascii=False,
                             )
                             + "\n"
                         )
                     progress.set_postfix_str(
-                        f"{benchmark} accuracy={correct / max(total, 1):.3f}"
+                        f"{benchmark} avg@{samples_per_problem}="
+                        f"{correct_generations / max(graded_generations, 1):.3f}"
                     )
                     progress.update(len(batch))
+            avg_at_n = problem_score_sum / max(problems, 1)
             suite["benchmarks"][benchmark] = {
-                "correct": correct,
-                "total": total,
-                "accuracy": correct / max(total, 1),
+                "correct": correct_generations,
+                "total": graded_generations,
+                "problems": problems,
+                "samples_per_problem": samples_per_problem,
+                "avg_at_16": avg_at_n,
+                # Compatibility alias consumed by existing plotting/aggregation.
+                "accuracy": avg_at_n,
                 "predictions": str(prediction_path),
                 "schema": schema,
             }
@@ -403,7 +446,9 @@ def evaluate_suite(
             output_dir,
             {
                 "backend": "vllm",
-                "temperature": evaluation.get("temperature", 1.0),
+                "temperature": evaluation.get("temperature", 0.7),
+                "top_p": evaluation.get("top_p", 0.95),
+                "num_responses": evaluation.get("num_responses", 16),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),
                 "benchmark_names": list(BENCHMARK_ORDER),

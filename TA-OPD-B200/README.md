@@ -7,9 +7,10 @@ Project độc lập này huấn luyện cùng student Qwen3-1.7B từ teacher Q
 - **Bellman-RAC**: cùng local teachability, truyền thông tin tương lai theo transition thực tế mà
   teacher ủng hộ, rồi weight mềm mọi response token.
 
-Ba phương pháp dùng chung data order, vLLM rollout, teacher/student sampled-token scoring,
-sampled-token PPO-clipped OPD loss, optimizer, checkpoint và evaluation. Chỉ cơ chế phân bổ
-supervision token khác nhau.
+Ba phương pháp dùng chung data order, vLLM rollout, teacher scoring, **Top-K OPD core**, optimizer,
+checkpoint và evaluation. Chỉ cơ chế phân bổ loss qua response position khác nhau. Core được port
+từ [`thunlp/OPD`](https://github.com/thunlp/OPD) tại commit
+`ac26e38d6f1572eb027597b48a9f4e01f6915ef8`.
 Xem lệnh đầy đủ từ shell mới trong [`RUN_B200.md`](RUN_B200.md), hoặc bản tiếng Việt ngắn trong
 [`HUONG_DAN_CHAY.md`](HUONG_DAN_CHAY.md).
 
@@ -37,20 +38,26 @@ Training luôn đọc toàn bộ split `all`; batch cuối không được pad h
 JSON và JSONL. Evaluation chọn file hỗ trợ theo thứ tự xác định, xác minh schema question/answer và
 lưu schema đã dùng trong output.
 
-## Định nghĩa OPD thuần
+## Common Top-K OPD core
 
-OPD thuần dùng đúng cùng elementwise PPO-clipped OPD loss với TA/RAC, nhưng không select hoặc
-reweight theo score. Mọi valid response token có mask `1`. Để khớp Full OPD trong implementation
-TA-OPD gốc, loss lấy mean token trong từng response rồi mean trên global sample batch:
+Tại mỗi prefix, student chọn `S_t = StudentTopK(p_t, K=16)`. Teacher được evaluate trên chính các
+ID trong `S_t`. Theo recipe upstream `only_stu + student_p + token_reward_direct`, core tính:
 
 ```text
-L_OPD = (1 / B) * sum_i [sum_t valid_it * ell_it_OPD / sum_t valid_it]
+alpha_t,k = softmax_k(log p_t(k))
+A_t,k     = (log q_t(k) - log p_old,t(k)) * alpha_t,k
+ell_t     = sum_k PPOClippedLoss(log p_t(k), log p_old,t(k), A_t,k)
 ```
 
-Đây chính là TA-OPD với full valid-token mask thay vì hard top-`rho`; RAC giữ normalization theo
-global soft-weight mass do objective RAC định nghĩa như vậy. OPD vẫn chạy cùng persistent vLLM
-on-policy rollout và mỗi student/teacher vẫn score original trajectory đúng một lần; chỉ bỏ phép
-tính TA top-K/Bellman không thuộc thuật toán OPD thuần.
+`K=16` là optimization support thật, không phải diagnostic và không còn objective sampled-token-only.
+Sau đó cả ba method dùng cùng normalization trên **global rollout batch**, bao gồm mọi DDP rank:
+
+```text
+L = sum_t w_t * ell_t / sum_t w_t
+```
+
+OPD đặt `w_t=1`; TA đặt hard mask top-`rho`; RAC đặt continuous Bellman weight. Vì vậy per-position
+signal và denominator convention hoàn toàn chung.
 
 ## Định nghĩa TA-OPD
 
@@ -104,10 +111,13 @@ trong shared config để audit fairness.
 
 - Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server;
   HF fallback có thể bật bằng `ROLLOUT_BACKEND=hf`.
-- Student và frozen teacher mỗi model score original trajectory đúng một lần cho cả ba method;
-  RAC không yêu cầu KV cache hay second-generation pass.
+- Common core score student Top-K và teacher-on-student IDs một lần. TA/RAC thêm một student
+  cross-score trên teacher Top-K để tính literal union; đây chỉ là selector statistic. Mọi scoring
+  dùng micro-batch và chỉ giữ tensor `[B,T,K]`, không giữ full-vocabulary logits của toàn rollout.
+  Mỗi prompt được interleave `n=4` lần và gửi thành bốn request có seed riêng; RAC không yêu cầu
+  counterfactual generation.
 - TA top-K/KL, actual-token log-prob ratio, global quantiles, RAC weights và loss weighting đều là
-  tensor operations trên GPU, với FP32 cho score/reduction nhạy số.
+  tensor operations trên GPU, với BF16 model forward và FP32 cho logsumexp/score/reduction nhạy số.
 - Bellman mặc định dùng associative affine suffix scan O(log T), vector hóa theo batch. Backend
   `reference` chứa recurrence rõ ràng để debug/cross-check.
 - BF16, FlashAttention 2 nếu có (SDPA fallback), fused AdamW nếu runtime hỗ trợ, DDP world size tự
@@ -133,19 +143,21 @@ rollout, seed, batch, optimizer, schedule và evaluation settings được kế 
 Các launcher đều expose:
 
 ```text
-LR NUM_EPOCHS MAX_STEPS GLOBAL_BATCH_SIZE MICRO_BATCH_SIZE GRAD_ACCUM_STEPS
-MAX_PROMPT_LEN MAX_RESPONSE_LEN TOP_K TA_RHO
+LR EPOCHS MAX_STEPS BATCH_SIZE MICRO_BATCH_SIZE NUM_RESPONSES
+MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TOP_K TA_RHO
 RAC_GAMMA RAC_W_MIN RAC_BETA RAC_SCAN_BACKEND
 EVAL_INTERVAL SAVE_INTERVAL LOG_INTERVAL SEED
 ```
 
-Defaults là BF16, full-parameter student, `LR=1e-6`, một epoch, global batch 8, micro-batch 1,
-prompt/response `2048/8192`, eval/save mỗi 50 step. Đây là điểm bắt đầu thận trọng nhưng **không phải
+Defaults là BF16, full-parameter student, `LR=1e-6`, một epoch, prompt batch 16, `n=4`
+(tối đa 64 trajectories), micro-batch 1, prompt/response `1024/7168`, eval/save mỗi 50 step. Đây là
+điểm bắt đầu thận trọng nhưng **không phải
 cam kết fit** cho mọi driver/package/GPU layout; chạy preflight và điều chỉnh batch/length/memory
 fraction đối xứng cho OPD, TA và RAC.
 
-Evaluation mặc định dùng vLLM sampling với `temperature=1.0` và seed `1234`. Để eval lại toàn bộ
-checkpoint đã lưu và thay thế lịch sử temperature cũ, dùng
+Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric
+chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
+lưu và thay thế lịch sử/file eval cũ, dùng
 `scripts/reeval_all_checkpoints_b200.sh`; lệnh dry-run/chạy thật nằm trong `RUN_B200.md`.
 
 <!-- B200_AUTOTUNE_RESULT_START -->
@@ -172,14 +184,15 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 `--set logging.selected_tokens_enabled=true` cho một run audit ngắn.
 
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
-cho accuracy, loss, TA score distribution, Bellman-RAC `g/V/w`, và mean alignment/V/weight.
+cho avg@16, loss, TA score distribution, Bellman-RAC `g/V/w`, và mean alignment/V/weight.
 `plot_training_progress.sh` hỗ trợ `PLOT_METHODS='opd ta rac'` với một, hai hoặc cả ba method.
 Một method tạo ba đường MATH-500/AIME24/AIME25; từ hai method trở lên tạo ba subplot benchmark,
 mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn tương thích và có nghĩa TA+RAC.
 
 ## Validation
 
-Các test nhẹ bao phủ uniform pure-OPD allocation, literal TA formula, robust normalization,
+Các test nhẹ bao phủ Top-K OPD khớp upstream trên synthetic logits, n=4 expansion, global
+weighted-token mean/DDP, uniform pure-OPD allocation, literal TA formula, robust normalization,
 Bellman recurrence tính tay,
 padding/trajectory reset, bounds, detachment, gradient path, optimized/reference equivalence,
 global DDP normalization/budget, resume, eval schedule, loaders, vLLM wrappers và plotting.
