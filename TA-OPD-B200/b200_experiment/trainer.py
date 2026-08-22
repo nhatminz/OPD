@@ -391,6 +391,9 @@ def _run_training_evaluation(
     step_dir = eval_root / f"step-{step:06d}"
     runtime_settings = {
         "backend": str(settings.get("backend", "vllm")).lower(),
+        "temperature": float(
+            settings.get("temperature", config["evaluation"].get("temperature", 1.0))
+        ),
         "batch_size": int(
             settings.get("batch_size", config["evaluation"].get("batch_size", 16))
         ),

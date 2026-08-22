@@ -70,6 +70,7 @@ class VllmEvaluationTests(unittest.TestCase):
             }
             settings = {
                 "max_new_tokens": 32,
+                "temperature": 1.0,
                 "benchmark_names": list(benchmarks),
                 "vllm": {"max_num_seqs": 64, "gpu_memory_utilization": 0.4},
             }
@@ -92,6 +93,8 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(len(calls[0][0]), 3)
             self.assertTrue(calls[0][2])
             self.assertEqual(_LLM.instances[0].kwargs["max_num_seqs"], 64)
+            self.assertEqual(calls[0][1].kwargs["temperature"], 1.0)
+            self.assertTrue(suite["parameters"]["do_sample"])
             self.assertEqual(
                 [suite["benchmarks"][name]["accuracy"] for name in benchmarks],
                 [1.0, 1.0, 1.0],

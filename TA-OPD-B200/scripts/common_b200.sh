@@ -175,6 +175,7 @@ build_training_args() {
     --set "logging.log_interval=${LOG_INTERVAL:-1}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
+    --set "training_evaluation.temperature=${TRAIN_EVAL_TEMPERATURE:-1.0}"
     --set "training_evaluation.target_evaluations=null"
     --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "training_evaluation.limit=null"

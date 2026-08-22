@@ -42,6 +42,7 @@ export MAX_STEPS="${MAX_STEPS:-}"
 # Identical evaluation schedule: step 0, every 50 steps, and the final step.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"  # vllm or hf
+export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-1.0}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"
 export TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-16}"  # hf backend only
 

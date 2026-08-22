@@ -34,6 +34,7 @@ export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 # Periodic evaluation defaults to step 0, every 50 steps, and the final step.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"
+export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-1.0}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"
 
 # Engineering/DDP defaults match train_ta_b200.sh and train_rac_b200.sh.

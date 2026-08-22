@@ -12,6 +12,7 @@ exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --output "${EVAL_OUTPUT}" \
   --set "paths.storage_root=${STORAGE_ROOT}" \
   --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \
+  --set "evaluation.temperature=${EVAL_TEMPERATURE:-1.0}" \
   --set "evaluation.batch_size=${EVAL_BATCH_SIZE:-16}" \
   --set "evaluation.max_new_tokens=${EVAL_MAX_NEW_TOKENS:-8192}" \
   --set "evaluation.vllm.tensor_parallel_size=${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}" \

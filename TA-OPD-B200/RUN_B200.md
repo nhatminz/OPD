@@ -140,7 +140,8 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
 ```
 
-Evaluation mặc định là vLLM greedy (`n=1`, `temperature=0`) và lưu raw generation/correctness.
+Evaluation mặc định dùng vLLM sampling (`n=1`, `temperature=1.0`, seed `1234`) và lưu raw
+generation/correctness.
 Fallback: `EVAL_BACKEND=hf`. Tensor parallel example:
 
 ```bash
@@ -148,6 +149,43 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
 bash scripts/eval_all_b200.sh
 ```
+
+## Re-eval mọi checkpoint đã lưu ở temperature 1
+
+Script dưới đây tìm `checkpoint-<step>` và `final/` trong cả ba output. Nó cũng eval lại base ở
+step 0 để toàn bộ đường accuracy dùng cùng temperature. Mỗi `training_eval/step-*` tương ứng,
+`eval_history.jsonl` và `eval_metrics.csv` cũ sẽ bị thay thế; raw prediction và `summary.json`
+trong từng step cũng bị thay thế.
+
+Kiểm tra danh sách checkpoint trước, không ghi file:
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  REEVAL_DRY_RUN=true \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Chạy thật:
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Tensor parallel cho từng evaluator vLLM:
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  CUDA_VISIBLE_DEVICES=0,1 \
+  REEVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Script chạy tuần tự một subprocess vLLM cho mỗi checkpoint để trả VRAM sau từng lượt. Nó từ chối
+ghi lịch sử mới nếu phát hiện thư mục eval cũ không có checkpoint tương ứng, tránh trộn kết quả
+temperature 0 và 1. Sau khi hoàn tất, chạy lại lệnh plot periodic training evaluation bên dưới.
 
 ## Plot periodic training evaluation
 

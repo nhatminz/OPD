@@ -238,6 +238,10 @@ def evaluate_loaded_suite(
     evaluation = {**config["evaluation"], **(runtime_settings or {})}
     batch_size = int(evaluation.get("batch_size", 16))
     max_new_tokens = int(evaluation.get("max_new_tokens", 2048))
+    temperature = float(evaluation.get("temperature", 1.0))
+    if temperature < 0:
+        raise ValueError("Evaluation temperature cannot be negative")
+    do_sample = temperature > 0
     limit = evaluation.get("limit")
     benchmark_names = tuple(evaluation.get("benchmark_names", BENCHMARK_ORDER))
     unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
@@ -261,8 +265,8 @@ def evaluate_loaded_suite(
             "batch_size": batch_size,
             "max_new_tokens": max_new_tokens,
             "limit": limit,
-            "do_sample": False,
-            "temperature": 0.0,
+            "do_sample": do_sample,
+            "temperature": temperature,
         },
     }
     cpu_rng_state = torch.get_rng_state()
@@ -324,14 +328,18 @@ def evaluate_loaded_suite(
                         add_special_tokens=False,
                         return_tensors="pt",
                     ).to(device)
+                    generation_kwargs = {
+                        "do_sample": do_sample,
+                        "max_new_tokens": max_new_tokens,
+                        "eos_token_id": tokenizer.eos_token_id,
+                        "pad_token_id": tokenizer.pad_token_id,
+                        "use_cache": True,
+                    }
+                    if do_sample:
+                        generation_kwargs["temperature"] = temperature
                     generated = model.generate(
                         **encoded,
-                        do_sample=False,
-                        temperature=None,
-                        max_new_tokens=max_new_tokens,
-                        eos_token_id=tokenizer.eos_token_id,
-                        pad_token_id=tokenizer.pad_token_id,
-                        use_cache=True,
+                        **generation_kwargs,
                     )
                     responses = tokenizer.batch_decode(
                         generated[:, encoded.input_ids.shape[1] :],
@@ -395,6 +403,7 @@ def evaluate_suite(
             output_dir,
             {
                 "backend": "vllm",
+                "temperature": evaluation.get("temperature", 1.0),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),
                 "benchmark_names": list(BENCHMARK_ORDER),

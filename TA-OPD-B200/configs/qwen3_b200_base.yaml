@@ -120,6 +120,7 @@ logging:
 training_evaluation:
   enabled: true
   backend: vllm
+  temperature: 1.0
   target_evaluations: null
   interval_steps: 50
   eval_at_start: true
@@ -150,6 +151,7 @@ autotune:
 
 evaluation:
   backend: vllm
+  temperature: 1.0
   batch_size: 16
   max_new_tokens: 8192
   limit: null

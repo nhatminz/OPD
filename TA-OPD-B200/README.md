@@ -144,6 +144,10 @@ prompt/response `2048/8192`, eval/save mỗi 50 step. Đây là điểm bắt đ
 cam kết fit** cho mọi driver/package/GPU layout; chạy preflight và điều chỉnh batch/length/memory
 fraction đối xứng cho OPD, TA và RAC.
 
+Evaluation mặc định dùng vLLM sampling với `temperature=1.0` và seed `1234`. Để eval lại toàn bộ
+checkpoint đã lưu và thay thế lịch sử temperature cũ, dùng
+`scripts/reeval_all_checkpoints_b200.sh`; lệnh dry-run/chạy thật nằm trong `RUN_B200.md`.
+
 <!-- B200_AUTOTUNE_RESULT_START -->
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
 <!-- B200_AUTOTUNE_RESULT_END -->

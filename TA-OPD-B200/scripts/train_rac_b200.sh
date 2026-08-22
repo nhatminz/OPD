@@ -34,6 +34,7 @@ export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 # Keep enabled when accuracy-over-step plots are needed after training.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"
+export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-1.0}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-8192}"
 
 # Engineering/DDP defaults. GLOBAL_BATCH_SIZE is independent of GPU count.

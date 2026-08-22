@@ -71,6 +71,9 @@ def evaluate_vllm_suite(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     max_new_tokens = int(runtime_settings.get("max_new_tokens", 2048))
+    temperature = float(runtime_settings.get("temperature", 1.0))
+    if temperature < 0:
+        raise ValueError("Evaluation temperature cannot be negative")
     limit = runtime_settings.get("limit")
     benchmark_names = tuple(runtime_settings.get("benchmark_names", BENCHMARK_ORDER))
     unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
@@ -114,7 +117,7 @@ def evaluate_vllm_suite(
         f"Eval {model_name}: loading vLLM engine for {len(prompts)} full-dataset samples..."
     )
     engine = LLM(**engine_kwargs)
-    sampling = SamplingParams(temperature=0.0, max_tokens=max_new_tokens)
+    sampling = SamplingParams(temperature=temperature, max_tokens=max_new_tokens)
     # One call produces one tqdm progress bar for all configured benchmarks.
     generated = engine.generate(prompts, sampling, use_tqdm=True) if prompts else []
     if len(generated) != len(prompt_rows):
@@ -130,8 +133,8 @@ def evaluate_vllm_suite(
             "backend": "vllm",
             "max_new_tokens": max_new_tokens,
             "limit": limit,
-            "do_sample": False,
-            "temperature": 0.0,
+            "do_sample": temperature > 0,
+            "temperature": temperature,
             **{key: value for key, value in engine_kwargs.items() if key != "model"},
         },
     }

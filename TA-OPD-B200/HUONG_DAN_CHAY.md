@@ -115,3 +115,19 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 
 Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
 không phải subset size.
+
+Eval lại toàn bộ checkpoint đã lưu với vLLM `temperature=1.0`, đồng thời ghi đè lịch sử/file eval
+cũ của OPD, TA-OPD và RAC:
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  REEVAL_DRY_RUN=true CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Dòng đầu chỉ kiểm tra danh sách; dòng thứ hai mới thực sự ghi đè. Script mặc định eval lại cả base
+step 0 để không trộn temperature giữa baseline và checkpoint.
