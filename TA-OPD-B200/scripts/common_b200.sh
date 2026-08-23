@@ -195,11 +195,16 @@ build_training_args() {
     --set "training_evaluation.limit=null"
     --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-1}"
     --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-7168}"
+    --set "training_evaluation.reuse_base_evaluation=${TRAIN_EVAL_REUSE_BASE:-true}"
+    --set "training_evaluation.base_cache_dir=${TRAIN_EVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
     --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
     --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
     --set "training_evaluation.vllm.gpu_headroom_gib=${VLLM_GPU_HEADROOM_GIB:-4}"
     --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-256}"
     --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-9216}"
+    --set "training_evaluation.vllm.enable_chunked_prefill=${VLLM_ENABLE_CHUNKED_PREFILL:-true}"
+    --set "training_evaluation.vllm.performance_mode=${VLLM_PERFORMANCE_MODE:-throughput}"
+    --set "training_evaluation.vllm.async_scheduling=${VLLM_ASYNC_SCHEDULING:-true}"
   )
   if batch_autotune_enabled; then
     COMMON_TRAIN_ARGS=(--overlay "${AUTOTUNE_CONFIG}" "${COMMON_TRAIN_ARGS[@]}")

@@ -159,6 +159,9 @@ Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `ma
 chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
 lưu và thay thế lịch sử/file eval cũ, dùng
 `scripts/reeval_all_checkpoints_b200.sh`; lệnh dry-run/chạy thật nằm trong `RUN_B200.md`.
+560 problem tạo đúng 8.960 responses. Step-0 base giống hệt giữa ba method nên được generate một
+lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng. Evaluator bật vLLM
+`performance_mode=throughput`, chunked prefill và async scheduling mặc định.
 
 <!-- B200_AUTOTUNE_RESULT_START -->
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.

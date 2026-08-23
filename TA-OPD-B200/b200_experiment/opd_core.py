@@ -56,17 +56,26 @@ def build_topk_opd_reference(
     _validate_topk_tensors(student_log_probs, teacher_log_probs, valid_mask)
     if candidate_ids.shape != student_log_probs.shape:
         raise ValueError("Student candidate IDs and Top-K log-probabilities must match")
-    student = student_log_probs.detach().float()
-    teacher = teacher_log_probs.detach().float()
-    weights = torch.softmax(student, dim=-1)
-    advantages = (teacher - student) * weights
-    position_mask = valid_mask.detach().bool().unsqueeze(-1)
-    weights = torch.where(position_mask, weights, torch.zeros_like(weights))
-    advantages = torch.where(
-        position_mask, advantages, torch.zeros_like(advantages)
-    )
+    # ``score_original_rollout`` deliberately runs under inference_mode.  A
+    # dtype conversion is allowed to be a no-op (FP32 -> FP32, int64 -> int64),
+    # so ``detach().float()``/``detach().long()`` can otherwise leak inference
+    # tensors into the differentiable PPO gather below.  Clone with inference
+    # mode explicitly disabled to materialize ordinary frozen tensors that
+    # autograd is allowed to save for backward.
+    with torch.inference_mode(False):
+        candidate_ids = candidate_ids.detach().clone().to(dtype=torch.long)
+        student = student_log_probs.detach().clone().to(dtype=torch.float32)
+        teacher = teacher_log_probs.detach().clone().to(dtype=torch.float32)
+        valid = valid_mask.detach().clone().to(dtype=torch.bool)
+        weights = torch.softmax(student, dim=-1)
+        advantages = (teacher - student) * weights
+        position_mask = valid.unsqueeze(-1)
+        weights = torch.where(position_mask, weights, torch.zeros_like(weights))
+        advantages = torch.where(
+            position_mask, advantages, torch.zeros_like(advantages)
+        )
     return TopKOPDReference(
-        candidate_ids=candidate_ids.detach().long(),
+        candidate_ids=candidate_ids,
         old_student_log_probs=student,
         teacher_log_probs=teacher,
         student_weights=weights,

@@ -49,6 +49,8 @@ export TRAIN_EVAL_TOP_P="${TRAIN_EVAL_TOP_P:-0.95}"
 export TRAIN_EVAL_NUM_RESPONSES="${TRAIN_EVAL_NUM_RESPONSES:-16}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${TRAIN_EVAL_MAX_NEW_TOKENS:-7168}"
 export TRAIN_EVAL_BATCH_SIZE="${TRAIN_EVAL_BATCH_SIZE:-1}"  # hf backend only
+export TRAIN_EVAL_REUSE_BASE="${TRAIN_EVAL_REUSE_BASE:-true}"
+export TRAIN_EVAL_BASE_CACHE_DIR="${TRAIN_EVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 
 # Periodic/final evaluation vLLM settings (separate from training rollout).
 # For tensor parallelism, expose the same number of GPUs above.
@@ -57,6 +59,9 @@ export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
 export VLLM_GPU_HEADROOM_GIB="${VLLM_GPU_HEADROOM_GIB:-4}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-9216}"
+export VLLM_ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-true}"
+export VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}"
+export VLLM_ASYNC_SCHEDULING="${VLLM_ASYNC_SCHEDULING:-true}"
 # Override TRAIN_EVAL_INTERVAL only if the same value is used for all methods.
 # ================================================================
 

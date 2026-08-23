@@ -156,6 +156,12 @@ training_evaluation:
   max_new_tokens: 7168
   limit: null
   output_subdir: training_eval
+  # The base model and protocol are identical for all methods. Generate step 0
+  # once, then copy the exact same predictions into every run for both speed
+  # and a strictly controlled comparison. Existing valid step-0 artifacts are
+  # also reused after a crash before the first optimizer update.
+  reuse_base_evaluation: true
+  base_cache_dir: outputs/.base_eval_cache
   vllm:
     tensor_parallel_size: 1
     # Dynamically consume almost all currently-free VRAM. The training process
@@ -165,6 +171,11 @@ training_evaluation:
     max_num_seqs: 256
     max_model_len: 9216
     enable_prefix_caching: true
+    enable_chunked_prefill: true
+    # vLLM 0.17.1 increases the B200 scheduling budget in throughput mode;
+    # async scheduling reduces CPU-side gaps without changing sampling config.
+    performance_mode: throughput
+    async_scheduling: true
     seed: 1234
 
 autotune:
@@ -189,6 +200,9 @@ evaluation:
     max_num_seqs: 256
     max_model_len: 9216
     enable_prefix_caching: true
+    enable_chunked_prefill: true
+    performance_mode: throughput
+    async_scheduling: true
     seed: 1234
   benchmarks:
     MATH-500:

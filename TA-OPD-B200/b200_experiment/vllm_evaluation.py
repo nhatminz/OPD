@@ -118,6 +118,15 @@ def evaluate_vllm_suite(
     max_model_len = vllm_settings.get("max_model_len", 4096)
     if max_model_len is not None:
         engine_kwargs["max_model_len"] = int(max_model_len)
+    max_num_batched_tokens = vllm_settings.get("max_num_batched_tokens")
+    if max_num_batched_tokens is not None:
+        engine_kwargs["max_num_batched_tokens"] = int(max_num_batched_tokens)
+    for boolean_setting in ("enable_chunked_prefill", "async_scheduling"):
+        if vllm_settings.get(boolean_setting) is not None:
+            engine_kwargs[boolean_setting] = bool(vllm_settings[boolean_setting])
+    performance_mode = vllm_settings.get("performance_mode")
+    if performance_mode not in (None, ""):
+        engine_kwargs["performance_mode"] = str(performance_mode)
 
     tqdm.write(
         f"Eval {model_name}: loading vLLM engine for {len(prompts)} full-dataset samples..."

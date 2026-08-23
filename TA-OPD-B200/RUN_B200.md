@@ -73,6 +73,13 @@ checkpoint và lịch
 eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
 tài nguyên giữa các run.
 
+Full eval có 560 problem và `n=16`, vì vậy progress của vLLM hiển thị 8.960 generated responses
+(`560 * 16`); đây không phải rollout train `n=4`. Để không lặp lại lượt base tốn thời gian, step 0
+được cache theo fingerprint của model, dataset, evaluator và toàn bộ protocol. OPD sinh lần đầu;
+TA-OPD/RAC copy đúng cùng prediction. Một run bị lỗi trước step train đầu tiên cũng tái sử dụng
+`training_eval/step-000000` hợp lệ khi chạy lại. Có thể tắt bằng
+`TRAIN_EVAL_REUSE_BASE=false`, hoặc đổi chỗ lưu qua `TRAIN_EVAL_BASE_CACHE_DIR`.
+
 Không export `MAX_STEPS`, hoặc đặt `MAX_STEPS=-1`, để consume full configured epoch. `MAX_STEPS=N`
 chỉ dành cho debug/explicit total target; nó không phải số step chạy thêm sau resume.
 
@@ -157,7 +164,9 @@ bash scripts/eval_all_b200.sh
 Script dưới đây tìm `checkpoint-<step>` và `final/` trong cả ba output. Nó cũng eval lại base ở
 step 0 để toàn bộ đường avg@16 dùng cùng protocol. Mỗi `training_eval/step-*` tương ứng,
 `eval_history.jsonl` và `eval_metrics.csv` cũ sẽ bị thay thế; raw prediction và `summary.json`
-trong từng step cũng bị thay thế.
+trong từng step cũng bị thay thế. Base được generate một lần rồi tái sử dụng cho hai method còn
+lại; checkpoint sau train vẫn được eval độc lập. Đặt `REEVAL_REUSE_BASE=false` nếu cần cố ý sinh
+lại base ba lần.
 
 Kiểm tra danh sách checkpoint trước, không ghi file:
 

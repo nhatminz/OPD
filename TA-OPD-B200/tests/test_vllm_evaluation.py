@@ -79,7 +79,14 @@ class VllmEvaluationTests(unittest.TestCase):
                 "top_p": 0.95,
                 "num_responses": 16,
                 "benchmark_names": list(benchmarks),
-                "vllm": {"max_num_seqs": 64, "gpu_memory_utilization": 0.4},
+                "vllm": {
+                    "max_num_seqs": 64,
+                    "max_num_batched_tokens": 4096,
+                    "gpu_memory_utilization": 0.4,
+                    "enable_chunked_prefill": True,
+                    "async_scheduling": True,
+                    "performance_mode": "throughput",
+                },
             }
             fake_vllm = types.SimpleNamespace(LLM=_LLM, SamplingParams=_SamplingParams)
             _LLM.instances.clear()
@@ -100,6 +107,14 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(len(calls[0][0]), 3)
             self.assertTrue(calls[0][2])
             self.assertEqual(_LLM.instances[0].kwargs["max_num_seqs"], 64)
+            self.assertEqual(
+                _LLM.instances[0].kwargs["max_num_batched_tokens"], 4096
+            )
+            self.assertTrue(_LLM.instances[0].kwargs["enable_chunked_prefill"])
+            self.assertTrue(_LLM.instances[0].kwargs["async_scheduling"])
+            self.assertEqual(
+                _LLM.instances[0].kwargs["performance_mode"], "throughput"
+            )
             self.assertEqual(calls[0][1].kwargs["temperature"], 1.0)
             self.assertEqual(calls[0][1].kwargs["top_p"], 0.95)
             self.assertEqual(calls[0][1].kwargs["n"], 16)

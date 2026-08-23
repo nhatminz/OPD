@@ -25,10 +25,14 @@ ARGS=(
   --max-num-seqs "${REEVAL_VLLM_MAX_NUM_SEQS:-${EVAL_VLLM_MAX_NUM_SEQS:-256}}"
   --max-model-len "${REEVAL_VLLM_MAX_MODEL_LEN:-${EVAL_VLLM_MAX_MODEL_LEN:-9216}}"
   --seed "${REEVAL_SEED:-1234}"
+  --base-cache-dir "${REEVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 )
 
 case "${REEVAL_SKIP_BASE:-false}" in
   true|TRUE|1|yes|YES) ARGS+=(--skip-base) ;;
+esac
+case "${REEVAL_REUSE_BASE:-true}" in
+  false|FALSE|0|no|NO) ARGS+=(--no-base-cache) ;;
 esac
 case "${REEVAL_ALLOW_UNMATCHED_EVAL_DIRECTORIES:-false}" in
   true|TRUE|1|yes|YES) ARGS+=(--allow-unmatched-eval-directories) ;;

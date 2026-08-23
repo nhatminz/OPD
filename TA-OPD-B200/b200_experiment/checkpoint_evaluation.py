@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_runtime_paths
+from .evaluation_cache import evaluate_or_reuse_base
 
 
 BENCHMARK_ORDER = ("MATH-500", "AIME24", "AIME25")
@@ -298,6 +299,11 @@ def _runtime_settings(config: dict[str, Any], args: argparse.Namespace) -> dict[
     vllm_settings.update(
         {key: value for key, value in overrides.items() if value is not None}
     )
+    # Old resolved configs predate these vLLM 0.17.1 throughput controls.  They
+    # only affect scheduling/throughput, not the requested sampling protocol.
+    vllm_settings.setdefault("enable_chunked_prefill", True)
+    vllm_settings.setdefault("performance_mode", "throughput")
+    vllm_settings.setdefault("async_scheduling", True)
     return {
         "backend": "vllm",
         "temperature": float(args.temperature),
@@ -377,16 +383,45 @@ def _reevaluate_method(
             f"temperature={settings['temperature']}: {target.model_path}",
             flush=True,
         )
-        try:
+
+        def run_evaluator() -> dict[str, Any]:
             subprocess.run(
                 command,
                 cwd=repo_root,
                 env=_subprocess_environment(repo_root),
                 check=True,
             )
+            return json.loads((staged / "summary.json").read_text(encoding="utf-8"))
+
+        try:
+            cache_status = "disabled"
+            if target.step == 0 and not args.no_base_cache:
+                suite, cache_status = evaluate_or_reuse_base(
+                    config=config,
+                    runtime_settings=settings,
+                    model_path=target.model_path,
+                    model_name=target.model_name,
+                    destination=staged,
+                    evaluator=run_evaluator,
+                    cache_dir=args.base_cache_dir,
+                    # Re-eval must replace the requested output. It may reuse a
+                    # verified shared result, never the old destination itself.
+                    reuse_destination=False,
+                )
+                if cache_status == "shared":
+                    skipped_responses = sum(
+                        int(result["total"])
+                        for result in suite["benchmarks"].values()
+                    )
+                    print(
+                        f"[{display_name}] reused identical cached base evaluation; "
+                        f"skipped {skipped_responses:,} generations.",
+                        flush=True,
+                    )
+            else:
+                suite = run_evaluator()
             elapsed = time.perf_counter() - started
             summary_path = staged / "summary.json"
-            suite = json.loads(summary_path.read_text(encoding="utf-8"))
             actual_temperature = float(suite["parameters"]["temperature"])
             if actual_temperature != float(settings["temperature"]):
                 raise AssertionError(
@@ -427,6 +462,7 @@ def _reevaluate_method(
             "model_role": target.model_role,
             "backend": "vllm",
             "evaluation_time": elapsed,
+            "base_cache_status": cache_status if target.step == 0 else None,
             "benchmarks": {
                 name: {
                     "correct": result["correct"],
@@ -506,6 +542,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--base-cache-dir")
+    parser.add_argument("--no-base-cache", action="store_true")
     parser.add_argument("--skip-base", action="store_true")
     parser.add_argument("--allow-unmatched-eval-directories", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

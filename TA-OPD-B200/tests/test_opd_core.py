@@ -6,6 +6,7 @@ import torch
 
 from b200_experiment.opd_core import (
     build_topk_opd_reference,
+    gather_candidate_log_probs,
     topk_candidate_ppo_loss,
     topk_reference_from_logits,
     weighted_token_sums,
@@ -13,6 +14,37 @@ from b200_experiment.opd_core import (
 
 
 class TopKOPDCoreTests(unittest.TestCase):
+    def test_inference_mode_scores_are_materialized_before_backward(self):
+        with torch.inference_mode():
+            candidate_ids = torch.tensor([[[0, 2], [1, 3]]], dtype=torch.long)
+            student = torch.log_softmax(torch.randn(1, 2, 2), dim=-1)
+            teacher = torch.log_softmax(torch.randn(1, 2, 2), dim=-1)
+            valid = torch.ones(1, 2, dtype=torch.bool)
+            # The core must remain safe even if a future caller constructs the
+            # frozen reference before leaving its inference-mode scope.
+            reference = build_topk_opd_reference(
+                candidate_ids, student, teacher, valid
+            )
+
+        self.assertFalse(torch.is_inference(reference.candidate_ids))
+        self.assertFalse(torch.is_inference(reference.old_student_log_probs))
+        self.assertFalse(torch.is_inference(reference.teacher_log_probs))
+        self.assertFalse(torch.is_inference(reference.student_weights))
+        self.assertFalse(torch.is_inference(reference.advantages))
+
+        logits = torch.randn(1, 2, 5, requires_grad=True)
+        current = gather_candidate_log_probs(
+            logits,
+            reference.candidate_ids,
+            temperature=1.0,
+            chunk_steps=1,
+        )
+        loss = topk_candidate_ppo_loss(
+            current, reference, clip_low=0.2, clip_high=0.28, dual_clip=3.0
+        )
+        loss.sum().backward()
+        self.assertIsNotNone(logits.grad)
+
     def test_only_stu_student_p_matches_upstream_formula_with_k16(self):
         torch.manual_seed(7)
         student_logits = torch.randn(2, 3, 29)

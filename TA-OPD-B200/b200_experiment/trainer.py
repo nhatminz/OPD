@@ -38,6 +38,7 @@ from .distributed import (
     unwrap_model,
 )
 from .evaluation import BENCHMARK_ORDER, evaluate_loaded_suite
+from .evaluation_cache import evaluate_or_reuse_base
 from .eval_schedule import (
     should_run_training_evaluation,
     training_evaluation_steps,
@@ -260,6 +261,69 @@ def _append_csv_row(
         writer.writerow(row)
 
 
+def _upsert_jsonl_row(
+    path: Path, payload: dict[str, Any], key_fields: tuple[str, ...]
+) -> None:
+    """Atomically insert/replace a row so a pre-train retry cannot duplicate step 0."""
+    rows: list[dict[str, Any]] = []
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+    def matches(row: dict[str, Any]) -> bool:
+        return all(row.get(key) == payload.get(key) for key in key_fields)
+
+    output: list[dict[str, Any]] = []
+    replaced = False
+    for row in rows:
+        if matches(row):
+            if not replaced:
+                output.append(payload)
+                replaced = True
+        else:
+            output.append(row)
+    if not replaced:
+        output.append(payload)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in output:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=True) + "\n")
+    os.replace(temporary, path)
+
+
+def _upsert_csv_row(
+    path: Path,
+    row: dict[str, Any],
+    fieldnames: tuple[str, ...],
+    key_fields: tuple[str, ...],
+) -> None:
+    rows: list[dict[str, Any]] = []
+    if path.is_file() and path.stat().st_size > 0:
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    def matches(item: dict[str, Any]) -> bool:
+        return all(str(item.get(key)) == str(row.get(key)) for key in key_fields)
+
+    output: list[dict[str, Any]] = []
+    replaced = False
+    for existing in rows:
+        if matches(existing):
+            if not replaced:
+                output.append(row)
+                replaced = True
+        else:
+            output.append(existing)
+    if not replaced:
+        output.append(row)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(output)
+    os.replace(temporary, path)
+
+
 def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
     selector = metrics.get("selector", {})
     row = {
@@ -444,23 +508,48 @@ def _run_training_evaluation(
     method_name = METHOD_DISPLAY_NAMES[method]
     model_name = "Base student" if step == 0 else f"{method_name} step {step}"
     backend = runtime_settings["backend"]
+    cache_status = "disabled"
     if backend == "vllm":
         source_path = (
             Path(config["models"]["student_path"]).resolve()
             if step == 0
             else checkpoint
         )
-        suite = _evaluate_vllm_subprocess(
-            model,
-            tokenizer,
-            model_name,
-            source_path,
-            step,
-            config,
-            resolved_config_path,
-            step_dir,
-            runtime_settings,
-        )
+
+        def evaluate_vllm() -> dict[str, Any]:
+            return _evaluate_vllm_subprocess(
+                model,
+                tokenizer,
+                model_name,
+                source_path,
+                step,
+                config,
+                resolved_config_path,
+                step_dir,
+                runtime_settings,
+            )
+
+        if step == 0 and bool(settings.get("reuse_base_evaluation", True)):
+            suite, cache_status = evaluate_or_reuse_base(
+                config=config,
+                runtime_settings=runtime_settings,
+                model_path=source_path,
+                model_name=model_name,
+                destination=step_dir,
+                evaluator=evaluate_vllm,
+                cache_dir=settings.get("base_cache_dir"),
+                reuse_destination=True,
+            )
+            if cache_status != "generated":
+                skipped_responses = sum(
+                    int(result["total"]) for result in suite["benchmarks"].values()
+                )
+                tqdm.write(
+                    "Reused untouched-base avg@16 evaluation "
+                    f"({cache_status} cache); skipped {skipped_responses:,} generations."
+                )
+        else:
+            suite = evaluate_vllm()
     elif backend == "hf":
         suite = evaluate_loaded_suite(
             model,
@@ -481,6 +570,7 @@ def _run_training_evaluation(
         "model_role": "base_student" if step == 0 else method,
         "backend": backend,
         "evaluation_time": elapsed,
+        "base_cache_status": cache_status if step == 0 else None,
         "benchmarks": {
             name: {
                 "correct": result["correct"],
@@ -495,9 +585,24 @@ def _run_training_evaluation(
         "parameters": suite["parameters"],
         "details": str((step_dir / "summary.json").resolve()),
     }
-    _append_jsonl(output_dir / "eval_history.jsonl", history_entry)
+    _upsert_jsonl_row(
+        output_dir / "eval_history.jsonl", history_entry, ("step", "method")
+    )
+    eval_metric_fields = (
+        "step",
+        "method",
+        "backend",
+        "benchmark",
+        "correct",
+        "total",
+        "accuracy",
+        "avg_at_16",
+        "problems",
+        "samples_per_problem",
+        "evaluation_time_sec",
+    )
     for benchmark, result in history_entry["benchmarks"].items():
-        _append_csv_row(
+        _upsert_csv_row(
             output_dir / "eval_metrics.csv",
             {
                 "step": step,
@@ -507,19 +612,8 @@ def _run_training_evaluation(
                 **result,
                 "evaluation_time_sec": elapsed,
             },
-            (
-                "step",
-                "method",
-                "backend",
-                "benchmark",
-                "correct",
-                "total",
-                "accuracy",
-                "avg_at_16",
-                "problems",
-                "samples_per_problem",
-                "evaluation_time_sec",
-            ),
+            eval_metric_fields,
+            ("step", "method", "benchmark"),
         )
     return history_entry
 

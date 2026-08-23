@@ -115,6 +115,9 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 
 Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
 không phải subset size.
+Ba bộ có tổng cộng 560 problem; `n=16` nên vLLM báo 8.960 processed responses. Base step 0 chỉ
+generate một lần rồi dùng cùng artifact đã kiểm tra fingerprint cho OPD/TA-OPD/RAC. Những step
+sau vẫn phải generate riêng vì weights của ba method đã khác nhau.
 
 Eval lại toàn bộ checkpoint đã lưu với vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, metric
 `avg@16`, đồng thời ghi đè lịch sử/file eval cũ của OPD, TA-OPD và RAC:
@@ -130,4 +133,4 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 ```
 
 Dòng đầu chỉ kiểm tra danh sách; dòng thứ hai mới thực sự ghi đè. Script mặc định eval lại cả base
-step 0 để không trộn protocol eval giữa baseline và checkpoint.
+step 0 để không trộn protocol eval giữa baseline và checkpoint, nhưng chỉ generate base một lần.
