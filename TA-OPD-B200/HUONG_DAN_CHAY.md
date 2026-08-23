@@ -38,6 +38,13 @@ Không đặt `MAX_STEPS` (hoặc để `-1`) để dùng toàn bộ epoch/full 
 trên mọi valid response token. Cả ba method dùng cùng vLLM rollout và eval step 0 / mỗi 50 step /
 final. Nếu cần hạ memory, đặt cùng giá trị cho cả ba lệnh.
 
+Fast defaults đã bật sẵn: crop sau EOS, length bucketing, response-only Qwen3 logits,
+`SCORE_MICRO_BATCH_SIZE=8`, vLLM throughput/chunked-prefill/async và joint scoring hai-forward cho
+TA/RAC. Để tận dụng thêm VRAM B200, probe RAC một step bằng
+`MAX_STEPS=1 TRAIN_EVAL_ENABLED=false MICRO_BATCH_SIZE=4`; nếu ổn có thể thử micro-batch 8 hoặc
+scoring micro-batch 16. Sau khi chọn, phải dùng đúng cùng giá trị cho cả ba method. Xem giải thích và
+lệnh đầy đủ trong mục “Fast path không đổi protocol” của `RUN_B200.md`.
+
 ```bash
 BATCH_SIZE=4 MICRO_BATCH_SIZE=1 NUM_RESPONSES=4 MAX_RESPONSE_LENGTH=4096 \
   RUN_NAME="$OPD_RUN_NAME" CUDA_VISIBLE_DEVICES=0 bash scripts/train_opd_b200.sh

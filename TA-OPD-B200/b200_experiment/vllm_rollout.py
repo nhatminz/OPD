@@ -159,6 +159,18 @@ class VLLMRolloutEngine:
         ]
         if bool(self.settings.get("enable_prefix_caching", True)):
             command.append("--enable-prefix-caching")
+        if bool(self.settings.get("enable_chunked_prefill", True)):
+            command.append("--enable-chunked-prefill")
+        if bool(self.settings.get("async_scheduling", True)):
+            command.append("--async-scheduling")
+        performance_mode = self.settings.get("performance_mode", "throughput")
+        if performance_mode not in (None, ""):
+            command.extend(("--performance-mode", str(performance_mode)))
+        max_num_batched_tokens = self.settings.get("max_num_batched_tokens")
+        if max_num_batched_tokens is not None:
+            command.extend(
+                ("--max-num-batched-tokens", str(int(max_num_batched_tokens)))
+            )
         return command
 
     def _server_environment(self) -> dict[str, str]:
@@ -321,6 +333,7 @@ class VLLMRolloutEngine:
         top_p: float,
         eos_token_ids: list[int],
         seed: int,
+        return_log_probs: bool,
     ) -> tuple[int, list[int], list[float] | None]:
         payload = {
             "model": self.served_model_name,
@@ -332,8 +345,9 @@ class VLLMRolloutEngine:
             "stop_token_ids": eos_token_ids,
             "return_token_ids": True,
             "skip_special_tokens": False,
-            "logprobs": 1,
         }
+        if return_log_probs:
+            payload["logprobs"] = 1
         response = requests.post(
             f"{self.base_url}/v1/completions",
             json=payload,
@@ -392,6 +406,9 @@ class VLLMRolloutEngine:
         workers = min(
             len(prompts), int(self.settings.get("max_concurrent_requests", 128))
         )
+        return_log_probs = bool(
+            self.settings.get("logprob_sanity", {}).get("enabled", False)
+        )
         try:
             with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
                 futures = [
@@ -404,6 +421,7 @@ class VLLMRolloutEngine:
                         top_p=top_p,
                         eos_token_ids=eos_ids,
                         seed=seed + int(sample_seed_offset),
+                        return_log_probs=return_log_probs,
                     )
                     for index, prompt in enumerate(prompts)
                 ]

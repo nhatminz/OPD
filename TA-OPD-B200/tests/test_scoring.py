@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import torch
 
-from b200_experiment.scoring import RolloutBatch, score_original_rollout
+from b200_experiment.scoring import (
+    RolloutBatch,
+    score_original_rollout,
+    score_student_teacher_rollout,
+)
 
 
 class _FakeModel:
@@ -23,7 +27,192 @@ class _FakeModel:
         )
 
 
+class _RecordingQwenModel(_FakeModel):
+    def __init__(self, logits: torch.Tensor):
+        super().__init__(logits)
+        self.config = SimpleNamespace(model_type="qwen3")
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        input_ids = kwargs["input_ids"]
+        rows = input_ids[:, 0].long() - 1
+        logits = self.logits.index_select(0, rows)[:, : input_ids.shape[1]]
+        logits_to_keep = kwargs.get("logits_to_keep")
+        self.calls.append((input_ids.shape[0], input_ids.shape[1], logits_to_keep))
+        if logits_to_keep is not None:
+            logits = logits[:, -int(logits_to_keep) :]
+        return SimpleNamespace(logits=logits, past_key_values=None)
+
+
 class ScoringTests(unittest.TestCase):
+    def test_joint_bidirectional_scoring_matches_three_independent_forwards(self):
+        torch.manual_seed(23)
+        student_logits = torch.randn(4, 7, 17)
+        teacher_logits = torch.randn(4, 7, 17)
+        rollout = RolloutBatch(
+            input_ids=torch.tensor(
+                [
+                    [1, 10, 11, 5, 0, 0, 0],
+                    [2, 10, 11, 6, 7, 8, 9],
+                    [3, 10, 11, 4, 5, 0, 0],
+                    [4, 10, 11, 3, 4, 5, 0],
+                ]
+            ),
+            attention_mask=torch.tensor(
+                [
+                    [1, 1, 1, 1, 0, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 1],
+                    [1, 1, 1, 1, 1, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 0],
+                ]
+            ),
+            response_ids=torch.tensor(
+                [[5, 0, 0, 0], [6, 7, 8, 9], [4, 5, 0, 0], [3, 4, 5, 0]]
+            ),
+            valid_mask=torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, True, True],
+                    [True, True, False, False],
+                    [True, True, True, False],
+                ]
+            ),
+            rollout_log_probs=torch.zeros(4, 4),
+            prompt_width=3,
+        )
+        student_temperature, teacher_temperature = 0.8, 1.2
+        independent_student = score_original_rollout(
+            _RecordingQwenModel(student_logits),
+            rollout,
+            retain_response_logits=False,
+            top_k=5,
+            temperature=student_temperature,
+            micro_batch_size=2,
+        )
+        independent_teacher = score_original_rollout(
+            _RecordingQwenModel(teacher_logits),
+            rollout,
+            retain_response_logits=False,
+            top_k=5,
+            candidate_ids=independent_student.top_k_ids,
+            temperature=teacher_temperature,
+            micro_batch_size=2,
+        )
+        independent_cross = score_original_rollout(
+            _RecordingQwenModel(student_logits),
+            rollout,
+            retain_response_logits=False,
+            candidate_ids=independent_teacher.top_k_ids,
+            temperature=student_temperature,
+            micro_batch_size=2,
+        )
+        joint_student, joint_teacher = score_student_teacher_rollout(
+            _RecordingQwenModel(student_logits),
+            _RecordingQwenModel(teacher_logits),
+            rollout,
+            top_k=5,
+            student_temperature=student_temperature,
+            teacher_temperature=teacher_temperature,
+            micro_batch_size=2,
+        )
+
+        valid = rollout.valid_mask
+        self.assertTrue(
+            torch.equal(joint_student.top_k_ids[valid], independent_student.top_k_ids[valid])
+        )
+        self.assertTrue(
+            torch.equal(joint_teacher.top_k_ids[valid], independent_teacher.top_k_ids[valid])
+        )
+        for actual, expected in (
+            (joint_student.sampled_log_probs, independent_student.sampled_log_probs),
+            (joint_student.top_k_log_probs, independent_student.top_k_log_probs),
+            (
+                joint_student.candidate_log_probs,
+                independent_cross.candidate_log_probs,
+            ),
+            (joint_teacher.sampled_log_probs, independent_teacher.sampled_log_probs),
+            (joint_teacher.top_k_log_probs, independent_teacher.top_k_log_probs),
+            (
+                joint_teacher.candidate_log_probs,
+                independent_teacher.candidate_log_probs,
+            ),
+        ):
+            self.assertTrue(torch.allclose(actual[valid], expected[valid], atol=1e-6))
+
+    def test_length_bucketing_trims_padding_and_keeps_valid_scores_exact(self):
+        torch.manual_seed(17)
+        logits = torch.randn(4, 7, 13)
+        rollout = RolloutBatch(
+            input_ids=torch.tensor(
+                [
+                    [1, 10, 11, 5, 0, 0, 0],
+                    [2, 10, 11, 6, 7, 8, 9],
+                    [3, 10, 11, 4, 5, 0, 0],
+                    [4, 10, 11, 3, 4, 5, 0],
+                ]
+            ),
+            attention_mask=torch.tensor(
+                [
+                    [1, 1, 1, 1, 0, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 1],
+                    [1, 1, 1, 1, 1, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 0],
+                ]
+            ),
+            response_ids=torch.tensor(
+                [[5, 0, 0, 0], [6, 7, 8, 9], [4, 5, 0, 0], [3, 4, 5, 0]]
+            ),
+            valid_mask=torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, True, True],
+                    [True, True, False, False],
+                    [True, True, True, False],
+                ]
+            ),
+            rollout_log_probs=torch.zeros(4, 4),
+            prompt_width=3,
+        )
+        optimized_model = _RecordingQwenModel(logits)
+        optimized = score_original_rollout(
+            optimized_model,
+            rollout,
+            retain_response_logits=False,
+            top_k=4,
+            micro_batch_size=2,
+        )
+        reference = score_original_rollout(
+            _RecordingQwenModel(logits),
+            rollout,
+            retain_response_logits=False,
+            top_k=4,
+            micro_batch_size=2,
+            trim_padding=False,
+            length_bucketed=False,
+        )
+
+        # Sorted buckets contain lengths [4,3] then [2,1]. The last sampled
+        # input token and all right padding are omitted as causally irrelevant.
+        self.assertEqual(optimized_model.calls, [(2, 6, 4), (2, 4, 2)])
+        valid = rollout.valid_mask
+        self.assertTrue(
+            torch.allclose(
+                optimized.sampled_log_probs[valid],
+                reference.sampled_log_probs[valid],
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(
+            torch.equal(optimized.top_k_ids[valid], reference.top_k_ids[valid])
+        )
+        self.assertTrue(
+            torch.allclose(
+                optimized.top_k_log_probs[valid],
+                reference.top_k_log_probs[valid],
+                atol=1e-6,
+            )
+        )
+
     def test_pure_opd_scores_topk_without_retaining_full_logits(self):
         torch.manual_seed(5)
         logits = torch.randn(2, 5, 11)

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -36,6 +36,42 @@ def _config(max_model_len: int = 1024):
 
 
 class VLLMRolloutTests(unittest.TestCase):
+    def test_rollout_requests_log_probs_only_for_enabled_sanity_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(_config(), Path(temporary))
+            response = MagicMock()
+            response.json.return_value = {
+                "choices": [{"token_ids": [31], "logprobs": None}]
+            }
+            with patch(
+                "b200_experiment.vllm_rollout.requests.post", return_value=response
+            ) as post:
+                engine._generate_one(
+                    0,
+                    [11, 12],
+                    max_new_tokens=2,
+                    temperature=1.0,
+                    top_p=1.0,
+                    eos_token_ids=[2],
+                    seed=42,
+                    return_log_probs=False,
+                )
+                without_sanity = post.call_args.kwargs["json"]
+                engine._generate_one(
+                    0,
+                    [11, 12],
+                    max_new_tokens=2,
+                    temperature=1.0,
+                    top_p=1.0,
+                    eos_token_ids=[2],
+                    seed=42,
+                    return_log_probs=True,
+                )
+                with_sanity = post.call_args.kwargs["json"]
+            engine.close()
+        self.assertNotIn("logprobs", without_sanity)
+        self.assertEqual(with_sanity["logprobs"], 1)
+
     def test_each_torchrun_worker_isolates_its_vllm_child_gpu(self):
         with tempfile.TemporaryDirectory() as temporary:
             engine = VLLMRolloutEngine(
@@ -120,6 +156,9 @@ class VLLMRolloutTests(unittest.TestCase):
         self.assertIn("--enable-sleep-mode", command)
         self.assertIn("--enforce-eager", command)
         self.assertIn("--enable-prefix-caching", command)
+        self.assertIn("--enable-chunked-prefill", command)
+        self.assertIn("--async-scheduling", command)
+        self.assertIn("--performance-mode throughput", joined)
         self.assertIn("--gpu-memory-utilization 0.25", joined)
 
     def test_server_rejects_context_smaller_than_prompt_plus_response(self):

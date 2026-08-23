@@ -68,6 +68,8 @@ from .scoring import (
     cuda_sync,
     generate_on_policy,
     score_original_rollout,
+    score_student_teacher_rollout,
+    supports_response_only_logits,
 )
 from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
 from .selectors import OPDSelector, RACSelector, TASelector, top_budget_mask
@@ -361,6 +363,8 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "student_teacher_topk_divergence",
         "throughput_tokens_per_sec",
         "rollout_time",
+        "total_scoring_time_sec",
+        "joint_student_teacher_scoring_time",
         "teacher_score_time_sec",
         "student_cross_topk_scoring_time",
         "ta_local_score_time_sec",
@@ -664,10 +668,13 @@ def _opd_train_step(
     unwrap_model(model).config.use_cache = False
     forward_seconds = backward_seconds = optimizer_seconds = loss_value = 0.0
     base_loss_sum = 0.0
-    begins = list(range(0, local_batch_size, micro_batch))
-    for chunk_index, begin in enumerate(begins):
-        end = min(begin + micro_batch, local_batch_size)
-        synchronize = chunk_index == len(begins) - 1
+    response_lengths = rollout.valid_mask.long().sum(dim=-1)
+    order = torch.arange(local_batch_size, device=rollout.input_ids.device)
+    if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
+        order = torch.argsort(response_lengths, descending=True, stable=True)
+    micro_batches = list(order.split(micro_batch))
+    for chunk_index, indices in enumerate(micro_batches):
+        synchronize = chunk_index == len(micro_batches) - 1
         sync_context = (
             nullcontext()
             if synchronize or not isinstance(model, DistributedDataParallel)
@@ -676,26 +683,51 @@ def _opd_train_step(
         with sync_context:
             cuda_sync(device)
             started = time.perf_counter()
-            output = model(
-                input_ids=rollout.input_ids[begin:end],
-                attention_mask=rollout.attention_mask[begin:end],
-                use_cache=False,
-                return_dict=True,
+            local_width = int(response_lengths.index_select(0, indices).max().item())
+            start = rollout.prompt_width - 1
+            input_stop = start + local_width
+            input_ids = rollout.input_ids.index_select(0, indices)[:, :input_stop]
+            attention_mask = rollout.attention_mask.index_select(0, indices)[
+                :, :input_stop
+            ]
+            forward_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "use_cache": False,
+                "return_dict": True,
+            }
+            response_only_logits = supports_response_only_logits(model)
+            if response_only_logits:
+                forward_kwargs["logits_to_keep"] = local_width
+            output = model(**forward_kwargs)
+            logits = (
+                output.logits[:, -local_width:]
+                if response_only_logits
+                else output.logits[:, start : start + local_width]
             )
-            width, start = rollout.response_ids.shape[1], rollout.prompt_width - 1
-            logits = output.logits[:, start : start + width]
+            candidate_ids = opd_reference.candidate_ids.index_select(0, indices)[
+                :, :local_width
+            ]
             current = gather_candidate_log_probs(
                 logits,
-                opd_reference.candidate_ids[begin:end],
+                candidate_ids,
                 temperature=float(config["rollout"].get("temperature", 1.0)),
                 chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
             )
             chunk_reference = TopKOPDReference(
-                candidate_ids=opd_reference.candidate_ids[begin:end],
-                old_student_log_probs=opd_reference.old_student_log_probs[begin:end],
-                teacher_log_probs=opd_reference.teacher_log_probs[begin:end],
-                student_weights=opd_reference.student_weights[begin:end],
-                advantages=opd_reference.advantages[begin:end],
+                candidate_ids=candidate_ids,
+                old_student_log_probs=opd_reference.old_student_log_probs.index_select(
+                    0, indices
+                )[:, :local_width],
+                teacher_log_probs=opd_reference.teacher_log_probs.index_select(
+                    0, indices
+                )[:, :local_width],
+                student_weights=opd_reference.student_weights.index_select(
+                    0, indices
+                )[:, :local_width],
+                advantages=opd_reference.advantages.index_select(0, indices)[
+                    :, :local_width
+                ],
             )
             per_position_loss = topk_candidate_ppo_loss(
                 current,
@@ -704,10 +736,13 @@ def _opd_train_step(
                 clip_high=eps_high,
                 dual_clip=dual_clip,
             )
-            valid_chunk = rollout.valid_mask[begin:end]
+            valid_chunk = rollout.valid_mask.index_select(0, indices)[:, :local_width]
+            chunk_weights = position_weights.index_select(0, indices)[
+                :, :local_width
+            ]
             local_numerator, _ = weighted_token_sums(
                 per_position_loss,
-                position_weights[begin:end],
+                chunk_weights,
                 valid_chunk,
             )
             base_loss_sum += float(
@@ -727,7 +762,18 @@ def _opd_train_step(
             cuda_sync(device)
             backward_seconds += time.perf_counter() - started
             loss_value += float(loss.detach().item())
-            del output, logits, current, per_position_loss, local_numerator, loss
+            del (
+                output,
+                logits,
+                current,
+                per_position_loss,
+                local_numerator,
+                loss,
+                input_ids,
+                attention_mask,
+                candidate_ids,
+                chunk_weights,
+            )
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         float(training.get("max_grad_norm", 1.0)),
@@ -1183,37 +1229,84 @@ def run_training(
         rollout_hash = _rollout_hash(
             rollout.response_ids, rollout.valid_mask, distributed
         )
-        if distributed.is_main:
-            progress.set_postfix_str("stage=score-student", refresh=True)
-        student_scores, student_base_time = _timed(
-            device,
-            score_original_rollout,
-            student,
-            rollout,
-            False,
-            int(selector_cfg.get("score_chunk_steps", 128)),
-            retain_response_logits=False,
-            top_k=top_k,
-            temperature=float(config["rollout"].get("temperature", 1.0)),
-            micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
+        use_joint_scoring = method in {"ta", "rac"} and bool(
+            selector_cfg.get("joint_cross_scoring", True)
         )
+        joint_scoring_time = 0.0
+        if use_joint_scoring:
+            if distributed.is_main:
+                progress.set_postfix_str(
+                    "stage=score-student-teacher-joint", refresh=True
+                )
+            joint_scores, joint_scoring_time = _timed(
+                device,
+                score_student_teacher_rollout,
+                student,
+                teacher,
+                rollout,
+                score_chunk_steps=int(selector_cfg.get("score_chunk_steps", 128)),
+                top_k=top_k,
+                student_temperature=float(
+                    config["rollout"].get("temperature", 1.0)
+                ),
+                teacher_temperature=float(
+                    opd_config.get("teacher_temperature", 1.0)
+                ),
+                micro_batch_size=int(
+                    selector_cfg.get("score_micro_batch_size", 1)
+                ),
+                trim_padding=bool(selector_cfg.get("trim_padding", True)),
+                length_bucketed=bool(
+                    selector_cfg.get("length_bucketed_scoring", True)
+                ),
+            )
+            student_scores, teacher_scores = joint_scores
+            student_base_time = teacher_base_time = 0.0
+        else:
+            if distributed.is_main:
+                progress.set_postfix_str("stage=score-student", refresh=True)
+            student_scores, student_base_time = _timed(
+                device,
+                score_original_rollout,
+                student,
+                rollout,
+                False,
+                int(selector_cfg.get("score_chunk_steps", 128)),
+                retain_response_logits=False,
+                top_k=top_k,
+                temperature=float(config["rollout"].get("temperature", 1.0)),
+                micro_batch_size=int(
+                    selector_cfg.get("score_micro_batch_size", 1)
+                ),
+                trim_padding=bool(selector_cfg.get("trim_padding", True)),
+                length_bucketed=bool(
+                    selector_cfg.get("length_bucketed_scoring", True)
+                ),
+            )
         if student_scores.top_k_ids is None or student_scores.top_k_log_probs is None:
             raise AssertionError("Student scoring did not produce the common Top-K support")
-        if distributed.is_main:
-            progress.set_postfix_str("stage=score-teacher", refresh=True)
-        teacher_scores, teacher_base_time = _timed(
-            device,
-            score_original_rollout,
-            teacher,
-            rollout,
-            False,
-            int(selector_cfg.get("score_chunk_steps", 128)),
-            retain_response_logits=False,
-            top_k=top_k,
-            candidate_ids=student_scores.top_k_ids,
-            temperature=float(opd_config.get("teacher_temperature", 1.0)),
-            micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
-        )
+        if not use_joint_scoring:
+            if distributed.is_main:
+                progress.set_postfix_str("stage=score-teacher", refresh=True)
+            teacher_scores, teacher_base_time = _timed(
+                device,
+                score_original_rollout,
+                teacher,
+                rollout,
+                False,
+                int(selector_cfg.get("score_chunk_steps", 128)),
+                retain_response_logits=False,
+                top_k=top_k,
+                candidate_ids=student_scores.top_k_ids,
+                temperature=float(opd_config.get("teacher_temperature", 1.0)),
+                micro_batch_size=int(
+                    selector_cfg.get("score_micro_batch_size", 1)
+                ),
+                trim_padding=bool(selector_cfg.get("trim_padding", True)),
+                length_bucketed=bool(
+                    selector_cfg.get("length_bucketed_scoring", True)
+                ),
+            )
         if (
             teacher_scores.candidate_log_probs is None
             or teacher_scores.top_k_ids is None
@@ -1307,18 +1400,27 @@ def run_training(
             ta_time = bellman_scan_time = 0.0
             selector_time = opd_selector_time + opd_gather_time
         else:
-            student_on_teacher, student_cross_score_time = _timed(
-                device,
-                score_original_rollout,
-                student,
-                rollout,
-                False,
-                int(selector_cfg.get("score_chunk_steps", 128)),
-                retain_response_logits=False,
-                candidate_ids=teacher_scores.top_k_ids,
-                temperature=float(config["rollout"].get("temperature", 1.0)),
-                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
-            )
+            if use_joint_scoring:
+                student_on_teacher = student_scores
+            else:
+                student_on_teacher, student_cross_score_time = _timed(
+                    device,
+                    score_original_rollout,
+                    student,
+                    rollout,
+                    False,
+                    int(selector_cfg.get("score_chunk_steps", 128)),
+                    retain_response_logits=False,
+                    candidate_ids=teacher_scores.top_k_ids,
+                    temperature=float(config["rollout"].get("temperature", 1.0)),
+                    micro_batch_size=int(
+                        selector_cfg.get("score_micro_batch_size", 1)
+                    ),
+                    trim_padding=bool(selector_cfg.get("trim_padding", True)),
+                    length_bucketed=bool(
+                        selector_cfg.get("length_bucketed_scoring", True)
+                    ),
+                )
             if student_on_teacher.candidate_log_probs is None:
                 raise AssertionError("Student did not score the teacher Top-K IDs")
             ta_raw, ta_raw_time = _timed(
@@ -1594,9 +1696,22 @@ def run_training(
             "vllm_logprob_sanity": vllm_logprob_sanity,
             "student_base_scoring_time": distributed.max_float(student_base_time),
             "teacher_base_scoring_time": distributed.max_float(teacher_base_time),
-            "teacher_score_time_sec": distributed.max_float(teacher_base_time),
+            # Legacy aggregate column: under joint scoring this represents the
+            # complete two-model common scoring stage, not teacher-only time.
+            "teacher_score_time_sec": distributed.max_float(
+                joint_scoring_time if use_joint_scoring else teacher_base_time
+            ),
             "student_cross_topk_scoring_time": distributed.max_float(
                 student_cross_score_time
+            ),
+            "joint_student_teacher_scoring_time": distributed.max_float(
+                joint_scoring_time
+            ),
+            "total_scoring_time_sec": distributed.max_float(
+                joint_scoring_time
+                + student_base_time
+                + teacher_base_time
+                + student_cross_score_time
             ),
             "ta_diagnostic_time": distributed.max_float(ta_time),
             "ta_local_score_time_sec": distributed.max_float(ta_time),

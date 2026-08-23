@@ -99,6 +99,70 @@ Các OOM knob chính là `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `MAX_RESPONSE_LENGTH`
 `ROLLOUT_VLLM_MAX_MODEL_LEN`. Chưa có peak-memory measurement trên B200 local, nên không coi default
 là fit guarantee.
 
+## Fast path không đổi protocol
+
+Các launcher hiện mặc định bật cùng một nhóm tối ưu chính xác cho cả ba method:
+
+- vLLM rollout persistent, CUDA-IPC weight sync, prefix cache, chunked prefill, async scheduler và
+  throughput scheduling;
+- bỏ LM-head projection ở prompt positions của Qwen3 khi chỉ cần response logits;
+- crop mọi suffix sau EOS và bucket trajectory theo response length ở scoring lẫn backward;
+- scoring inference micro-batch 8 thay vì 1, đồng thời tái sử dụng `logsumexp` khi temperature bằng 1;
+- TA/RAC lấy hai chiều student/teacher Top-K trong hai forward thay vì forward student lần thứ ba;
+- không yêu cầu/serialize vLLM rollout token log-probs khi sync sanity check đang tắt.
+
+Các mục này không đổi prompt, response, seed, sampling, Top-K OPD loss, selector hay optimizer step.
+Có thể kiểm tra resolved config của một run tại `outputs/<run>/<method>/resolved_config.yaml`.
+
+Trên đúng máy B200, speed knob có tác động lớn nhất tiếp theo là tăng trajectory micro-batch. Hãy
+probe RAC (đường có peak memory lớn nhất) một step với cùng full length trước; mỗi probe phải dùng
+tên output mới:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 RUN_NAME=probe_rac_mb4 MAX_STEPS=1 \
+  TRAIN_EVAL_ENABLED=false MICRO_BATCH_SIZE=4 SCORE_MICRO_BATCH_SIZE=8 \
+  bash scripts/train_rac_b200.sh
+```
+
+Nếu peak trong `outputs/probe_rac_mb4/rac_opd/metrics.jsonl` còn xa giới hạn, thử lần lượt
+`MICRO_BATCH_SIZE=8` và `SCORE_MICRO_BATCH_SIZE=16`; nếu OOM thì lùi về `4/8`, rồi `2/8`.
+Micro-batch chỉ chia cùng global weighted objective thành các lượt accumulate; hãy khóa đúng cùng
+hai giá trị đã chọn cho OPD, TA và RAC. Sai khác floating-point ở mức thứ tự cộng gradient vẫn có
+thể xảy ra khi đổi micro-batch, vì vậy không trộn các giá trị giữa ba run trong một comparison.
+
+Nếu có nhiều B200, liệt kê tất cả GPU cho từng controlled run. Launcher tự dùng DDP nhưng giữ nguyên
+global prompt batch 16 và chia shard theo rank:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+# Đây là GLOBAL trajectory micro-batch; 16 / 4 rank = 4 trajectory/GPU.
+export MICRO_BATCH_SIZE=16
+export SCORE_MICRO_BATCH_SIZE=8
+bash scripts/train_all_b200.sh
+```
+
+Full avg@16 trên 560 problem bắt buộc sinh 8.960 response cho mỗi checkpoint khác nhau; không thể
+giảm con số này mà vẫn giữ nguyên metric. Nếu ưu tiên thời gian train không bị chặn bởi eval, có thể
+lưu đúng mỗi 50 step, tắt eval inline, rồi chạy evaluator trên các checkpoint sau train (kết quả
+checkpoint không đổi, nhưng về mặt vận hành đây không còn là eval đồng bộ bên trong train):
+
+```bash
+PAIR=$(date +%Y%m%d_%H%M%S)
+export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
+export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
+export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
+export TRAIN_EVAL_TEMPERATURE=1
+TRAIN_EVAL_ENABLED=false SAVE_INTERVAL=50 bash scripts/train_all_b200.sh
+
+REEVAL_TEMPERATURE="$TRAIN_EVAL_TEMPERATURE" \
+  OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Step 0 vẫn chỉ generate một lần nhờ shared fingerprint cache. Không giảm `NUM_RESPONSES=4`,
+`TRAIN_EVAL_NUM_RESPONSES=16` hoặc `MAX_RESPONSE_LENGTH` nếu mục tiêu là so sánh đúng protocol hiện
+tại; các thay đổi đó nhanh hơn nhưng là thí nghiệm khác.
+
 ## Resume after interruption
 
 Explicit checkpoint:

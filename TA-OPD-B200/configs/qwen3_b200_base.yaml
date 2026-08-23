@@ -54,7 +54,9 @@ rollout:
   vllm:
     # This is a co-located engine reservation, not an evaluation sample limit.
     # It sleeps at level 2 while HF student/teacher scoring and backward run.
-    gpu_memory_utilization: 0.25
+    # B200-specific: enough KV cache for 64 long trajectories without frequent
+    # preemption/recomputation while leaving ample room for the sleeping trainer.
+    gpu_memory_utilization: 0.40
     max_num_seqs: 64
     # 1024 prompt + 7168 generated tokens, plus small serving headroom.
     max_model_len: 9216
@@ -63,10 +65,15 @@ rollout:
     # cannot wake with this safety margin; avoid empty_cache on every step.
     wake_headroom_gib: 2
     enable_prefix_caching: true
+    enable_chunked_prefill: true
+    performance_mode: throughput
+    async_scheduling: true
     startup_timeout: 600
     control_timeout: 600
     generation_timeout: 3600
     # Optional stale-weight diagnostic after CUDA-IPC synchronization.
+    # When disabled, the rollout API also skips serializing token log-probs;
+    # the common HF scoring pass computes every log-prob needed by the loss.
     logprob_sanity:
       enabled: false
       max_tokens_per_rank: 32
@@ -88,7 +95,17 @@ selector:
   top_k: 16
   # Forward rows per scoring call; full-vocabulary logits are consumed and
   # released one micro-batch at a time, never retained for the full rollout.
-  score_micro_batch_size: 1
+  # Inference-only scoring is much lighter than backward; B200 can score eight
+  # length-bucketed trajectories together while training micro-batch stays 1.
+  score_micro_batch_size: 8
+  # Exact compute optimizations: group similar response lengths and never run
+  # student/teacher forwards through right padding after EOS.
+  trim_padding: true
+  length_bucketed_scoring: true
+  # TA/RAC need both directions over the two Top-K supports. Keep the two
+  # model logit views only within one bounded micro-batch and gather both
+  # directions there, eliminating their redundant third student forward.
+  joint_cross_scoring: true
   score_chunk_steps: 128
   ta_vocab_chunk_tokens: 2048
   eps: 1.0e-8
@@ -112,6 +129,9 @@ training:
   resume_allow_config_mismatch: false
   # Micro-batches are accumulated within each rollout before one optimizer step.
   micro_batch_size: 1
+  # When MICRO_BATCH_SIZE > 1, group similar response lengths to reduce padding
+  # in the differentiable forward/backward pass.
+  length_bucketed_micro_batches: true
   grad_accum_steps: auto
   learning_rate: 1.0e-6
   adam_betas: [0.9, 0.95]

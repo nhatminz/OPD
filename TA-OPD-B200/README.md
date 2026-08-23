@@ -111,9 +111,11 @@ trong shared config để audit fairness.
 
 - Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server;
   HF fallback có thể bật bằng `ROLLOUT_BACKEND=hf`.
-- Common core score student Top-K và teacher-on-student IDs một lần. TA/RAC thêm một student
-  cross-score trên teacher Top-K để tính literal union; đây chỉ là selector statistic. Mọi scoring
-  dùng micro-batch và chỉ giữ tensor `[B,T,K]`, không giữ full-vocabulary logits của toàn rollout.
+- Common core score student Top-K và teacher-on-student IDs một lần. Với TA/RAC, student và teacher
+  được forward chung theo từng bounded micro-batch: code lấy luôn student-on-teacher Top-K từ logit
+  view đang có, nên literal union vẫn chính xác nhưng bỏ được forward student thứ ba. OPD không cần
+  thống kê chéo này. Mọi scoring chỉ giữ tensor `[B,T,K]` qua toàn rollout; hai full-vocabulary logit
+  view BF16 chỉ cùng tồn tại bên trong một scoring micro-batch rồi được giải phóng.
   Mỗi prompt được interleave `n=4` lần và gửi thành bốn request có seed riêng; RAC không yêu cầu
   counterfactual generation.
 - TA top-K/KL, actual-token log-prob ratio, global quantiles, RAC weights và loss weighting đều là

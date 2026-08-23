@@ -164,11 +164,14 @@ build_training_args() {
     --set "rollout.max_new_tokens=${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-7168}}}"
     --set "rollout.temperature=${ROLLOUT_TEMPERATURE:-1.0}"
     --set "rollout.top_p=${ROLLOUT_TOP_P:-1.0}"
-    --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+    --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
     --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${trajectory_batch}}"
     --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-9216}"
     --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${trajectory_batch}}"
     --set "rollout.vllm.wake_headroom_gib=${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
+    --set "rollout.vllm.enable_chunked_prefill=${ROLLOUT_VLLM_ENABLE_CHUNKED_PREFILL:-true}"
+    --set "rollout.vllm.performance_mode=${ROLLOUT_VLLM_PERFORMANCE_MODE:-throughput}"
+    --set "rollout.vllm.async_scheduling=${ROLLOUT_VLLM_ASYNC_SCHEDULING:-true}"
     --set "rollout.vllm.logprob_sanity.enabled=${VLLM_LOGPROB_SANITY_ENABLED:-false}"
     --set "rollout.vllm.logprob_sanity.max_tokens_per_rank=${VLLM_LOGPROB_SANITY_TOKENS:-32}"
     --set "rollout.vllm.logprob_sanity.tolerance=${VLLM_LOGPROB_SANITY_TOLERANCE:-0.05}"
@@ -176,7 +179,10 @@ build_training_args() {
     --set "opd.teacher_temperature=${TEACHER_TEMPERATURE:-1.0}"
     --set "token_budget.rho=${TA_RHO:-${RHO:-0.10}}"
     --set "selector.top_k=${TOP_K:-16}"
-    --set "selector.score_micro_batch_size=${SCORE_MICRO_BATCH_SIZE:-1}"
+    --set "selector.score_micro_batch_size=${SCORE_MICRO_BATCH_SIZE:-8}"
+    --set "selector.trim_padding=${TRIM_RESPONSE_PADDING:-true}"
+    --set "selector.length_bucketed_scoring=${LENGTH_BUCKETED_SCORING:-true}"
+    --set "selector.joint_cross_scoring=${JOINT_CROSS_SCORING:-true}"
     --set "selector.score_chunk_steps=${SCORE_CHUNK_STEPS:-128}"
     --set "selector.ta_vocab_chunk_tokens=${TA_VOCAB_CHUNK_TOKENS:-2048}"
     --set "selector.rac_gamma=${RAC_GAMMA:-0.995}"
@@ -212,6 +218,7 @@ build_training_args() {
     COMMON_TRAIN_ARGS+=(
       --set "rollout.batch_size=${prompt_batch}"
       --set "training.micro_batch_size=${MICRO_BATCH_SIZE:-1}"
+      --set "training.length_bucketed_micro_batches=${LENGTH_BUCKETED_MICRO_BATCHES:-true}"
     )
   fi
   if [[ -n "${TRAIN_EVAL_TARGET:-}" ]]; then
