@@ -163,6 +163,34 @@ Step 0 vẫn chỉ generate một lần nhờ shared fingerprint cache. Không g
 `TRAIN_EVAL_NUM_RESPONSES=16` hoặc `MAX_RESPONSE_LENGTH` nếu mục tiêu là so sánh đúng protocol hiện
 tại; các thay đổi đó nhanh hơn nhưng là thí nghiệm khác.
 
+### Accuracy một response thay cho avg@16
+
+Nếu không cần avg@16, đặt `TRAIN_EVAL_NUM_RESPONSES=1`. Mỗi checkpoint chỉ sinh một response cho
+mỗi problem, tức 560 generation trên ba bộ thay vì 8.960. Output, CSV và biểu đồ tự ghi nhãn
+`accuracy`, không còn ghi nhầm `avg@16`:
+
+```bash
+TRAIN_EVAL_NUM_RESPONSES=1 TRAIN_EVAL_TEMPERATURE=1 \
+  bash scripts/train_all_b200.sh
+```
+
+Eval final thủ công dùng `EVAL_NUM_RESPONSES=1`; eval lại và ghi đè mọi checkpoint dùng
+`REEVAL_NUM_RESPONSES=1`:
+
+```bash
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval_all_b200.sh
+
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
+  REEVAL_NUM_RESPONSES=1 REEVAL_TEMPERATURE=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_all_checkpoints_b200.sh
+```
+
+Với temperature 1 đây là sampled accuracy@1 theo seed cố định, không phải greedy decoding. Chế độ
+n=1 nhanh hơn nhiều nhưng có variance lớn hơn n=16; phải dùng cùng n/temperature/top-p/seed cho cả
+ba method.
+
 ## Resume after interruption
 
 Explicit checkpoint:

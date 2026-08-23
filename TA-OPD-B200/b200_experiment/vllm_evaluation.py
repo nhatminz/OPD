@@ -12,7 +12,12 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from .config import load_config
-from .evaluation import BENCHMARK_ORDER, _grade, load_benchmark
+from .evaluation import (
+    BENCHMARK_ORDER,
+    _grade,
+    evaluation_metric_name,
+    load_benchmark,
+)
 
 
 def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
@@ -74,8 +79,9 @@ def evaluate_vllm_suite(
     temperature = float(runtime_settings.get("temperature", 0.7))
     top_p = float(runtime_settings.get("top_p", 0.95))
     samples_per_problem = int(runtime_settings.get("num_responses", 16))
+    metric_name = evaluation_metric_name(samples_per_problem)
     if temperature <= 0:
-        raise ValueError("avg@16 evaluation requires positive temperature")
+        raise ValueError("Sampled evaluation requires positive temperature")
     if not 0.0 < top_p <= 1.0:
         raise ValueError("Evaluation top_p must be in (0, 1]")
     if samples_per_problem <= 0:
@@ -157,7 +163,7 @@ def evaluate_vllm_suite(
             "temperature": temperature,
             "top_p": top_p,
             "num_responses": samples_per_problem,
-            "metric": f"avg@{samples_per_problem}",
+            "metric": metric_name,
             **{key: value for key, value in engine_kwargs.items() if key != "model"},
         },
     }
@@ -212,23 +218,25 @@ def evaluate_vllm_suite(
                     + "\n"
                 )
                 grade_progress.set_postfix_str(
-                    f"{benchmark} avg@{samples_per_problem}="
+                    f"{benchmark} {metric_name}="
                     f"{correct / max(graded, 1):.3f}",
                     refresh=False,
                 )
                 grade_progress.update(1)
         avg_at_n = problem_score_sum / max(problems, 1)
-        suite["benchmarks"][benchmark] = {
+        benchmark_result = {
             "correct": correct,
             "total": graded,
             "problems": len(records),
             "samples_per_problem": samples_per_problem,
-            "avg_at_16": avg_at_n,
-            # Compatibility alias consumed by existing plotting/aggregation.
+            "avg_at_n": avg_at_n,
             "accuracy": avg_at_n,
             "predictions": str(prediction_path),
             "schema": schema,
         }
+        if samples_per_problem == 16:
+            benchmark_result["avg_at_16"] = avg_at_n
+        suite["benchmarks"][benchmark] = benchmark_result
     grade_progress.close()
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:

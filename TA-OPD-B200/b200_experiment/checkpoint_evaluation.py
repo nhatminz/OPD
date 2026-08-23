@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_runtime_paths
+from .evaluation import evaluation_metric_name
 from .evaluation_cache import evaluate_or_reuse_base
 
 
@@ -216,9 +217,11 @@ def _write_history_atomically(
         "correct",
         "total",
         "accuracy",
+        "avg_at_n",
         "avg_at_16",
         "problems",
         "samples_per_problem",
+        "metric",
         "evaluation_time_sec",
     )
     with metrics_temp.open("w", newline="", encoding="utf-8") as handle:
@@ -455,6 +458,12 @@ def _reevaluate_method(
             if staged.exists():
                 shutil.rmtree(staged)
 
+        samples_per_problem = int(settings["num_responses"])
+        metric_name = str(
+            suite.get("parameters", {}).get(
+                "metric", evaluation_metric_name(samples_per_problem)
+            )
+        )
         history_entry = {
             "step": target.step,
             "max_steps": max_steps,
@@ -468,9 +477,17 @@ def _reevaluate_method(
                     "correct": result["correct"],
                     "total": result["total"],
                     "accuracy": result["accuracy"],
-                    "avg_at_16": result.get("avg_at_16", result["accuracy"]),
+                    "avg_at_n": result.get("avg_at_n", result["accuracy"]),
+                    **(
+                        {"avg_at_16": result["avg_at_16"]}
+                        if "avg_at_16" in result
+                        else {}
+                    ),
                     "problems": result.get("problems"),
-                    "samples_per_problem": result.get("samples_per_problem", 16),
+                    "samples_per_problem": result.get(
+                        "samples_per_problem", samples_per_problem
+                    ),
+                    "metric": metric_name,
                 }
                 for name, result in suite["benchmarks"].items()
             },
@@ -506,7 +523,7 @@ def _reevaluate_method(
         "temperature": settings["temperature"],
         "top_p": settings["top_p"],
         "num_responses": settings["num_responses"],
-        "metric": "avg@16",
+        "metric": evaluation_metric_name(settings["num_responses"]),
         "backend": "vllm",
         "full_benchmarks": list(BENCHMARK_ORDER),
         "history": str((run_output / "eval_history.jsonl").resolve()),

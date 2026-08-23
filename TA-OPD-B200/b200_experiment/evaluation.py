@@ -18,6 +18,13 @@ transformers_logging.disable_progress_bar()
 
 BENCHMARK_ORDER = ("MATH-500", "AIME24", "AIME25")
 MODEL_ORDER = ("Base", "OPD", "TA-OPD", "RAC")
+
+
+def evaluation_metric_name(samples_per_problem: int) -> str:
+    samples = int(samples_per_problem)
+    if samples <= 0:
+        raise ValueError("Evaluation samples per problem must be positive")
+    return "accuracy" if samples == 1 else f"avg@{samples}"
 QUESTION_ALIASES = ("problem", "question", "prompt", "input", "query")
 ANSWER_ALIASES = (
     "answer",
@@ -241,9 +248,10 @@ def evaluate_loaded_suite(
     temperature = float(evaluation.get("temperature", 0.7))
     top_p = float(evaluation.get("top_p", 0.95))
     samples_per_problem = int(evaluation.get("num_responses", 16))
+    metric_name = evaluation_metric_name(samples_per_problem)
     seed = int(evaluation.get("seed", 1234))
     if temperature <= 0:
-        raise ValueError("avg@16 evaluation requires positive temperature")
+        raise ValueError("Sampled evaluation requires positive temperature")
     if not 0.0 < top_p <= 1.0:
         raise ValueError("Evaluation top_p must be in (0, 1]")
     if samples_per_problem <= 0:
@@ -276,7 +284,7 @@ def evaluate_loaded_suite(
             "temperature": temperature,
             "top_p": top_p,
             "num_responses": samples_per_problem,
-            "metric": f"avg@{samples_per_problem}",
+            "metric": metric_name,
             "seed": seed,
         },
     }
@@ -310,7 +318,7 @@ def evaluate_loaded_suite(
             with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
                 for begin in range(0, len(records), batch_size):
                     progress.set_postfix_str(
-                        f"{benchmark} avg@{samples_per_problem}="
+                        f"{benchmark} {metric_name}="
                         f"{correct_generations / max(graded_generations, 1):.3f}"
                     )
                     batch = records[begin : begin + batch_size]
@@ -394,22 +402,24 @@ def evaluate_loaded_suite(
                             + "\n"
                         )
                     progress.set_postfix_str(
-                        f"{benchmark} avg@{samples_per_problem}="
+                        f"{benchmark} {metric_name}="
                         f"{correct_generations / max(graded_generations, 1):.3f}"
                     )
                     progress.update(len(batch))
             avg_at_n = problem_score_sum / max(problems, 1)
-            suite["benchmarks"][benchmark] = {
+            benchmark_result = {
                 "correct": correct_generations,
                 "total": graded_generations,
                 "problems": problems,
                 "samples_per_problem": samples_per_problem,
-                "avg_at_16": avg_at_n,
-                # Compatibility alias consumed by existing plotting/aggregation.
+                "avg_at_n": avg_at_n,
                 "accuracy": avg_at_n,
                 "predictions": str(prediction_path),
                 "schema": schema,
             }
+            if samples_per_problem == 16:
+                benchmark_result["avg_at_16"] = avg_at_n
+            suite["benchmarks"][benchmark] = benchmark_result
     finally:
         progress.close()
         model.config.use_cache = previous_use_cache

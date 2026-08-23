@@ -46,7 +46,12 @@ case "${REEVAL_DRY_RUN:-false}" in
 esac
 
 echo "Re-evaluating every saved OPD, TA-OPD, and RAC checkpoint."
-echo "avg@16: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
+if [[ "${REEVAL_NUM_RESPONSES:-16}" == "1" ]]; then
+  REEVAL_METRIC_LABEL="accuracy"
+else
+  REEVAL_METRIC_LABEL="avg@${REEVAL_NUM_RESPONSES:-16}"
+fi
+echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."
 else

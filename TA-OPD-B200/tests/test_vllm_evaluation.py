@@ -46,6 +46,48 @@ class _LLM:
 
 
 class VllmEvaluationTests(unittest.TestCase):
+    def test_one_response_reports_accuracy_without_avg16_label(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            benchmark_path = root / "math.jsonl"
+            benchmark_path.write_text(
+                json.dumps({"problem": "1?", "answer": "1"}) + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "models": {"dtype": "bfloat16"},
+                "data": {"chat_template_kwargs": {}},
+                "evaluation": {
+                    "benchmarks": {"MATH-500": {"path": str(benchmark_path)}}
+                },
+            }
+            settings = {
+                "max_new_tokens": 8,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "num_responses": 1,
+                "benchmark_names": ["MATH-500"],
+                "vllm": {"gpu_memory_utilization": 0.4},
+            }
+            fake_vllm = types.SimpleNamespace(LLM=_LLM, SamplingParams=_SamplingParams)
+            _LLM.instances.clear()
+            with (
+                patch.dict(sys.modules, {"vllm": fake_vllm}),
+                patch(
+                    "b200_experiment.vllm_evaluation.AutoTokenizer.from_pretrained",
+                    return_value=_Tokenizer(),
+                ),
+            ):
+                suite = evaluate_vllm_suite(
+                    "student", root, config, root / "results", settings
+                )
+
+            result = suite["benchmarks"]["MATH-500"]
+            self.assertEqual(suite["parameters"]["metric"], "accuracy")
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(result["avg_at_n"], 1.0)
+            self.assertNotIn("avg_at_16", result)
+
     def test_auto_memory_uses_all_free_vram_except_headroom(self):
         gib = 2**30
         with (

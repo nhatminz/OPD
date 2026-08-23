@@ -126,6 +126,11 @@ Ba bộ có tổng cộng 560 problem; `n=16` nên vLLM báo 8.960 processed res
 generate một lần rồi dùng cùng artifact đã kiểm tra fingerprint cho OPD/TA-OPD/RAC. Những step
 sau vẫn phải generate riêng vì weights của ba method đã khác nhau.
 
+Nếu chỉ cần một kết quả cho mỗi problem, thêm
+`TRAIN_EVAL_NUM_RESPONSES=1 TRAIN_EVAL_TEMPERATURE=1` khi train. Khi đó mỗi checkpoint chỉ có 560
+generation và metric/biểu đồ được ghi đúng là `accuracy`. Eval final dùng
+`EVAL_NUM_RESPONSES=1`; re-eval checkpoint dùng `REEVAL_NUM_RESPONSES=1`.
+
 Eval lại toàn bộ checkpoint đã lưu với vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, metric
 `avg@16`, đồng thời ghi đè lịch sử/file eval cũ của OPD, TA-OPD và RAC:
 

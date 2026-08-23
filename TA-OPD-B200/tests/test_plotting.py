@@ -10,6 +10,28 @@ from b200_experiment.plotting import plot_results, plot_training_progress
 
 
 class PlottingTests(unittest.TestCase):
+    def test_single_response_history_is_labeled_accuracy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "opd"
+            self._write_training_output(output, 0.25)
+            history_path = output / "eval_history.jsonl"
+            rows = [json.loads(line) for line in history_path.read_text().splitlines()]
+            for row in rows:
+                row["parameters"] = {"metric": "accuracy", "num_responses": 1}
+                for result in row["benchmarks"].values():
+                    result["samples_per_problem"] = 1
+            history_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+            paths = plot_training_progress(
+                root / "results", opd_output=output, methods=["opd"]
+            )
+
+            self.assertEqual(paths["metric"], "accuracy")
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+
     @staticmethod
     def _write_training_output(output: Path, accuracy: float) -> None:
         output.mkdir()

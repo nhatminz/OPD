@@ -11,7 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .evaluation import BENCHMARK_ORDER, MODEL_ORDER
+from .evaluation import BENCHMARK_ORDER, MODEL_ORDER, evaluation_metric_name
 
 
 _PROGRESS_METHOD_ALIASES = {
@@ -121,6 +121,32 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
                 f"accuracy for: {', '.join(missing)}"
             )
     return rows
+
+
+def _history_metric_name(histories: dict[str, list[dict]]) -> str:
+    """Require one evaluation protocol and return its display metric."""
+    metrics = set()
+    for rows in histories.values():
+        for row in rows:
+            configured = row.get("parameters", {}).get("metric")
+            if configured:
+                metrics.add(str(configured))
+                continue
+            samples = {
+                int(result.get("samples_per_problem", 16))
+                for result in row["benchmarks"].values()
+            }
+            if len(samples) != 1:
+                raise ValueError(
+                    f"Evaluation step {row.get('step')} mixes response counts: {samples}"
+                )
+            metrics.add(evaluation_metric_name(samples.pop()))
+    if len(metrics) != 1:
+        raise ValueError(
+            "Cannot compare histories generated with different evaluation metrics: "
+            f"{sorted(metrics)}"
+        )
+    return metrics.pop()
 
 
 def _moving_average(values: list[float], window: int) -> np.ndarray:
@@ -280,7 +306,7 @@ def _plot_token_score_distributions(
 
 
 def _plot_single_method_accuracy(
-    plots_dir: Path, method: str, rows: list[dict]
+    plots_dir: Path, method: str, rows: list[dict], metric_name: str
 ) -> Path:
     spec = _PROGRESS_METHODS[method]
     colors = {
@@ -308,9 +334,9 @@ def _plot_single_method_accuracy(
             label=benchmark,
         )
     axis.set_xlabel("Optimizer step")
-    axis.set_ylabel("avg@16")
+    axis.set_ylabel(metric_name)
     axis.set_ylim(0.0, 1.05)
-    axis.set_title(f"{spec['label']} evaluation avg@16 during training")
+    axis.set_title(f"{spec['label']} evaluation {metric_name} during training")
     axis.grid(alpha=0.25)
     axis.legend(title="Dataset")
     fig.tight_layout()
@@ -377,7 +403,7 @@ def plot_training_progress(
     opd_output: str | Path | None = None,
     methods: list[str] | tuple[str, ...] | None = None,
 ):
-    """Plot eval avg@16 for any one, two, or all three training methods."""
+    """Plot the configured evaluation metric for one, two, or three methods."""
     results_dir = Path(results_dir).resolve()
     plots_dir = _plots_dir or _plot_directory(results_dir, plot_name)
     selected_methods = _normalize_progress_methods(method, methods)
@@ -386,6 +412,7 @@ def plot_training_progress(
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
         for item in selected_methods
     }
+    metric_name = _history_metric_name(histories)
 
     base_accuracy: dict[str, float] = {}
     for benchmark in BENCHMARK_ORDER:
@@ -405,13 +432,16 @@ def plot_training_progress(
     if len(selected_methods) == 1:
         selected_method = selected_methods[0]
         rows = next(iter(histories.values()))
-        progress_path = _plot_single_method_accuracy(plots_dir, selected_method, rows)
+        progress_path = _plot_single_method_accuracy(
+            plots_dir, selected_method, rows, metric_name
+        )
         prefix = f"{_PROGRESS_METHODS[selected_method]['slug']}_"
         history_csv, history_json = _write_training_history(
             results_dir, histories, base_accuracy, filename_prefix=prefix
         )
         return {
             "method": _PROGRESS_METHODS[selected_method]["label"],
+            "metric": metric_name,
             "accuracy_over_steps": str(progress_path),
             "history_csv": str(history_csv),
             "history_json": str(history_json),
@@ -463,7 +493,7 @@ def plot_training_progress(
         axis.set_xlabel("Optimizer step")
         axis.set_ylim(0.0, 1.05)
         axis.grid(alpha=0.25)
-    axes[0].set_ylabel("avg@16")
+    axes[0].set_ylabel(metric_name)
     handles, labels = axes[-1].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -475,7 +505,9 @@ def plot_training_progress(
     compared_names = ", ".join(
         _PROGRESS_METHODS[item]["label"] for item in selected_methods
     )
-    fig.suptitle(f"Evaluation avg@16 during {compared_names} training", y=1.02)
+    fig.suptitle(
+        f"Evaluation {metric_name} during {compared_names} training", y=1.02
+    )
     fig.tight_layout()
     progress_path = plots_dir / "accuracy_over_steps.png"
     _save_figure(fig, progress_path)
@@ -491,6 +523,7 @@ def plot_training_progress(
     token_plots = _plot_token_score_distributions(plots_dir, selected_outputs)
     return {
         "methods": [_PROGRESS_METHODS[item]["label"] for item in selected_methods],
+        "metric": metric_name,
         "accuracy_over_steps": str(progress_path),
         "loss": str(loss_path),
         "history_csv": str(history_csv),
@@ -525,6 +558,23 @@ def plot_results(
             f"{MODEL_ORDER[1:]}; got {plotted_models}"
         )
 
+    metric_name = "avg@16"
+    comparison_json = results_dir / "comparison.json"
+    if comparison_json.is_file():
+        comparison_payload = json.loads(comparison_json.read_text(encoding="utf-8"))
+        configured_metrics = {
+            str(detail.get("parameters", {}).get("metric"))
+            for detail in comparison_payload.get("details", {}).values()
+            if detail.get("parameters", {}).get("metric")
+        }
+        if len(configured_metrics) > 1:
+            raise ValueError(
+                "Cannot plot final evaluations with different metrics: "
+                f"{sorted(configured_metrics)}"
+            )
+        if configured_metrics:
+            metric_name = configured_metrics.pop()
+
     x = np.arange(len(BENCHMARK_ORDER))
     width = min(0.8 / len(plotted_models), 0.24)
     fig, axis = plt.subplots(figsize=(9, 5.5))
@@ -537,7 +587,7 @@ def plot_results(
         )
     axis.set_xticks(x, BENCHMARK_ORDER)
     axis.set_ylim(0.0, 1.08)
-    axis.set_ylabel("avg@16")
+    axis.set_ylabel(metric_name)
     axis.set_title("Qwen3-1.7B: " + " vs ".join(plotted_models))
     axis.grid(axis="y", alpha=0.25)
     axis.legend()
@@ -553,7 +603,11 @@ def plot_results(
     if opd_output is not None:
         training_outputs = {"opd": opd_output, **training_outputs}
     loss_path = _plot_loss_comparison(plots_dir, training_outputs, smoothing_window)
-    result = {"accuracy": str(accuracy_path), "loss": str(loss_path)}
+    result = {
+        "metric": metric_name,
+        "accuracy": str(accuracy_path),
+        "loss": str(loss_path),
+    }
     opd_history = (
         Path(opd_output).resolve() / "eval_history.jsonl"
         if opd_output is not None

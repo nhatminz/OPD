@@ -37,7 +37,11 @@ from .distributed import (
     unique_free_port,
     unwrap_model,
 )
-from .evaluation import BENCHMARK_ORDER, evaluate_loaded_suite
+from .evaluation import (
+    BENCHMARK_ORDER,
+    evaluate_loaded_suite,
+    evaluation_metric_name,
+)
 from .evaluation_cache import evaluate_or_reuse_base
 from .eval_schedule import (
     should_run_training_evaluation,
@@ -567,6 +571,12 @@ def _run_training_evaluation(
         raise ValueError("training_evaluation.backend must be 'vllm' or 'hf'")
     torch.cuda.empty_cache()
     elapsed = time.perf_counter() - started
+    samples_per_problem = int(runtime_settings["num_responses"])
+    metric_name = str(
+        suite.get("parameters", {}).get(
+            "metric", evaluation_metric_name(samples_per_problem)
+        )
+    )
     history_entry = {
         "step": step,
         "max_steps": max_steps,
@@ -580,9 +590,17 @@ def _run_training_evaluation(
                 "correct": result["correct"],
                 "total": result["total"],
                 "accuracy": result["accuracy"],
-                "avg_at_16": result.get("avg_at_16", result["accuracy"]),
+                "avg_at_n": result.get("avg_at_n", result["accuracy"]),
+                **(
+                    {"avg_at_16": result["avg_at_16"]}
+                    if "avg_at_16" in result
+                    else {}
+                ),
                 "problems": result.get("problems"),
-                "samples_per_problem": result.get("samples_per_problem", 16),
+                "samples_per_problem": result.get(
+                    "samples_per_problem", samples_per_problem
+                ),
+                "metric": metric_name,
             }
             for name, result in suite["benchmarks"].items()
         },
@@ -600,9 +618,11 @@ def _run_training_evaluation(
         "correct",
         "total",
         "accuracy",
+        "avg_at_n",
         "avg_at_16",
         "problems",
         "samples_per_problem",
+        "metric",
         "evaluation_time_sec",
     )
     for benchmark, result in history_entry["benchmarks"].items():
