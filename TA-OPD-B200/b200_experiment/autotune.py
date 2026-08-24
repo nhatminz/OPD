@@ -35,7 +35,7 @@ def _write_generated_config(
             "report": str(report_path),
         },
         "rollout": {"batch_size": selected},
-        "training": {"micro_batch_size": 1},
+        "training": {"micro_batch_size_per_gpu": 1},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -115,7 +115,7 @@ def run_batch_autotune(
                 "--set",
                 "training.save_checkpoints=false",
                 "--set",
-                "training.micro_batch_size=1",
+                "training.micro_batch_size_per_gpu=1",
                 "--set",
                 f"rollout.batch_size={batch_size}",
                 "--set",
@@ -123,7 +123,7 @@ def run_batch_autotune(
                 "--set",
                 "training_evaluation.enabled=false",
                 "--set",
-                "rollout.backend=hf",
+                "rollout.backend=vllm",
             ]
             completed = subprocess.run(command, cwd=repo_root, check=False)
             method_result: dict[str, Any] = {

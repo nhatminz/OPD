@@ -15,14 +15,22 @@ from b200_experiment.evaluation import aggregate_evaluations, load_benchmark
 
 
 class DataEvaluationConfigTests(unittest.TestCase):
+    def test_one_response_keeps_one_independent_trajectory_per_prompt(self):
+        encoded = {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "attention_mask": torch.ones(2, 2, dtype=torch.long),
+        }
+        expanded, indices, response_indices = expand_prompt_batch(encoded, [7, 9], 1)
+        self.assertTrue(torch.equal(expanded["input_ids"], encoded["input_ids"]))
+        self.assertEqual(indices, [7, 9])
+        self.assertEqual(response_indices, [0, 0])
+
     def test_one_prompt_expands_to_four_independent_trajectory_entries(self):
         encoded = {
             "input_ids": torch.tensor([[1, 2, 3]]),
             "attention_mask": torch.ones(1, 3, dtype=torch.long),
         }
-        expanded, indices, response_indices = expand_prompt_batch(
-            encoded, [17], 4
-        )
+        expanded, indices, response_indices = expand_prompt_batch(encoded, [17], 4)
         self.assertEqual(expanded["input_ids"].shape[0], 4)
         self.assertEqual(indices, [17, 17, 17, 17])
         self.assertEqual(response_indices, [0, 1, 2, 3])
@@ -51,6 +59,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
 
             self.assertEqual([row["Method"] for row in rows], list(model_dirs))
             self.assertEqual(rows[1]["MATH-500"], 0.2)
+
     def test_epoch_batches_cover_full_dataset_without_repetition(self):
         batches = [epoch_batch_indices(10, 4, step, 1234) for step in range(3)]
         flattened = [item for batch in batches for item in batch]
@@ -127,10 +136,15 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(base["evaluation"]["num_responses"], 16)
         self.assertIsNone(base["evaluation"]["limit"])
         self.assertEqual(base["rollout"]["backend"], "vllm")
-        self.assertEqual(base["rollout"]["batch_size"], 16)
-        self.assertEqual(base["rollout"]["num_responses"], 4)
+        self.assertEqual(base["distributed"]["strategy"], "fsdp")
+        self.assertEqual(base["distributed"]["fsdp"]["sharding_strategy"], "FULL_SHARD")
+        self.assertTrue(base["distributed"]["fsdp"]["use_orig_params"])
+        self.assertFalse(base["distributed"]["fsdp"]["teacher_cpu_offload"])
+        self.assertEqual(base["rollout"]["batch_size"], 64)
+        self.assertEqual(base["rollout"]["num_responses"], 1)
         self.assertEqual(base["rollout"]["temperature"], 1.0)
-        self.assertEqual(base["training"]["micro_batch_size"], 1)
+        self.assertEqual(base["training"]["micro_batch_size_per_gpu"], 8)
+        self.assertTrue(base["training"]["gradient_checkpointing"])
         self.assertEqual(base["data"]["max_prompt_tokens"], 1024)
         self.assertEqual(base["rollout"]["max_new_tokens"], 7168)
         self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 9216)
@@ -155,6 +169,8 @@ class DataEvaluationConfigTests(unittest.TestCase):
             "token_budget",
             "training",
             "training_evaluation",
+            "distributed",
+            "logging",
         ):
             self.assertEqual(opd[section], ta[section], section)
             self.assertEqual(ta[section], rac[section], section)

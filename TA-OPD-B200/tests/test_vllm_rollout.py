@@ -134,9 +134,7 @@ class VLLMRolloutTests(unittest.TestCase):
             response_log_probs=[[-0.1, -0.2]],
         )
         self.assertTrue(
-            torch.allclose(
-                rollout.rollout_log_probs, torch.tensor([[-0.1, -0.2]])
-            )
+            torch.allclose(rollout.rollout_log_probs, torch.tensor([[-0.1, -0.2]]))
         )
 
     def test_server_command_enables_ipc_dummy_load_and_sleep(self):

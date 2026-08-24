@@ -14,8 +14,14 @@ from typing import Any
 
 import requests
 import torch
+import torch.distributed as dist
 from tqdm.auto import tqdm
 
+from .fsdp import (
+    is_fsdp_model,
+    materialize_full_parameters,
+    validated_hf_named_parameters,
+)
 from .scoring import RolloutBatch
 
 
@@ -286,7 +292,7 @@ class VLLMRolloutEngine:
             self._post("/wake_up", params=[("tags", "kv_cache")])
             self.sleeping = False
 
-    def _sync_weights(self, model) -> None:
+    def _sync_weights(self, model) -> dict[str, float]:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         from vllm.distributed.weight_transfer.ipc_engine import (
             IPCTrainerSendWeightsArgs,
@@ -294,9 +300,37 @@ class VLLMRolloutEngine:
         )
 
         trainer_args = IPCTrainerSendWeightsArgs(mode="http", url=self.base_url)
-        IPCWeightTransferEngine.trainer_send_weights(
-            iterator=model.named_parameters(), trainer_args=trainer_args
-        )
+        if self.world_size > 1:
+            if not dist.is_initialized():
+                raise RuntimeError(
+                    "Distributed vLLM synchronization requires a process group"
+                )
+            dist.barrier()
+        torch.cuda.synchronize()
+        materialize_started = time.perf_counter()
+        with materialize_full_parameters(model) as full_model:
+            torch.cuda.synchronize()
+            materialization_seconds = time.perf_counter() - materialize_started
+            named_parameters = validated_hf_named_parameters(model, full_model)
+            ipc_started = time.perf_counter()
+            IPCWeightTransferEngine.trainer_send_weights(
+                iterator=iter(named_parameters), trainer_args=trainer_args
+            )
+            torch.cuda.synchronize()
+            ipc_seconds = time.perf_counter() - ipc_started
+            # Keep every rank's full tensors alive until all local vLLM servers
+            # have completed their independent CUDA-IPC imports.
+            if self.world_size > 1:
+                dist.barrier()
+        if self.world_size > 1:
+            dist.barrier()
+        return {
+            "full_weight_materialization_time": materialization_seconds
+            if is_fsdp_model(model)
+            else 0.0,
+            "ipc_weight_sync_time": ipc_seconds,
+            "weight_sync_time": materialization_seconds + ipc_seconds,
+        }
 
     def _release_torch_cache_if_needed(self) -> tuple[bool, float]:
         """Return cached blocks only when the colocated engine cannot wake safely."""
@@ -362,7 +396,9 @@ class VLLMRolloutEngine:
             )
         raw_log_probs = (choice.get("logprobs") or {}).get("token_logprobs")
         token_log_probs = None
-        if raw_log_probs is not None and all(item is not None for item in raw_log_probs):
+        if raw_log_probs is not None and all(
+            item is not None for item in raw_log_probs
+        ):
             token_log_probs = [float(item) for item in raw_log_probs]
         return index, [int(token) for token in tokens], token_log_probs
 
@@ -396,7 +432,7 @@ class VLLMRolloutEngine:
         self._wake_weights()
         torch.cuda.synchronize()
         sync_started = time.perf_counter()
-        self._sync_weights(model)
+        weight_sync_metrics = self._sync_weights(model)
         torch.cuda.synchronize()
         sync_seconds = time.perf_counter() - sync_started
         self._wake_kv_cache()
@@ -446,6 +482,9 @@ class VLLMRolloutEngine:
         if any(tokens is None for tokens in responses):
             raise RuntimeError("vLLM did not return every rollout response")
         self.last_metrics = {
+            **weight_sync_metrics,
+            # Include collective barriers and CUDA synchronization in the
+            # public end-to-end value; the two split fields remain diagnostic.
             "weight_sync_time": sync_seconds,
             "generation_time": generate_seconds,
             "sleep_time": sleep_seconds,

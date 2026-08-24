@@ -22,7 +22,7 @@ if batch_autotune_enabled; then
   fi
   "${PYTHON_BIN}" -m b200_experiment.cli autotune-batch "${TUNE_ARGS[@]}"
 else
-  echo "Skipping batch search; fixed prompt BATCH_SIZE=${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}, NUM_RESPONSES=${NUM_RESPONSES:-4}."
+  echo "Skipping batch search; fixed prompt BATCH_SIZE=${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}, NUM_RESPONSES=${NUM_RESPONSES:-1}."
 fi
 require_b200_validation
 

@@ -55,13 +55,22 @@ def main() -> int:
                 "pyarrow",
                 "matplotlib",
                 "math-verify",
+                "tensorboard",
             )
         },
-        "paths": {name: {"path": str(path), "exists": path.exists()} for name, path in paths.items()},
+        "paths": {
+            name: {"path": str(path), "exists": path.exists()}
+            for name, path in paths.items()
+        },
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
     missing = [name for name, detail in report["paths"].items() if not detail["exists"]]
-    if not report["cuda_available"] or report["packages"]["vllm"] == "missing" or missing:
+    if (
+        not report["cuda_available"]
+        or report["packages"]["vllm"] == "missing"
+        or report["packages"]["tensorboard"] == "missing"
+        or missing
+    ):
         print(
             "WARNING: environment is not ready for the full B200 run; inspect the report above.",
             file=sys.stderr,

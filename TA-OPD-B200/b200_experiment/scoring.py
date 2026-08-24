@@ -210,7 +210,9 @@ def _reduce_response_logits(
                 - scaled_normalizers.unsqueeze(-1)
             )
     return BaseScores(
-        response_logits=(response_logits.detach().clone() if retain_response_logits else None),
+        response_logits=(
+            response_logits.detach().clone() if retain_response_logits else None
+        ),
         log_normalizers=torch.cat(normalizer_chunks, dim=1),
         scaled_log_normalizers=torch.cat(scaled_normalizer_chunks, dim=1),
         sampled_log_probs=torch.cat(sampled_chunks, dim=1),
@@ -278,7 +280,9 @@ def score_original_rollout(
         raise ValueError("keep_cache is incompatible with scoring micro-batches")
     response_lengths = rollout.valid_mask.long().sum(dim=-1)
     if bool(response_lengths.le(0).any()):
-        raise ValueError("Every rollout trajectory must contain at least one valid token")
+        raise ValueError(
+            "Every rollout trajectory must contain at least one valid token"
+        )
     prefix_mask = torch.arange(width, device=rollout.valid_mask.device).unsqueeze(0)
     prefix_mask = prefix_mask < response_lengths.unsqueeze(1)
     if not torch.equal(prefix_mask, rollout.valid_mask.bool()):
@@ -300,9 +304,7 @@ def score_original_rollout(
         # cannot affect any requested causal logit.
         input_stop = start + local_width if trim_padding and not keep_cache else None
         input_ids = rollout.input_ids.index_select(0, indices)[:, :input_stop]
-        attention_mask = rollout.attention_mask.index_select(0, indices)[
-            :, :input_stop
-        ]
+        attention_mask = rollout.attention_mask.index_select(0, indices)[:, :input_stop]
         response_ids = rollout.response_ids.index_select(0, indices)[:, :local_width]
         forward_kwargs = {
             "input_ids": input_ids,
@@ -311,8 +313,8 @@ def score_original_rollout(
             "use_cache": keep_cache,
             "return_dict": True,
         }
-        response_only_logits = (
-            input_stop is not None and supports_response_only_logits(model)
+        response_only_logits = input_stop is not None and supports_response_only_logits(
+            model
         )
         if response_only_logits:
             forward_kwargs["logits_to_keep"] = local_width
@@ -351,9 +353,7 @@ def score_original_rollout(
             _pad_response_time(local_scores.sampled_log_probs, width)
         )
         if local_scores.top_k_ids is not None:
-            top_id_batches.append(
-                _pad_response_time(local_scores.top_k_ids, width)
-            )
+            top_id_batches.append(_pad_response_time(local_scores.top_k_ids, width))
             top_log_prob_batches.append(
                 _pad_response_time(local_scores.top_k_log_probs, width)
             )
@@ -372,9 +372,7 @@ def score_original_rollout(
 
     def restored(values: list[torch.Tensor]) -> torch.Tensor | None:
         return (
-            torch.cat(values, dim=0).index_select(0, restore_order)
-            if values
-            else None
+            torch.cat(values, dim=0).index_select(0, restore_order) if values else None
         )
 
     return BaseScores(
@@ -427,7 +425,9 @@ def score_student_teacher_rollout(
     )
     response_lengths = rollout.valid_mask.long().sum(dim=-1)
     if bool(response_lengths.le(0).any()):
-        raise ValueError("Every rollout trajectory must contain at least one valid token")
+        raise ValueError(
+            "Every rollout trajectory must contain at least one valid token"
+        )
     prefix_mask = torch.arange(width, device=rollout.valid_mask.device).unsqueeze(0)
     prefix_mask = prefix_mask < response_lengths.unsqueeze(1)
     if not torch.equal(prefix_mask, rollout.valid_mask.bool()):
@@ -454,9 +454,7 @@ def score_student_teacher_rollout(
             local_width = int(response_lengths.index_select(0, indices).max().item())
         input_stop = start + local_width if trim_padding else None
         input_ids = rollout.input_ids.index_select(0, indices)[:, :input_stop]
-        attention_mask = rollout.attention_mask.index_select(0, indices)[
-            :, :input_stop
-        ]
+        attention_mask = rollout.attention_mask.index_select(0, indices)[:, :input_stop]
         response_ids = rollout.response_ids.index_select(0, indices)[:, :local_width]
         common_kwargs = {
             "input_ids": input_ids,
@@ -467,8 +465,8 @@ def score_student_teacher_rollout(
         }
 
         student_kwargs = dict(common_kwargs)
-        student_response_only = input_stop is not None and supports_response_only_logits(
-            student
+        student_response_only = (
+            input_stop is not None and supports_response_only_logits(student)
         )
         if student_response_only:
             student_kwargs["logits_to_keep"] = local_width
@@ -491,8 +489,8 @@ def score_student_teacher_rollout(
             raise AssertionError("Student joint scoring did not produce Top-K IDs")
 
         teacher_kwargs = dict(common_kwargs)
-        teacher_response_only = input_stop is not None and supports_response_only_logits(
-            teacher
+        teacher_response_only = (
+            input_stop is not None and supports_response_only_logits(teacher)
         )
         if teacher_response_only:
             teacher_kwargs["logits_to_keep"] = local_width

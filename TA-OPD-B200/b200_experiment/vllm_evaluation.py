@@ -205,8 +205,7 @@ def evaluate_vllm_suite(
                 with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
                     for row, rendered_prompt, responses in grouped[benchmark]:
                         correctness = [
-                            _grade(response, row["answer"])
-                            for response in responses
+                            _grade(response, row["answer"]) for response in responses
                         ]
                         correct += sum(map(int, correctness))
                         graded += samples_per_problem
@@ -246,8 +245,7 @@ def evaluate_vllm_suite(
                             + "\n"
                         )
                         grade_progress.set_postfix_str(
-                            f"{benchmark} {metric_name}="
-                            f"{correct / max(graded, 1):.3f}",
+                            f"{benchmark} {metric_name}={correct / max(graded, 1):.3f}",
                             refresh=False,
                         )
                         grade_progress.update(1)

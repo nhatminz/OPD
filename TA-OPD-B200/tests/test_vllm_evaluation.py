@@ -97,7 +97,10 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(detailed["model_name"], "student")
             self.assertEqual(detailed["backend"], "vllm")
             self.assertEqual(detailed["benchmark"], "MATH-500")
-            self.assertEqual(detailed["rendered_prompt"], "Solve the problem step by step. End with only the final answer inside \\boxed{}.\n\n1?")
+            self.assertEqual(
+                detailed["rendered_prompt"],
+                "Solve the problem step by step. End with only the final answer inside \\boxed{}.\n\n1?",
+            )
             self.assertEqual(detailed["samples_per_problem"], 1)
             self.assertEqual(detailed["outputs"][0]["response"], "1")
             self.assertTrue(detailed["outputs"][0]["correct"])
@@ -163,14 +166,10 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(len(calls[0][0]), 3)
             self.assertTrue(calls[0][2])
             self.assertEqual(_LLM.instances[0].kwargs["max_num_seqs"], 64)
-            self.assertEqual(
-                _LLM.instances[0].kwargs["max_num_batched_tokens"], 4096
-            )
+            self.assertEqual(_LLM.instances[0].kwargs["max_num_batched_tokens"], 4096)
             self.assertTrue(_LLM.instances[0].kwargs["enable_chunked_prefill"])
             self.assertTrue(_LLM.instances[0].kwargs["async_scheduling"])
-            self.assertEqual(
-                _LLM.instances[0].kwargs["performance_mode"], "throughput"
-            )
+            self.assertEqual(_LLM.instances[0].kwargs["performance_mode"], "throughput")
             self.assertEqual(calls[0][1].kwargs["temperature"], 1.0)
             self.assertEqual(calls[0][1].kwargs["top_p"], 0.95)
             self.assertEqual(calls[0][1].kwargs["n"], 16)

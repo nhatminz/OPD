@@ -165,9 +165,7 @@ def topk_candidate_ppo_loss(
     )
     upper_clipped = torch.maximum(loss_unclipped, loss_clipped)
     dual_clipped = torch.minimum(-advantages * float(dual_clip), upper_clipped)
-    candidate_loss = torch.where(
-        advantages < 0, dual_clipped, upper_clipped
-    )
+    candidate_loss = torch.where(advantages < 0, dual_clipped, upper_clipped)
     return candidate_loss.sum(dim=-1)
 
 
@@ -196,7 +194,10 @@ def topk_overlap_fraction(
     student_ids: torch.Tensor, teacher_ids: torch.Tensor, valid_mask: torch.Tensor
 ) -> torch.Tensor:
     """Mean set-overlap fraction |S_student ∩ S_teacher| / K per position."""
-    if student_ids.shape != teacher_ids.shape or student_ids.shape[:2] != valid_mask.shape:
+    if (
+        student_ids.shape != teacher_ids.shape
+        or student_ids.shape[:2] != valid_mask.shape
+    ):
         raise ValueError("Top-K ID tensors must match each other and valid_mask")
     overlap = (
         student_ids.unsqueeze(-1)

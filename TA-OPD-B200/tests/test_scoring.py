@@ -118,10 +118,14 @@ class ScoringTests(unittest.TestCase):
 
         valid = rollout.valid_mask
         self.assertTrue(
-            torch.equal(joint_student.top_k_ids[valid], independent_student.top_k_ids[valid])
+            torch.equal(
+                joint_student.top_k_ids[valid], independent_student.top_k_ids[valid]
+            )
         )
         self.assertTrue(
-            torch.equal(joint_teacher.top_k_ids[valid], independent_teacher.top_k_ids[valid])
+            torch.equal(
+                joint_teacher.top_k_ids[valid], independent_teacher.top_k_ids[valid]
+            )
         )
         for actual, expected in (
             (joint_student.sampled_log_probs, independent_student.sampled_log_probs),
@@ -241,9 +245,7 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(compact.sampled_log_probs, retained.sampled_log_probs)
         )
-        self.assertTrue(
-            torch.equal(compact.log_normalizers, retained.log_normalizers)
-        )
+        self.assertTrue(torch.equal(compact.log_normalizers, retained.log_normalizers))
         self.assertEqual(compact.top_k_ids.shape, (2, 3, 4))
         expected_log_probs = torch.log_softmax(logits[:, 2:5].float(), dim=-1)
         self.assertTrue(

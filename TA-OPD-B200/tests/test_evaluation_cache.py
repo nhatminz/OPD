@@ -71,9 +71,7 @@ class BaseEvaluationCacheTests(unittest.TestCase):
                             "predictions": str(prediction),
                         }
                     detailed_outputs = destination / "model_outputs_detailed.jsonl.gz"
-                    with gzip.open(
-                        detailed_outputs, "wt", encoding="utf-8"
-                    ) as handle:
+                    with gzip.open(detailed_outputs, "wt", encoding="utf-8") as handle:
                         handle.write('{"response":"2"}\n')
                     suite["detailed_outputs"] = str(detailed_outputs)
                     (destination / "summary.json").write_text(

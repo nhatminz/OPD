@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import tempfile
 import unittest
@@ -13,7 +14,9 @@ from torch.nn.parallel import DistributedDataParallel
 
 from b200_experiment.distributed import (
     DistributedContext,
+    batch_layout,
     contiguous_partition,
+    padded_local_indices,
     unique_free_port,
 )
 from b200_experiment.selectors import TASelector
@@ -32,9 +35,11 @@ class _TinyCausalLM(nn.Module):
         self.embedding = nn.Embedding(11, 5)
         self.output = nn.Linear(5, 11, bias=False)
         self.config = type("Config", (), {"use_cache": False})()
+        self.forward_calls = 0
 
     def forward(self, input_ids, attention_mask, use_cache, return_dict):
         del attention_mask, use_cache, return_dict
+        self.forward_calls += 1
         logits = self.output(self.embedding(input_ids))
         return type("Output", (), {"logits": logits})()
 
@@ -56,16 +61,16 @@ def _tiny_batch(start: int, end: int) -> RolloutBatch:
     )
 
 
-def _tiny_config() -> dict:
+def _tiny_config(micro_batch_size_per_gpu: int = 3) -> dict:
     return {
         "rollout": {"temperature": 1.0},
         "selector": {"score_chunk_steps": 2},
         "training": {
-            "micro_batch_size": 3,
+            "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "ppo_clip_low": 0.2,
             "ppo_clip_high": 0.28,
             "max_grad_norm": 100.0,
-        }
+        },
     }
 
 
@@ -191,6 +196,82 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
 
 
 class DistributedInvariantTests(unittest.TestCase):
+    def test_production_batch_layout_is_explicit(self):
+        layout = batch_layout(64, 1, 2, 8)
+        self.assertEqual(layout.global_prompt_batch_size, 64)
+        self.assertEqual(layout.local_prompt_batch_size, 32)
+        self.assertEqual(layout.global_trajectory_batch_size, 64)
+        self.assertEqual(layout.local_trajectory_batch_size, 32)
+        self.assertEqual(layout.micro_batch_size_per_gpu, 8)
+        self.assertEqual(layout.micro_batches_per_gpu, 4)
+
+    def test_tail_padding_preserves_every_real_sample_exactly_once(self):
+        indices = list(range(5))
+        rank_batches = [padded_local_indices(indices, rank, 2) for rank in range(2)]
+        self.assertEqual([len(batch) for batch, _ in rank_batches], [3, 3])
+        real = [
+            index
+            for (batch, active) in rank_batches
+            for index, is_active in zip(batch, active)
+            if is_active
+        ]
+        self.assertEqual(real, indices)
+        self.assertEqual(
+            sum(not flag for _, flags in rank_batches for flag in flags), 1
+        )
+        singleton = [padded_local_indices([42], rank, 2) for rank in range(2)]
+        self.assertEqual(singleton, [([42], [True]), ([42], [False])])
+
+    def test_microbatch_8_splits_32_local_trajectories_into_four_forwards(self):
+        model = _TinyCausalLM()
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(32)], dtype=torch.long
+        )
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((32, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((32, 2)),
+            prompt_width=2,
+        )
+        reference = _tiny_reference(model, rollout)
+        model.forward_calls = 0
+        _opd_train_step(
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.01),
+            rollout,
+            rollout.valid_mask,
+            reference,
+            _tiny_config(8),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+        )
+        self.assertEqual(model.forward_calls, 4)
+
+    def test_gradient_accumulation_does_not_change_the_objective(self):
+        torch.manual_seed(7)
+        first = _TinyCausalLM()
+        second = copy.deepcopy(first)
+        rollout = _tiny_batch(0, 3)
+        reference = _tiny_reference(first, rollout)
+        for model, micro in ((first, 1), (second, 3)):
+            _opd_train_step(
+                model,
+                torch.optim.SGD(model.parameters(), lr=0.05),
+                rollout,
+                rollout.valid_mask,
+                reference,
+                _tiny_config(micro),
+                torch.device("cpu"),
+                DistributedContext(0, 0, 1, torch.device("cpu")),
+            )
+        self.assertTrue(
+            torch.allclose(
+                _parameters(first), _parameters(second), atol=1e-7, rtol=1e-6
+            )
+        )
+
     def test_full_opd_reduction_is_global_token_mean(self):
         elementwise = torch.tensor([[1.0, 3.0, 99.0], [10.0, 20.0, 30.0]])
         full_valid_mask = torch.tensor(

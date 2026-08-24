@@ -25,6 +25,14 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 `smoke_test_b200.sh` chạy unit tests và preflight, đọc full training/eval schema nhưng không train full.
 Báo cáo nằm ở `results/preflight.json`.
 
+Chạy smoke FSDP thật hai step trên hai GPU trước full run (đổi `METHOD` để kiểm tra từng method):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 METHOD=opd bash scripts/smoke_test_fsdp_2gpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=ta  bash scripts/smoke_test_fsdp_2gpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_2gpu.sh
+```
+
 Có thể chỉ inspect schema/path qua preflight CLI:
 
 ```bash
@@ -44,10 +52,11 @@ export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
 export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
 export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
 
-export CUDA_VISIBLE_DEVICES=0,1,2
-export BATCH_SIZE=16
-export MICRO_BATCH_SIZE=1
-export NUM_RESPONSES=4
+export CUDA_VISIBLE_DEVICES=0,1
+export DISTRIBUTED_STRATEGY=fsdp
+export BATCH_SIZE=64
+export MICRO_BATCH_SIZE_PER_GPU=8
+export NUM_RESPONSES=1
 export LR=1e-6
 export NUM_EPOCHS=1
 export MAX_PROMPT_LENGTH=1024
@@ -74,7 +83,7 @@ eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên
 tài nguyên giữa các run.
 
 Full eval có 560 problem và `n=16`, vì vậy progress của vLLM hiển thị 8.960 generated responses
-(`560 * 16`); đây không phải rollout train `n=4`. Để không lặp lại lượt base tốn thời gian, step 0
+(`560 * 16`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
 được cache theo fingerprint của model, dataset, evaluator và toàn bộ protocol. OPD sinh lần đầu;
 TA-OPD/RAC copy đúng cùng prediction. Một run bị lỗi trước step train đầu tiên cũng tái sử dụng
 `training_eval/step-000000` hợp lệ khi chạy lại. Có thể tắt bằng
@@ -94,7 +103,7 @@ LR=5e-7 BATCH_SIZE=4 EVAL_INTERVAL=40 \
 RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 ```
 
-Các OOM knob chính là `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `MAX_RESPONSE_LENGTH`,
+Các OOM knob chính là `MICRO_BATCH_SIZE_PER_GPU`, `SCORE_MICRO_BATCH_SIZE`, `MAX_RESPONSE_LENGTH`,
 `ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION`, `ROLLOUT_VLLM_MAX_NUM_SEQS` và
 `ROLLOUT_VLLM_MAX_MODEL_LEN`. Chưa có peak-memory measurement trên B200 local, nên không coi default
 là fit guarantee.
@@ -119,27 +128,48 @@ probe RAC (đường có peak memory lớn nhất) một step với cùng full l
 tên output mới:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 RUN_NAME=probe_rac_mb4 MAX_STEPS=1 \
-  TRAIN_EVAL_ENABLED=false MICRO_BATCH_SIZE=4 SCORE_MICRO_BATCH_SIZE=8 \
+CUDA_VISIBLE_DEVICES=0,1 RUN_NAME=probe_rac_mb8 MAX_STEPS=1 \
+  TRAIN_EVAL_ENABLED=false BATCH_SIZE=64 NUM_RESPONSES=1 \
+  MICRO_BATCH_SIZE_PER_GPU=8 SCORE_MICRO_BATCH_SIZE=8 \
   bash scripts/train_rac_b200.sh
 ```
 
-Nếu peak trong `outputs/probe_rac_mb4/rac_opd/metrics.jsonl` còn xa giới hạn, thử lần lượt
-`MICRO_BATCH_SIZE=8` và `SCORE_MICRO_BATCH_SIZE=16`; nếu OOM thì lùi về `4/8`, rồi `2/8`.
+Nếu peak trong `outputs/probe_rac_mb8/rac_opd/metrics.jsonl` còn xa giới hạn, thử
+`MICRO_BATCH_SIZE_PER_GPU=16`; nếu OOM thì lùi về `4`. Không đổi global `BATCH_SIZE=64` trong quá
+trình tuning này. Có thể tune `SCORE_MICRO_BATCH_SIZE` riêng sau khi chọn training micro-batch.
 Micro-batch chỉ chia cùng global weighted objective thành các lượt accumulate; hãy khóa đúng cùng
 hai giá trị đã chọn cho OPD, TA và RAC. Sai khác floating-point ở mức thứ tự cộng gradient vẫn có
 thể xảy ra khi đổi micro-batch, vì vậy không trộn các giá trị giữa ba run trong một comparison.
 
-Nếu có nhiều B200, liệt kê tất cả GPU cho từng controlled run. Launcher tự dùng DDP nhưng giữ nguyên
-global prompt batch 16 và chia shard theo rank:
+DDP chỉ còn là regression/debug option rõ ràng:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-# Đây là GLOBAL trajectory micro-batch; 16 / 4 rank = 4 trajectory/GPU.
-export MICRO_BATCH_SIZE=16
-export SCORE_MICRO_BATCH_SIZE=8
-bash scripts/train_all_b200.sh
+DISTRIBUTED_STRATEGY=ddp CUDA_VISIBLE_DEVICES=0,1 \
+  BATCH_SIZE=64 NUM_RESPONSES=1 MICRO_BATCH_SIZE_PER_GPU=8 \
+  bash scripts/train_opd_b200.sh
 ```
+
+## TensorBoard
+
+Rank 0 ghi event vào `outputs/<run>/<method>/tensorboard`. Theo dõi riêng một run:
+
+```bash
+tensorboard --logdir "outputs/$RAC_RUN_NAME/rac_opd/tensorboard" \
+  --bind_all --port 6006
+```
+
+So sánh ba run trong cùng giao diện:
+
+```bash
+tensorboard --logdir_spec \
+  "OPD:outputs/$OPD_RUN_NAME/opd/tensorboard,TA:outputs/$TA_RUN_NAME/ta_opd/tensorboard,RAC:outputs/$RAC_RUN_NAME/rac_opd/tensorboard" \
+  --bind_all --port 6006
+```
+
+Production event chỉ có loss/grad norm/LR, ba OPD diagnostic, response length/EOS, bốn system
+metric; TA thêm selected-token fraction, RAC thêm normalized effective-token fraction. Debug
+vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được reduce
+toàn cục trước khi rank 0 ghi.
 
 Full avg@16 trên 560 problem bắt buộc sinh 8.960 response cho mỗi checkpoint khác nhau; không thể
 giảm con số này mà vẫn giữ nguyên metric. Nếu ưu tiên thời gian train không bị chặn bởi eval, có thể
@@ -159,7 +189,7 @@ REEVAL_TEMPERATURE="$TRAIN_EVAL_TEMPERATURE" \
   CUDA_VISIBLE_DEVICES=0 bash scripts/reeval_all_checkpoints_b200.sh
 ```
 
-Step 0 vẫn chỉ generate một lần nhờ shared fingerprint cache. Không giảm `NUM_RESPONSES=4`,
+Step 0 vẫn chỉ generate một lần nhờ shared fingerprint cache. Không đổi training `NUM_RESPONSES=1`,
 `TRAIN_EVAL_NUM_RESPONSES=16` hoặc `MAX_RESPONSE_LENGTH` nếu mục tiêu là so sánh đúng protocol hiện
 tại; các thay đổi đó nhanh hơn nhưng là thí nghiệm khác.
 

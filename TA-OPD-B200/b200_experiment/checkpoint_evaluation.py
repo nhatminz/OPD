@@ -91,7 +91,9 @@ def discover_evaluation_targets(
     """Discover step 0, numbered checkpoints, and the saved final snapshot."""
     run_output = Path(run_output).expanduser().resolve()
     if not run_output.is_dir():
-        raise FileNotFoundError(f"Missing {display_name} output directory: {run_output}")
+        raise FileNotFoundError(
+            f"Missing {display_name} output directory: {run_output}"
+        )
     config_path = run_output / "resolved_config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(f"Missing resolved training config: {config_path}")
@@ -174,14 +176,17 @@ def discover_evaluation_targets(
         metric = _last_jsonl_row(run_output / "metrics.jsonl")
         max_steps = int(metric["step"]) if metric is not None else max(targets_by_step)
     max_steps = max(max_steps, max(targets_by_step))
-    return config_path, config, sorted(targets_by_step.values(), key=lambda item: item.step), max_steps
+    return (
+        config_path,
+        config,
+        sorted(targets_by_step.values(), key=lambda item: item.step),
+        max_steps,
+    )
 
 
 def _atomic_replace_directory(staged: Path, destination: Path) -> None:
     """Replace one exact step directory, restoring the old one if commit fails."""
-    backup = destination.with_name(
-        f".{destination.name}.pre-reeval-{uuid.uuid4().hex}"
-    )
+    backup = destination.with_name(f".{destination.name}.pre-reeval-{uuid.uuid4().hex}")
     had_destination = destination.exists()
     if had_destination:
         os.replace(destination, backup)
@@ -265,9 +270,7 @@ def _write_history_atomically(
 
 def _subprocess_environment(repo_root: Path) -> dict[str, str]:
     environment = os.environ.copy()
-    environment["VLLM_LOGGING_LEVEL"] = environment.get(
-        "VLLM_LOGGING_LEVEL", "WARNING"
-    )
+    environment["VLLM_LOGGING_LEVEL"] = environment.get("VLLM_LOGGING_LEVEL", "WARNING")
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
@@ -288,7 +291,9 @@ def _subprocess_environment(repo_root: Path) -> dict[str, str]:
     return environment
 
 
-def _runtime_settings(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def _runtime_settings(
+    config: dict[str, Any], args: argparse.Namespace
+) -> dict[str, Any]:
     training_evaluation = config.get("training_evaluation", {})
     vllm_settings = dict(training_evaluation.get("vllm", {}))
     overrides = {
@@ -361,9 +366,7 @@ def _reevaluate_method(
     for target in targets:
         step_dir = eval_root / f"step-{target.step:06d}"
         staged = Path(
-            tempfile.mkdtemp(
-                prefix=f".reeval-step-{target.step:06d}-", dir=eval_root
-            )
+            tempfile.mkdtemp(prefix=f".reeval-step-{target.step:06d}-", dir=eval_root)
         )
         started = time.perf_counter()
         command = [
@@ -413,8 +416,7 @@ def _reevaluate_method(
                 )
                 if cache_status == "shared":
                     skipped_responses = sum(
-                        int(result["total"])
-                        for result in suite["benchmarks"].values()
+                        int(result["total"]) for result in suite["benchmarks"].values()
                     )
                     print(
                         f"[{display_name}] reused identical cached base evaluation; "

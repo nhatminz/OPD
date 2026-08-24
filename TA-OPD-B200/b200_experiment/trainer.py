@@ -31,9 +31,12 @@ from .data import (
 )
 from .diagnostics import correlations, finite_or_raise, selector_summary
 from .distributed import (
+    BatchLayout,
     DistributedContext,
+    batch_layout,
     contiguous_partition,
     initialize_distributed,
+    padded_local_indices,
     unique_free_port,
     unwrap_model,
 )
@@ -49,6 +52,14 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import load_models
+from .fsdp import (
+    clip_grad_norm,
+    distributed_strategy,
+    full_model_state_dict,
+    full_optimizer_state_dict,
+    is_fsdp_model,
+    wrap_fsdp_model,
+)
 from .opd_core import (
     UPSTREAM_ADV_ESTIMATOR,
     UPSTREAM_LOSS_AGG_MODE,
@@ -78,6 +89,7 @@ from .scoring import (
 from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
 from .selectors import OPDSelector, RACSelector, TASelector, top_budget_mask
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
+from .tensorboard_logging import TensorBoardLogger
 from .vllm_rollout import VLLMRolloutEngine
 
 
@@ -93,6 +105,57 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _micro_batch_size_per_gpu(training: dict[str, Any], world_size: int) -> int:
+    if "micro_batch_size_per_gpu" in training:
+        value = int(training["micro_batch_size_per_gpu"])
+    elif "micro_batch_size" in training:
+        if world_size > 1:
+            raise ValueError(
+                "training.micro_batch_size is a legacy ambiguous global value. "
+                "Set training.micro_batch_size_per_gpu explicitly for distributed "
+                "training."
+            )
+        value = int(training["micro_batch_size"])
+    else:
+        raise ValueError("training.micro_batch_size_per_gpu is required")
+    if value <= 0:
+        raise ValueError("training.micro_batch_size_per_gpu must be positive")
+    return value
+
+
+def _format_batch_layout(
+    layout: BatchLayout,
+    strategy: str,
+    config: dict[str, Any],
+) -> str:
+    fsdp = config.get("distributed", {}).get("fsdp", {})
+    training = config["training"]
+    return "\n".join(
+        (
+            f"distributed strategy          = {strategy}",
+            f"world_size                    = {layout.world_size}",
+            f"global_prompt_batch_size      = {layout.global_prompt_batch_size}",
+            f"local_prompt_batch_size       = {layout.local_prompt_batch_size}",
+            f"num_responses                 = {layout.num_responses}",
+            f"global_trajectory_batch_size  = {layout.global_trajectory_batch_size}",
+            f"local_trajectory_batch_size   = {layout.local_trajectory_batch_size}",
+            f"micro_batch_size_per_gpu      = {layout.micro_batch_size_per_gpu}",
+            f"micro_batches_per_gpu         = {layout.micro_batches_per_gpu}",
+            f"learning_rate                 = {float(training['learning_rate']):.8g}",
+            f"max_prompt_tokens             = {int(config['data']['max_prompt_tokens'])}",
+            f"max_response_tokens           = {int(config['rollout']['max_new_tokens'])}",
+            "student_sharding_strategy     = "
+            + ("FULL_SHARD" if strategy == "fsdp" else "none"),
+            "teacher_sharding              = "
+            + ("FULL_SHARD" if strategy == "fsdp" else "replicated"),
+            "teacher_cpu_offload           = "
+            + str(bool(fsdp.get("teacher_cpu_offload", False))).lower(),
+            "gradient_checkpointing        = "
+            + str(bool(training.get("gradient_checkpointing", False))).lower(),
+        )
+    )
 
 
 def _timed(device: torch.device, function, *args, **kwargs):
@@ -232,6 +295,8 @@ def _rollout_hash(
     serialized = []
     for row_ids, row_valid in zip(response_ids, valid_mask):
         tokens = row_ids[row_valid].long()
+        if tokens.numel() == 0:
+            continue
         serialized.append(
             torch.cat(
                 (
@@ -275,6 +340,7 @@ def _upsert_jsonl_row(
     if path.is_file():
         with path.open(encoding="utf-8") as handle:
             rows = [json.loads(line) for line in handle if line.strip()]
+
     def matches(row: dict[str, Any]) -> bool:
         return all(row.get(key) == payload.get(key) for key in key_fields)
 
@@ -307,6 +373,7 @@ def _upsert_csv_row(
     if path.is_file() and path.stat().st_size > 0:
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
+
     def matches(item: dict[str, Any]) -> bool:
         return all(str(item.get(key)) == str(row.get(key)) for key in key_fields)
 
@@ -391,15 +458,34 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
     _append_csv_row(path, row, common + statistics)
 
 
-def _save_inference_snapshot(model, tokenizer, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    previous_use_cache = model.config.use_cache
-    model.config.use_cache = True
+def _save_inference_snapshot(
+    model,
+    tokenizer,
+    destination: Path,
+    distributed: DistributedContext | None = None,
+) -> None:
+    """Export a normal HF checkpoint; every FSDP rank enters collectives."""
+    if is_fsdp_model(model) and distributed is None:
+        raise RuntimeError("FSDP snapshot export requires distributed context")
+    raw_model = unwrap_model(model)
+    previous_use_cache = raw_model.config.use_cache
+    raw_model.config.use_cache = True
     try:
-        model.save_pretrained(destination, safe_serialization=True)
+        state_dict = full_model_state_dict(model) if is_fsdp_model(model) else None
+        is_main = distributed is None or distributed.is_main
+        if is_main:
+            destination.mkdir(parents=True, exist_ok=True)
+            save_kwargs = {"state_dict": state_dict} if state_dict is not None else {}
+            raw_model.save_pretrained(
+                destination,
+                safe_serialization=True,
+                **save_kwargs,
+            )
+            tokenizer.save_pretrained(destination)
     finally:
-        model.config.use_cache = previous_use_cache
-    tokenizer.save_pretrained(destination)
+        raw_model.config.use_cache = previous_use_cache
+    if distributed is not None:
+        distributed.barrier()
 
 
 def _evaluate_vllm_subprocess(
@@ -421,6 +507,11 @@ def _evaluate_vllm_subprocess(
 
     temporary_snapshot: tempfile.TemporaryDirectory[str] | None = None
     if model_path is None:
+        if is_fsdp_model(model):
+            raise RuntimeError(
+                "FSDP periodic vLLM evaluation requires a collectively exported "
+                "checkpoint/snapshot path"
+            )
         snapshot_root = output_dir.parent / ".snapshots"
         snapshot_root.mkdir(parents=True, exist_ok=True)
         temporary_snapshot = tempfile.TemporaryDirectory(
@@ -492,13 +583,9 @@ def _run_training_evaluation(
         "temperature": float(
             settings.get("temperature", config["evaluation"].get("temperature", 0.7))
         ),
-        "top_p": float(
-            settings.get("top_p", config["evaluation"].get("top_p", 0.95))
-        ),
+        "top_p": float(settings.get("top_p", config["evaluation"].get("top_p", 0.95))),
         "num_responses": int(
-            settings.get(
-                "num_responses", config["evaluation"].get("num_responses", 16)
-            )
+            settings.get("num_responses", config["evaluation"].get("num_responses", 16))
         ),
         "batch_size": int(
             settings.get("batch_size", config["evaluation"].get("batch_size", 16))
@@ -591,11 +678,7 @@ def _run_training_evaluation(
                 "total": result["total"],
                 "accuracy": result["accuracy"],
                 "avg_at_n": result.get("avg_at_n", result["accuracy"]),
-                **(
-                    {"avg_at_16": result["avg_at_16"]}
-                    if "avg_at_16" in result
-                    else {}
-                ),
+                **({"avg_at_16": result["avg_at_16"]} if "avg_at_16" in result else {}),
                 "problems": result.get("problems"),
                 "samples_per_problem": result.get(
                     "samples_per_problem", samples_per_problem
@@ -665,10 +748,10 @@ def _opd_train_step(
     config,
     device,
     distributed: DistributedContext,
+    objective_valid_mask: torch.Tensor | None = None,
 ):
     training = config["training"]
-    global_micro_batch = max(1, int(training.get("micro_batch_size", 1)))
-    micro_batch = max(1, math.ceil(global_micro_batch / distributed.world_size))
+    micro_batch = _micro_batch_size_per_gpu(training, distributed.world_size)
     local_batch_size = rollout.input_ids.shape[0]
     if local_batch_size <= 0:
         raise ValueError("OPD train step received an empty local/global batch")
@@ -677,8 +760,17 @@ def _opd_train_step(
         float(training.get("ppo_clip_high", 0.28)),
     )
     dual_clip = float(training.get("ppo_dual_clip", 3.0))
+    objective_valid = (
+        rollout.valid_mask
+        if objective_valid_mask is None
+        else objective_valid_mask.to(device=rollout.valid_mask.device, dtype=torch.bool)
+    )
+    if objective_valid.shape != rollout.valid_mask.shape:
+        raise ValueError("objective_valid_mask must align with rollout.valid_mask")
+    if bool((objective_valid & ~rollout.valid_mask.bool()).any()):
+        raise ValueError("Objective-valid tokens must also be valid rollout tokens")
     local_weight_mass = float(
-        position_weights[rollout.valid_mask].detach().float().sum().item()
+        position_weights[objective_valid].detach().float().sum().item()
     )
     global_weight_mass = distributed.sum_float(local_weight_mass)
     if global_weight_mass <= 0.0:
@@ -688,6 +780,7 @@ def _opd_train_step(
     unwrap_model(model).config.use_cache = False
     forward_seconds = backward_seconds = optimizer_seconds = loss_value = 0.0
     base_loss_sum = 0.0
+    local_clipped_candidates = local_candidate_count = 0
     response_lengths = rollout.valid_mask.long().sum(dim=-1)
     order = torch.arange(local_batch_size, device=rollout.input_ids.device)
     if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
@@ -695,10 +788,14 @@ def _opd_train_step(
     micro_batches = list(order.split(micro_batch))
     for chunk_index, indices in enumerate(micro_batches):
         synchronize = chunk_index == len(micro_batches) - 1
+        fsdp_no_sync = bool(
+            config.get("distributed", {}).get("fsdp", {}).get("use_no_sync", False)
+        )
+        may_skip_sync = isinstance(model, DistributedDataParallel) or (
+            is_fsdp_model(model) and fsdp_no_sync
+        )
         sync_context = (
-            nullcontext()
-            if synchronize or not isinstance(model, DistributedDataParallel)
-            else model.no_sync()
+            model.no_sync() if not synchronize and may_skip_sync else nullcontext()
         )
         with sync_context:
             cuda_sync(device)
@@ -742,9 +839,9 @@ def _opd_train_step(
                 teacher_log_probs=opd_reference.teacher_log_probs.index_select(
                     0, indices
                 )[:, :local_width],
-                student_weights=opd_reference.student_weights.index_select(
-                    0, indices
-                )[:, :local_width],
+                student_weights=opd_reference.student_weights.index_select(0, indices)[
+                    :, :local_width
+                ],
                 advantages=opd_reference.advantages.index_select(0, indices)[
                     :, :local_width
                 ],
@@ -756,10 +853,8 @@ def _opd_train_step(
                 clip_high=eps_high,
                 dual_clip=dual_clip,
             )
-            valid_chunk = rollout.valid_mask.index_select(0, indices)[:, :local_width]
-            chunk_weights = position_weights.index_select(0, indices)[
-                :, :local_width
-            ]
+            valid_chunk = objective_valid.index_select(0, indices)[:, :local_width]
+            chunk_weights = position_weights.index_select(0, indices)[:, :local_width]
             local_numerator, _ = weighted_token_sums(
                 per_position_loss,
                 chunk_weights,
@@ -768,8 +863,19 @@ def _opd_train_step(
             base_loss_sum += float(
                 per_position_loss.detach()[valid_chunk].float().sum().item()
             )
-            # DDP averages rank gradients. Multiplication by world_size makes
-            # this exactly global sum(w_t*l_t) / global sum(w_t).
+            with torch.no_grad():
+                ratio = torch.exp(
+                    (current.detach() - chunk_reference.old_student_log_probs).clamp(
+                        min=-20.0, max=20.0
+                    )
+                )
+                candidate_valid = valid_chunk.unsqueeze(-1).expand_as(ratio)
+                clipped = ratio.lt(1.0 - eps_low) | ratio.gt(1.0 + eps_high)
+                local_clipped_candidates += int((clipped & candidate_valid).sum())
+                local_candidate_count += int(candidate_valid.sum())
+            # DDP and FSDP data-parallel reductions average synchronized rank
+            # gradients. The world-size factor therefore yields exactly:
+            # global sum(w_t*l_t) / global sum(w_t), including accumulation.
             loss = local_numerator * (
                 distributed.world_size / float(global_weight_mass)
             )
@@ -794,8 +900,8 @@ def _opd_train_step(
                 candidate_ids,
                 chunk_weights,
             )
-    gradient_norm = torch.nn.utils.clip_grad_norm_(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
+    gradient_norm = clip_grad_norm(
+        model,
         float(training.get("max_grad_norm", 1.0)),
     )
     cuda_sync(device)
@@ -806,7 +912,9 @@ def _opd_train_step(
     optimizer.zero_grad(set_to_none=True)
     global_loss = distributed.sum_float(loss_value) / distributed.world_size
     global_base_loss_sum = distributed.sum_float(base_loss_sum)
-    global_valid_tokens = distributed.sum_int(int(rollout.valid_mask.sum().item()))
+    global_valid_tokens = distributed.sum_int(int(objective_valid.sum().item()))
+    global_clipped_candidates = distributed.sum_int(local_clipped_candidates)
+    global_candidate_count = distributed.sum_int(local_candidate_count)
     return {
         "loss": global_loss,
         "weighted_final_loss": global_loss,
@@ -817,6 +925,7 @@ def _opd_train_step(
         "backward_time": backward_seconds,
         "optimizer_time": optimizer_seconds,
         "global_weight_mass": global_weight_mass,
+        "clip_fraction": global_clipped_candidates / max(global_candidate_count, 1),
     }
 
 
@@ -828,41 +937,67 @@ def _save_checkpoint(
     step: int,
     final: bool,
     save_optimizer: bool,
+    distributed: DistributedContext,
 ):
     checkpoint = output_dir / ("final" if final else f"checkpoint-{step:06d}")
-    temporary = output_dir / f".{checkpoint.name}.incomplete-{os.getpid()}"
+    temporary = output_dir / f".{checkpoint.name}.incomplete"
     if checkpoint.exists() or temporary.exists():
         raise FileExistsError(f"Refusing to overwrite checkpoint path: {checkpoint}")
     try:
-        _save_inference_snapshot(model, tokenizer, temporary)
+        if distributed.is_main:
+            temporary.mkdir(parents=True)
+        distributed.barrier()
+        _save_inference_snapshot(model, tokenizer, temporary, distributed)
         if save_optimizer:
-            torch.save(
-                {
-                    "step": step,
-                    "optimizer": optimizer.state_dict(),
-                    "torch_rng_state": torch.get_rng_state().cpu(),
-                    "cuda_rng_state_all": [
-                        state.cpu() for state in torch.cuda.get_rng_state_all()
-                    ],
-                },
-                temporary / "optimizer.pt",
+            optimizer_state = (
+                full_optimizer_state_dict(model, optimizer)
+                if is_fsdp_model(model) or distributed.is_main
+                else None
             )
-        os.replace(temporary, checkpoint)
+            local_rng = {
+                "torch_rng_state": torch.get_rng_state().cpu(),
+                "cuda_rng_state": torch.cuda.get_rng_state(distributed.device).cpu(),
+            }
+            rng_states = distributed.all_gather_objects(local_rng)
+            if distributed.is_main:
+                torch.save(
+                    {
+                        "step": step,
+                        "optimizer": optimizer_state,
+                        "optimizer_format": (
+                            "fsdp_full_v1" if is_fsdp_model(model) else "standard"
+                        ),
+                        "world_size": distributed.world_size,
+                        "rng_states": rng_states,
+                        # Retain legacy fields for older single-process loaders.
+                        "torch_rng_state": rng_states[0]["torch_rng_state"],
+                        "cuda_rng_state_all": [
+                            state["cuda_rng_state"] for state in rng_states
+                        ],
+                    },
+                    temporary / "optimizer.pt",
+                )
+        distributed.barrier()
+        if distributed.is_main:
+            os.replace(temporary, checkpoint)
     except BaseException:
-        if temporary.exists():
+        if distributed.is_main and temporary.exists():
             shutil.rmtree(temporary)
         raise
-    latest = output_dir / "latest.json"
-    latest_temporary = output_dir / ".latest.json.tmp"
-    latest_temporary.write_text(
-        json.dumps(
-            {"step": step, "checkpoint": checkpoint.name, "final": bool(final)},
-            ensure_ascii=False,
+    distributed.barrier()
+    if distributed.is_main:
+        latest = output_dir / "latest.json"
+        latest_temporary = output_dir / ".latest.json.tmp"
+        latest_temporary.write_text(
+            json.dumps(
+                {"step": step, "checkpoint": checkpoint.name, "final": bool(final)},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(latest_temporary, latest)
+        os.replace(latest_temporary, latest)
+    distributed.barrier()
     return checkpoint
 
 
@@ -882,15 +1017,40 @@ def run_training(
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     experiment, training = config["experiment"], config["training"]
+    strategy = distributed_strategy(config, distributed)
     method = str(experiment["method"]).lower()
     if method not in {"opd", "ta", "rac"}:
         raise ValueError(f"Training method must be opd, ta, or rac, got {method!r}")
+    global_prompt_batch_size = int(config["rollout"]["batch_size"])
+    num_responses = int(config["rollout"].get("num_responses", 1))
+    micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
+        training, distributed.world_size
+    )
+    layout = batch_layout(
+        global_prompt_batch_size,
+        num_responses,
+        distributed.world_size,
+        micro_batch_size_per_gpu,
+    )
+    configured_accumulation = training.get("grad_accum_steps", "auto")
+    if configured_accumulation not in (None, "auto"):
+        raise ValueError(
+            "training.grad_accum_steps is derived automatically from each local "
+            "trajectory batch. Configure training.micro_batch_size_per_gpu instead."
+        )
+    if distributed.is_main:
+        tqdm.write(_format_batch_layout(layout, strategy, config))
+    if strategy == "fsdp" and str(
+        config["models"].get("dtype", "bfloat16")
+    ).lower() not in {
+        "bfloat16",
+        "bf16",
+    }:
+        raise ValueError("FSDP production training requires models.dtype=bfloat16")
     opd_config = config.get("opd", {})
     top_k_strategy = str(opd_config.get("top_k_strategy", "only_stu"))
     reward_weight_mode = str(opd_config.get("reward_weight_mode", "student_p"))
-    advantage_estimator = str(
-        opd_config.get("adv_estimator", "token_reward_direct")
-    )
+    advantage_estimator = str(opd_config.get("adv_estimator", "token_reward_direct"))
     loss_aggregation = str(opd_config.get("loss_agg_mode", "token-mean"))
     controlled_settings = {
         "upstream_commit": (
@@ -955,6 +1115,21 @@ def run_training(
             "vLLM CUDA-IPC rollout requires full-parameter training; "
             "set training.use_lora=false or rollout.backend=hf"
         )
+    if strategy == "fsdp" and rollout_backend != "vllm":
+        raise RuntimeError(
+            "FSDP training requires the per-rank vLLM rollout backend. The HF "
+            "autoregressive fallback can finish at different times on each rank "
+            "and is not collective-safe."
+        )
+    if (
+        strategy == "fsdp"
+        and bool(config.get("training_evaluation", {}).get("enabled", False))
+        and str(config["training_evaluation"].get("backend", "vllm")).lower() != "vllm"
+    ):
+        raise RuntimeError(
+            "FSDP periodic evaluation must use backend=vllm so rank 0 evaluates "
+            "a collectively exported HF snapshot."
+        )
     rollout_engine: VLLMRolloutEngine | None = None
 
     setup_progress = tqdm(
@@ -992,7 +1167,21 @@ def run_training(
         model_load_config["models"]["student_path"] = str(resume_checkpoint)
     student, teacher, tokenizer, model_metadata = load_models(model_load_config, device)
     training_student = student
-    if distributed.enabled:
+    scoring_teacher = teacher
+    if strategy == "fsdp":
+        training_student = wrap_fsdp_model(
+            student,
+            config,
+            distributed,
+            role="student",
+        )
+        scoring_teacher = wrap_fsdp_model(
+            teacher,
+            config,
+            distributed,
+            role="teacher",
+        )
+    elif strategy == "ddp":
         training_student = DistributedDataParallel(
             student,
             device_ids=[distributed.local_rank],
@@ -1010,11 +1199,21 @@ def run_training(
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
     optimizer, fused_optimizer = _make_optimizer(
-        [parameter for parameter in student.parameters() if parameter.requires_grad],
+        [
+            parameter
+            for parameter in training_student.parameters()
+            if parameter.requires_grad
+        ],
         training,
     )
     resume_state = (
-        restore_optimizer(optimizer, resume_checkpoint, device)
+        restore_optimizer(
+            optimizer,
+            resume_checkpoint,
+            device,
+            model=training_student,
+            distributed=distributed,
+        )
         if resume_checkpoint is not None
         else None
     )
@@ -1042,13 +1241,20 @@ def run_training(
             "full_dataset": True,
         }
         metadata["distributed"] = {
-            "strategy": "ddp" if distributed.enabled else "single_process",
+            "strategy": strategy,
             "world_size": distributed.world_size,
             "global_batch_preserved": True,
             "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method == "ta",
             "global_rac_weight_normalization": method == "rac",
             "uniform_full_response_mask": method == "opd",
+            "student_sharding_strategy": ("FULL_SHARD" if strategy == "fsdp" else None),
+            "teacher_sharding_strategy": (
+                "FULL_SHARD" if strategy == "fsdp" else "replicated"
+            ),
+            "teacher_cpu_offload": bool(
+                distributed_cfg.get("fsdp", {}).get("teacher_cpu_offload", False)
+            ),
         }
         metadata["opd_upstream"] = {
             "repository": "https://github.com/thunlp/OPD",
@@ -1098,8 +1304,7 @@ def run_training(
         eps=float(selector_cfg.get("eps", 1e-8)),
         scan_backend=str(selector_cfg.get("rac_scan_backend", "parallel")),
     )
-    batch_size = int(config["rollout"]["batch_size"])
-    num_responses = int(config["rollout"].get("num_responses", 4))
+    batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:
         raise ValueError("Prompt batch size and rollout.num_responses must be positive")
     steps_per_epoch = math.ceil(len(records) / batch_size)
@@ -1137,6 +1342,12 @@ def run_training(
         enabled=distributed.is_main
         and bool(config.get("logging", {}).get("token_score_stats_enabled", True)),
     )
+    tensorboard_logger = TensorBoardLogger(
+        output_dir,
+        dict(config.get("logging", {}).get("tensorboard", {})),
+        enabled=distributed.is_main,
+        resume_step=resume_step,
+    )
     training_eval_settings = config.get("training_evaluation", {})
     evaluation_steps = training_evaluation_steps(max_steps, training_eval_settings)
     if evaluation_steps and distributed.is_main:
@@ -1165,7 +1376,7 @@ def run_training(
         if distributed.is_main:
             tqdm.write("Evaluating the untouched base student at optimizer step 0...")
             initial_evaluation = _run_training_evaluation(
-                student,
+                training_student,
                 tokenizer,
                 method,
                 0,
@@ -1193,21 +1404,23 @@ def run_training(
             progress.set_postfix_str(f"stage=rollout-{rollout_backend}", refresh=True)
         torch.cuda.reset_peak_memory_stats(device)
         global_indices = epoch_batch_indices(len(records), batch_size, step_index, seed)
-        if len(global_indices) < distributed.world_size:
-            raise ValueError(
-                f"Global batch has {len(global_indices)} samples but WORLD_SIZE is "
-                f"{distributed.world_size}; every DDP worker needs at least one sample"
-            )
-        local_start, local_end = contiguous_partition(
+        local_start, _ = contiguous_partition(
             len(global_indices), distributed.rank, distributed.world_size
         )
-        prompt_indices = global_indices[local_start:local_end]
-        prompt_records = [records[index] for index in prompt_indices]
-        encoded, _ = tokenize_prompts(
-            prompt_records, tokenizer, config["data"], device
+        prompt_indices, active_prompts = padded_local_indices(
+            global_indices,
+            distributed.rank,
+            distributed.world_size,
         )
+        prompt_records = [records[index] for index in prompt_indices]
+        encoded, _ = tokenize_prompts(prompt_records, tokenizer, config["data"], device)
         encoded, indices, response_indices = expand_prompt_batch(
             encoded, prompt_indices, num_responses
+        )
+        active_trajectories = torch.tensor(
+            [active for active in active_prompts for _ in range(num_responses)],
+            dtype=torch.bool,
+            device=device,
         )
         batch_records = [records[index] for index in indices]
         rollout_function = (
@@ -1218,7 +1431,7 @@ def run_training(
         rollout, rollout_time = _timed(
             device,
             rollout_function,
-            student,
+            training_student,
             encoded["input_ids"],
             encoded["attention_mask"],
             max_new_tokens=int(config["rollout"].get("max_new_tokens", 256)),
@@ -1230,8 +1443,7 @@ def run_training(
             # Repeated prompts are separate requests with globally unique,
             # deterministic seeds, so all n trajectories are independent.
             sample_seed_offset=(
-                step_index * batch_size * num_responses
-                + local_start * num_responses
+                step_index * batch_size * num_responses + local_start * num_responses
             ),
         )
         rollout_backend_metrics = (
@@ -1246,9 +1458,8 @@ def run_training(
         ):
             setattr(rollout, field, getattr(rollout, field).clone())
         original_rollout = rollout.input_ids.clone()
-        rollout_hash = _rollout_hash(
-            rollout.response_ids, rollout.valid_mask, distributed
-        )
+        objective_valid = rollout.valid_mask & active_trajectories.unsqueeze(1)
+        rollout_hash = _rollout_hash(rollout.response_ids, objective_valid, distributed)
         use_joint_scoring = method in {"ta", "rac"} and bool(
             selector_cfg.get("joint_cross_scoring", True)
         )
@@ -1261,24 +1472,16 @@ def run_training(
             joint_scores, joint_scoring_time = _timed(
                 device,
                 score_student_teacher_rollout,
-                student,
-                teacher,
+                training_student,
+                scoring_teacher,
                 rollout,
                 score_chunk_steps=int(selector_cfg.get("score_chunk_steps", 128)),
                 top_k=top_k,
-                student_temperature=float(
-                    config["rollout"].get("temperature", 1.0)
-                ),
-                teacher_temperature=float(
-                    opd_config.get("teacher_temperature", 1.0)
-                ),
-                micro_batch_size=int(
-                    selector_cfg.get("score_micro_batch_size", 1)
-                ),
+                student_temperature=float(config["rollout"].get("temperature", 1.0)),
+                teacher_temperature=float(opd_config.get("teacher_temperature", 1.0)),
+                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
                 trim_padding=bool(selector_cfg.get("trim_padding", True)),
-                length_bucketed=bool(
-                    selector_cfg.get("length_bucketed_scoring", True)
-                ),
+                length_bucketed=bool(selector_cfg.get("length_bucketed_scoring", True)),
             )
             student_scores, teacher_scores = joint_scores
             student_base_time = teacher_base_time = 0.0
@@ -1288,30 +1491,28 @@ def run_training(
             student_scores, student_base_time = _timed(
                 device,
                 score_original_rollout,
-                student,
+                training_student,
                 rollout,
                 False,
                 int(selector_cfg.get("score_chunk_steps", 128)),
                 retain_response_logits=False,
                 top_k=top_k,
                 temperature=float(config["rollout"].get("temperature", 1.0)),
-                micro_batch_size=int(
-                    selector_cfg.get("score_micro_batch_size", 1)
-                ),
+                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
                 trim_padding=bool(selector_cfg.get("trim_padding", True)),
-                length_bucketed=bool(
-                    selector_cfg.get("length_bucketed_scoring", True)
-                ),
+                length_bucketed=bool(selector_cfg.get("length_bucketed_scoring", True)),
             )
         if student_scores.top_k_ids is None or student_scores.top_k_log_probs is None:
-            raise AssertionError("Student scoring did not produce the common Top-K support")
+            raise AssertionError(
+                "Student scoring did not produce the common Top-K support"
+            )
         if not use_joint_scoring:
             if distributed.is_main:
                 progress.set_postfix_str("stage=score-teacher", refresh=True)
             teacher_scores, teacher_base_time = _timed(
                 device,
                 score_original_rollout,
-                teacher,
+                scoring_teacher,
                 rollout,
                 False,
                 int(selector_cfg.get("score_chunk_steps", 128)),
@@ -1319,13 +1520,9 @@ def run_training(
                 top_k=top_k,
                 candidate_ids=student_scores.top_k_ids,
                 temperature=float(opd_config.get("teacher_temperature", 1.0)),
-                micro_batch_size=int(
-                    selector_cfg.get("score_micro_batch_size", 1)
-                ),
+                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
                 trim_padding=bool(selector_cfg.get("trim_padding", True)),
-                length_bucketed=bool(
-                    selector_cfg.get("length_bucketed_scoring", True)
-                ),
+                length_bucketed=bool(selector_cfg.get("length_bucketed_scoring", True)),
             )
         if (
             teacher_scores.candidate_log_probs is None
@@ -1333,7 +1530,7 @@ def run_training(
             or teacher_scores.top_k_log_probs is None
         ):
             raise AssertionError("Teacher scoring did not score the student Top-K IDs")
-        valid = rollout.valid_mask
+        valid = objective_valid
         finite_or_raise(
             "student sampled log-probs", student_scores.sampled_log_probs[valid]
         )
@@ -1347,6 +1544,23 @@ def run_training(
             valid,
         )
         finite_or_raise("Top-K OPD advantages", opd_reference.advantages[valid])
+        local_advantage_abs_sum = float(
+            opd_reference.advantages[valid].abs().sum().item()
+        )
+        global_advantage_count = distributed.sum_int(
+            opd_reference.advantages[valid].numel()
+        )
+        opd_advantage_abs_mean = distributed.sum_float(local_advantage_abs_sum) / max(
+            global_advantage_count, 1
+        )
+        local_logprob_gap = (
+            teacher_scores.sampled_log_probs[valid]
+            - student_scores.sampled_log_probs[valid]
+        )
+        global_logprob_gap_count = distributed.sum_int(local_logprob_gap.numel())
+        opd_teacher_student_logprob_gap = distributed.sum_float(
+            float(local_logprob_gap.sum().item())
+        ) / max(global_logprob_gap_count, 1)
         overlap_values = topk_overlap_fraction(
             student_scores.top_k_ids, teacher_scores.top_k_ids, valid
         )
@@ -1368,16 +1582,19 @@ def run_training(
                 rollout.rollout_log_probs[comparable]
                 - student_scores.sampled_log_probs[comparable]
             ).abs()[: max(1, int(sanity.get("max_tokens_per_rank", 32)))]
-            if differences.numel() == 0:
+            compared = distributed.sum_int(differences.numel())
+            if compared == 0:
                 raise RuntimeError(
                     "vLLM log-prob sanity was enabled, but the server returned no "
                     "token log-probabilities"
                 )
-            compared = distributed.sum_int(differences.numel())
             mean_abs = distributed.sum_float(float(differences.sum().item())) / max(
                 compared, 1
             )
-            max_abs = distributed.max_float(float(differences.max().item()))
+            local_max_abs = (
+                float(differences.max().item()) if differences.numel() else 0.0
+            )
+            max_abs = distributed.max_float(local_max_abs)
             tolerance = float(sanity.get("tolerance", 0.05))
             vllm_logprob_sanity = {
                 "enabled": True,
@@ -1426,16 +1643,14 @@ def run_training(
                 student_on_teacher, student_cross_score_time = _timed(
                     device,
                     score_original_rollout,
-                    student,
+                    training_student,
                     rollout,
                     False,
                     int(selector_cfg.get("score_chunk_steps", 128)),
                     retain_response_logits=False,
                     candidate_ids=teacher_scores.top_k_ids,
                     temperature=float(config["rollout"].get("temperature", 1.0)),
-                    micro_batch_size=int(
-                        selector_cfg.get("score_micro_batch_size", 1)
-                    ),
+                    micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
                     trim_padding=bool(selector_cfg.get("trim_padding", True)),
                     length_bucketed=bool(
                         selector_cfg.get("length_bucketed_scoring", True)
@@ -1466,9 +1681,7 @@ def run_training(
                 distributed,
             )
             ta_output, global_ta_diagnostics, ta_start, ta_end = ta_globalized
-            ta_time = (
-                student_cross_score_time + ta_raw_time + ta_normalization_time
-            )
+            ta_time = student_cross_score_time + ta_raw_time + ta_normalization_time
             if method == "rac":
                 if distributed.is_main:
                     progress.set_postfix_str("stage=selector-Bellman-RAC", refresh=True)
@@ -1534,6 +1747,11 @@ def run_training(
             )
             expected = global_primary_diagnostics[score_key].numel()
             token_allocation = selected if method == "opd" else primary.scores
+        # RAC selector computations run under inference_mode.  Materialize a
+        # normal frozen tensor before it participates in a differentiable
+        # weighted loss (the same guard used by TopKOPDReference).
+        with torch.inference_mode(False):
+            token_allocation = token_allocation.detach().clone()
         if distributed.sum_int(int(selected.sum().item())) != expected:
             raise AssertionError(f"{method} supervised-token count is incorrect")
         if not torch.equal(original_rollout, rollout.input_ids):
@@ -1589,36 +1807,59 @@ def run_training(
             config,
             device,
             distributed,
+            objective_valid_mask=objective_valid,
         )
         checkpoint = None
         save_checkpoints = bool(training.get("save_checkpoints", True))
         save_interval = int(training.get("save_interval", 100))
-        if (
-            distributed.is_main
-            and save_checkpoints
-            and (step == max_steps or (save_interval > 0 and step % save_interval == 0))
-        ):
-            progress.set_postfix_str("stage=checkpoint", refresh=True)
+        should_save_checkpoint = save_checkpoints and (
+            step == max_steps or (save_interval > 0 and step % save_interval == 0)
+        )
+        if should_save_checkpoint:
+            if distributed.is_main:
+                progress.set_postfix_str("stage=checkpoint", refresh=True)
             checkpoint = _save_checkpoint(
-                student,
+                training_student,
                 tokenizer,
                 optimizer,
                 output_dir,
                 step,
                 step == max_steps,
                 bool(training.get("save_optimizer", True)),
+                distributed,
             )
-        distributed.barrier()
         cuda_sync(device)
         local_wall_time = time.perf_counter() - step_started
         local_valid_tokens = int(valid.sum().item())
         response_lengths = valid.sum(dim=-1)
-        local_response_count = response_lengths.numel()
-        local_response_min = int(response_lengths.min().item())
-        local_response_max = int(response_lengths.max().item())
+        active_responses = response_lengths.gt(0)
+        local_response_count = int(active_responses.sum().item())
+        if local_response_count:
+            local_response_min = int(response_lengths[active_responses].min().item())
+            local_response_max = int(response_lengths[active_responses].max().item())
+        else:
+            # An inactive-only rank is possible for a one-prompt dataset tail.
+            # Use a neutral max and a high min sentinel for global reduction.
+            local_response_min = int(config["rollout"]["max_new_tokens"]) + 1
+            local_response_max = 0
         local_clipped_responses = int(
-            response_lengths.ge(int(config["rollout"]["max_new_tokens"])).sum().item()
+            (
+                response_lengths.ge(int(config["rollout"]["max_new_tokens"]))
+                & active_responses
+            )
+            .sum()
+            .item()
         )
+        eos_token_ids = tokenizer.eos_token_id
+        eos_token_ids = (
+            [eos_token_ids] if isinstance(eos_token_ids, int) else eos_token_ids
+        )
+        response_has_eos = torch.zeros_like(active_responses)
+        for eos_token_id in eos_token_ids:
+            response_has_eos |= (
+                rollout.response_ids.eq(int(eos_token_id)) & valid
+            ).any(dim=-1)
+        local_eos_responses = int((response_has_eos & active_responses).sum().item())
         local_peak_allocated = torch.cuda.max_memory_allocated(device)
         local_peak_reserved = torch.cuda.max_memory_reserved(device)
         wall_time = distributed.max_float(local_wall_time)
@@ -1627,6 +1868,10 @@ def run_training(
         response_min = -distributed.max_int(-local_response_min)
         response_max = distributed.max_int(local_response_max)
         clipped_responses = distributed.sum_int(local_clipped_responses)
+        eos_responses = distributed.sum_int(local_eos_responses)
+        global_tail_padding_prompts = distributed.sum_int(
+            len(active_prompts) - sum(active_prompts)
+        )
         peak_allocated = distributed.max_int(local_peak_allocated)
         peak_reserved = distributed.max_int(local_peak_reserved)
         peak_allocated_total = distributed.sum_int(local_peak_allocated)
@@ -1645,6 +1890,7 @@ def run_training(
             "backward_time": distributed.max_float(train_metrics["backward_time"]),
             "optimizer_time": distributed.max_float(train_metrics["optimizer_time"]),
             "global_weight_mass": train_metrics["global_weight_mass"],
+            "opd_clip_fraction": train_metrics["clip_fraction"],
         }
         final_metrics = {
             "step": step,
@@ -1657,8 +1903,14 @@ def run_training(
             "resume_step": resume_step,
             "batch_size": len(global_indices),
             "prompt_batch_size": len(global_indices),
+            "global_prompt_batch_size": len(global_indices),
+            "local_prompt_batch_size": len(prompt_indices),
+            "local_real_prompt_count_rank0": sum(active_prompts),
+            "tail_padding_prompt_count": global_tail_padding_prompts,
             "num_responses_per_prompt": num_responses,
             "trajectory_batch_size": len(global_indices) * num_responses,
+            "global_trajectory_batch_size": len(global_indices) * num_responses,
+            "local_trajectory_batch_size": len(prompt_indices) * num_responses,
             "num_trajectories": trajectory_count,
             "local_batch_size_rank0": (
                 len(global_indices) // distributed.world_size
@@ -1666,15 +1918,9 @@ def run_training(
             )
             * num_responses,
             "configured_batch_size": batch_size,
-            "micro_batch_size": int(training.get("micro_batch_size", batch_size)),
-            "local_micro_batch_size": math.ceil(
-                int(training.get("micro_batch_size", batch_size))
-                / distributed.world_size
-            ),
+            "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
-            "distributed_strategy": (
-                "ddp" if distributed.enabled else "single_process"
-            ),
+            "distributed_strategy": strategy,
             "global_batch_preserved": True,
             "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method == "ta",
@@ -1693,6 +1939,8 @@ def run_training(
             "opd_reward_weight_mode": reward_weight_mode,
             "opd_adv_estimator": advantage_estimator,
             "opd_loss_agg_mode": loss_aggregation,
+            "opd_advantage_abs_mean": opd_advantage_abs_mean,
+            "opd_teacher_student_logprob_gap": (opd_teacher_student_logprob_gap),
             "fused_optimizer": fused_optimizer,
             "lr": float(optimizer.param_groups[0]["lr"]),
             **aggregated_train_metrics,
@@ -1700,6 +1948,12 @@ def run_training(
             "rollout_time": distributed.max_float(rollout_time),
             "vllm_weight_sync_time": distributed.max_float(
                 rollout_backend_metrics.get("weight_sync_time", 0.0)
+            ),
+            "vllm_full_weight_materialization_time": distributed.max_float(
+                rollout_backend_metrics.get("full_weight_materialization_time", 0.0)
+            ),
+            "vllm_ipc_weight_sync_time": distributed.max_float(
+                rollout_backend_metrics.get("ipc_weight_sync_time", 0.0)
             ),
             "vllm_generation_time": distributed.max_float(
                 rollout_backend_metrics.get("generation_time", 0.0)
@@ -1746,11 +2000,23 @@ def run_training(
             "wall_clock_step_time": wall_time,
             "tokens_per_second": valid_tokens / max(wall_time, 1e-12),
             "throughput_tokens_per_sec": valid_tokens / max(wall_time, 1e-12),
+            "generated_tokens_per_second": valid_tokens
+            / max(distributed.max_float(rollout_time), 1e-12),
+            "training_tokens_per_second": valid_tokens
+            / max(
+                distributed.max_float(
+                    train_metrics["training_forward_time"]
+                    + train_metrics["backward_time"]
+                    + train_metrics["optimizer_time"]
+                ),
+                1e-12,
+            ),
             "num_valid_tokens": valid_tokens,
             "mean_response_length": valid_tokens / max(trajectory_count, 1),
             "min_response_length": response_min,
             "max_response_length": response_max,
             "response_clip_ratio": clipped_responses / max(trajectory_count, 1),
+            "eos_fraction": eos_responses / max(trajectory_count, 1),
             "student_teacher_topk_overlap_ratio": student_teacher_topk_overlap,
             "student_teacher_topk_divergence": student_teacher_topk_divergence,
             "peak_gpu_allocated_bytes": peak_allocated,
@@ -1790,14 +2056,32 @@ def run_training(
             global_ta_diagnostics,
             global_selected,
             valid,
+            objective_valid,
+            active_trajectories,
             rollout_backend_metrics,
         )
         if should_run_training_evaluation(step, max_steps, training_eval_settings):
+            evaluation_checkpoint = checkpoint
+            temporary_eval_snapshot = None
+            if strategy == "fsdp" and evaluation_checkpoint is None:
+                temporary_eval_snapshot = (
+                    output_dir / ".evaluation_snapshots" / f"step-{step:06d}"
+                )
+                if distributed.is_main and temporary_eval_snapshot.exists():
+                    shutil.rmtree(temporary_eval_snapshot)
+                distributed.barrier()
+                _save_inference_snapshot(
+                    training_student,
+                    tokenizer,
+                    temporary_eval_snapshot,
+                    distributed,
+                )
+                evaluation_checkpoint = temporary_eval_snapshot
             distributed.barrier()
             if distributed.is_main:
                 progress.set_postfix_str("stage=evaluation", refresh=True)
                 periodic_evaluation = _run_training_evaluation(
-                    student,
+                    training_student,
                     tokenizer,
                     method,
                     step,
@@ -1805,7 +2089,7 @@ def run_training(
                     config,
                     output_dir,
                     resolved_config_path,
-                    checkpoint=checkpoint,
+                    checkpoint=evaluation_checkpoint,
                 )
                 final_metrics["periodic_evaluation"] = {
                     "evaluation_time": periodic_evaluation["evaluation_time"],
@@ -1816,9 +2100,13 @@ def run_training(
                     wall_time + periodic_evaluation["evaluation_time"]
                 )
             distributed.barrier()
+            if distributed.is_main and temporary_eval_snapshot is not None:
+                shutil.rmtree(temporary_eval_snapshot)
+            distributed.barrier()
         if distributed.is_main:
             _append_jsonl(metrics_path, final_metrics)
             _append_train_metrics_csv(output_dir / "train_metrics.csv", final_metrics)
+            tensorboard_logger.write(step, final_metrics, method)
             progress.set_postfix(
                 loss=f"{train_metrics['loss']:.4f}",
                 selected=f"{expected}/{valid_tokens}",
@@ -1830,6 +2118,7 @@ def run_training(
             tqdm.write(
                 json.dumps(final_metrics, indent=2, ensure_ascii=False, allow_nan=True)
             )
+    tensorboard_logger.close()
     if rollout_engine is not None:
         rollout_engine.close()
     distributed.barrier()

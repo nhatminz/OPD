@@ -119,19 +119,24 @@ autotune = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if not autotune.get("autotune", {}).get("validated"):
     raise SystemExit("B200 batch config is not validated")
 batch = autotune["autotune"]["selected_batch_size"]
-micro = autotune["training"]["micro_batch_size"]
+micro = autotune["training"]["micro_batch_size_per_gpu"]
 if batch != autotune["rollout"]["batch_size"] or micro <= 0:
     raise SystemExit("Autotune rollout/micro-batch values are inconsistent")
-print(f"Autotuned B200 global batch size: {batch} (global micro-batch: {micro})")
+print(f"Autotuned B200 global batch size: {batch} (microbatch/GPU: {micro})")
 PY
   else
-    "${PYTHON_BIN}" - "${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}" "${MICRO_BATCH_SIZE:-1}" <<'PY'
+    "${PYTHON_BIN}" - "${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}" "${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}" "$(visible_gpu_count)" "${NUM_RESPONSES:-1}" <<'PY'
 import sys
 
-batch, micro = map(int, sys.argv[1:])
-if batch <= 0 or micro <= 0:
-    raise SystemExit("GLOBAL_BATCH_SIZE and MICRO_BATCH_SIZE must be positive integers")
-print(f"Fixed global training batch size: {batch} (global micro-batch: {micro})")
+batch, micro, world_size, responses = map(int, sys.argv[1:])
+if min(batch, micro, world_size, responses) <= 0:
+    raise SystemExit("Batch, microbatch/GPU, world size and responses must be positive")
+local_prompts = (batch + world_size - 1) // world_size
+print(
+    f"FSDP batch: global prompts={batch}, local prompts/GPU={local_prompts}, "
+    f"n={responses}, local trajectories/GPU={local_prompts * responses}, "
+    f"microbatch/GPU={micro}"
+)
 PY
   fi
 }
@@ -145,9 +150,11 @@ batch_autotune_enabled() {
 
 build_training_args() {
   local output_dir="$1"
-  local prompt_batch="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}"
-  local response_count="${NUM_RESPONSES:-4}"
+  local prompt_batch="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}"
+  local response_count="${NUM_RESPONSES:-1}"
   local trajectory_batch=$((prompt_batch * response_count))
+  local process_count="${TRAIN_NPROC_PER_NODE:-$(visible_gpu_count)}"
+  local local_trajectory_batch=$(((trajectory_batch + process_count - 1) / process_count))
   COMMON_TRAIN_ARGS=(
     --set "experiment.output_dir=${output_dir}"
     --set "paths.storage_root=${STORAGE_ROOT}"
@@ -157,6 +164,10 @@ build_training_args() {
     --set "training.learning_rate=${LR:-${LEARNING_RATE:-1.0e-6}}"
     --set "training.save_interval=${SAVE_INTERVAL:-50}"
     --set "training.grad_accum_steps=${GRAD_ACCUM_STEPS:-auto}"
+    --set "training.gradient_checkpointing=${GRADIENT_CHECKPOINTING:-true}"
+    --set "distributed.strategy=${DISTRIBUTED_STRATEGY:-fsdp}"
+    --set "distributed.fsdp.teacher_cpu_offload=${FSDP_TEACHER_CPU_OFFLOAD:-false}"
+    --set "distributed.fsdp.use_no_sync=${FSDP_USE_NO_SYNC:-false}"
     --set "distributed.bucket_cap_mb=${DDP_BUCKET_CAP_MB:-100}"
     --set "rollout.backend=${ROLLOUT_BACKEND:-vllm}"
     --set "rollout.seed=${ROLLOUT_SEED:-42}"
@@ -165,9 +176,9 @@ build_training_args() {
     --set "rollout.temperature=${ROLLOUT_TEMPERATURE:-1.0}"
     --set "rollout.top_p=${ROLLOUT_TOP_P:-1.0}"
     --set "rollout.vllm.gpu_memory_utilization=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
-    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${trajectory_batch}}"
+    --set "rollout.vllm.max_num_seqs=${ROLLOUT_VLLM_MAX_NUM_SEQS:-${local_trajectory_batch}}"
     --set "rollout.vllm.max_model_len=${ROLLOUT_VLLM_MAX_MODEL_LEN:-9216}"
-    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${trajectory_batch}}"
+    --set "rollout.vllm.max_concurrent_requests=${ROLLOUT_VLLM_MAX_CONCURRENT_REQUESTS:-${local_trajectory_batch}}"
     --set "rollout.vllm.wake_headroom_gib=${ROLLOUT_VLLM_WAKE_HEADROOM_GIB:-2}"
     --set "rollout.vllm.enable_chunked_prefill=${ROLLOUT_VLLM_ENABLE_CHUNKED_PREFILL:-true}"
     --set "rollout.vllm.performance_mode=${ROLLOUT_VLLM_PERFORMANCE_MODE:-throughput}"
@@ -191,6 +202,8 @@ build_training_args() {
     --set "selector.rac_scan_backend=${RAC_SCAN_BACKEND:-parallel}"
     --set "logging.token_score_interval=${TOKEN_SCORE_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "logging.log_interval=${LOG_INTERVAL:-1}"
+    --set "logging.tensorboard.enabled=${TENSORBOARD_ENABLED:-true}"
+    --set "logging.tensorboard.log_interval=${TENSORBOARD_LOG_INTERVAL:-1}"
     --set "training_evaluation.enabled=${TRAIN_EVAL_ENABLED:-true}"
     --set "training_evaluation.backend=${TRAIN_EVAL_BACKEND:-vllm}"
     --set "training_evaluation.temperature=${TRAIN_EVAL_TEMPERATURE:-0.7}"
@@ -217,7 +230,7 @@ build_training_args() {
   else
     COMMON_TRAIN_ARGS+=(
       --set "rollout.batch_size=${prompt_batch}"
-      --set "training.micro_batch_size=${MICRO_BATCH_SIZE:-1}"
+      --set "training.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}"
       --set "training.length_bucketed_micro_batches=${LENGTH_BUCKETED_MICRO_BATCHES:-true}"
     )
   fi

@@ -58,6 +58,14 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
         if section in config
     }
     software = {"torch": torch.__version__}
+    if bool(config.get("logging", {}).get("tensorboard", {}).get("enabled", True)):
+        try:
+            software["tensorboard"] = version("tensorboard")
+        except PackageNotFoundError as error:
+            raise RuntimeError(
+                "TensorBoard logging is enabled but tensorboard is not installed; "
+                "run python -m pip install -r requirements.txt"
+            ) from error
     if "vllm" in requested_backends:
         try:
             vllm_version = version("vllm")

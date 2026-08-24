@@ -8,11 +8,19 @@ experiment:
   allow_existing_output: false
   verbose_metrics: false
 
-# scripts/train_{opd,ta,rac}_b200.sh automatically launches one DDP worker per
-# CUDA_VISIBLE_DEVICES entry. rollout.batch_size is the GLOBAL prompt count;
-# after n-way expansion, training.micro_batch_size remains a trajectory count.
+# scripts/train_{opd,ta,rac}_b200.sh launches one FSDP rank per visible GPU.
+# rollout.batch_size is global; micro_batch_size_per_gpu is explicitly local.
 distributed:
+  strategy: fsdp
   backend: nccl
+  fsdp:
+    sharding_strategy: FULL_SHARD
+    use_orig_params: true
+    transformer_layer_cls_names: [Qwen3DecoderLayer]
+    teacher_cpu_offload: false
+    # false reduces/scatters every accumulated microbatch and avoids retaining
+    # full unsharded gradients. Enable only for a measured throughput experiment.
+    use_no_sync: false
   find_unused_parameters: false
   gradient_as_bucket_view: true
   static_graph: true
@@ -44,9 +52,9 @@ rollout:
   # Default training rollout uses a persistent, same-GPU vLLM server. Student
   # weights are synchronized through CUDA IPC before every optimizer step.
   backend: vllm
-  # Prompt batch. n=4 expands 16 prompts to at most 64 trajectories.
-  batch_size: 16
-  num_responses: 4
+  # Global prompt batch. n=1 intentionally creates 64 independent trajectories.
+  batch_size: 64
+  num_responses: 1
   max_new_tokens: 7168
   temperature: 1.0
   top_p: 1.0
@@ -54,13 +62,13 @@ rollout:
   vllm:
     # This is a co-located engine reservation, not an evaluation sample limit.
     # It sleeps at level 2 while HF student/teacher scoring and backward run.
-    # B200-specific: enough KV cache for 64 long trajectories without frequent
+    # Each of two local TP=1 servers receives 32 long trajectories.
     # preemption/recomputation while leaving ample room for the sleeping trainer.
     gpu_memory_utilization: 0.40
-    max_num_seqs: 64
+    max_num_seqs: 32
     # 1024 prompt + 7168 generated tokens, plus small serving headroom.
     max_model_len: 9216
-    max_concurrent_requests: 64
+    max_concurrent_requests: 32
     # Release the trainer CUDA cache only when the sleeping engine otherwise
     # cannot wake with this safety margin; avoid empty_cache on every step.
     wake_headroom_gib: 2
@@ -96,7 +104,8 @@ selector:
   # Forward rows per scoring call; full-vocabulary logits are consumed and
   # released one micro-batch at a time, never retained for the full rollout.
   # Inference-only scoring is much lighter than backward; B200 can score eight
-  # length-bucketed trajectories together while training micro-batch stays 1.
+  # length-bucketed trajectories together; this knob is independent of the
+  # differentiable training micro-batch (8/GPU by default).
   score_micro_batch_size: 8
   # Exact compute optimizations: group similar response lengths and never run
   # student/teacher forwards through right padding after EOS.
@@ -127,9 +136,9 @@ training:
   # the total target step (not the number of extra steps after resume).
   resume_from_checkpoint: null
   resume_allow_config_mismatch: false
-  # Micro-batches are accumulated within each rollout before one optimizer step.
-  micro_batch_size: 1
-  # When MICRO_BATCH_SIZE > 1, group similar response lengths to reduce padding
+  # Local trajectories per differentiable forward/backward on each GPU.
+  micro_batch_size_per_gpu: 8
+  # Group similar response lengths to reduce padding
   # in the differentiable forward/backward pass.
   length_bucketed_micro_batches: true
   grad_accum_steps: auto
@@ -141,7 +150,7 @@ training:
   ppo_dual_clip: 3.0
   max_grad_norm: 1.0
   use_lora: false
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   fused_optimizer: true
   empty_cuda_cache_each_step: false
   save_checkpoints: true
@@ -156,10 +165,16 @@ logging:
   token_score_interval: 50
   token_score_histogram_bins: 64
   token_score_raw_sample_size: 2048
+  tensorboard:
+    enabled: true
+    log_dir: tensorboard
+    log_interval: 1
+    flush_secs: 30
 
 # By default, evaluation runs at step 0, every 50 optimizer steps, and the final
 # step. vLLM uses a short-lived subprocess so its engine memory is returned
-# before training resumes. "hf" remains available as a low-dependency fallback.
+# before training resumes. "hf" remains a single-process/DDP debug fallback;
+# distributed FSDP evaluation exports an HF snapshot and evaluates it with vLLM.
 training_evaluation:
   enabled: true
   backend: vllm

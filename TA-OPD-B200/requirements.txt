@@ -12,4 +12,5 @@ math-verify>=0.8
 safetensors>=0.4
 packaging>=24
 requests>=2.32
+tensorboard>=2.17
 vllm>=0.17.1,<0.18

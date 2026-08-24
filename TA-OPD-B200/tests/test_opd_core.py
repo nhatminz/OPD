@@ -22,9 +22,7 @@ class TopKOPDCoreTests(unittest.TestCase):
             valid = torch.ones(1, 2, dtype=torch.bool)
             # The core must remain safe even if a future caller constructs the
             # frozen reference before leaving its inference-mode scope.
-            reference = build_topk_opd_reference(
-                candidate_ids, student, teacher, valid
-            )
+            reference = build_topk_opd_reference(candidate_ids, student, teacher, valid)
 
         self.assertFalse(torch.is_inference(reference.candidate_ids))
         self.assertFalse(torch.is_inference(reference.old_student_log_probs))
@@ -72,7 +70,9 @@ class TopKOPDCoreTests(unittest.TestCase):
 
     def test_policy_loss_uses_all_candidates_not_only_sampled_token(self):
         student = torch.log_softmax(torch.arange(16, dtype=torch.float32), dim=0)
-        teacher = torch.log_softmax(torch.arange(15, -1, -1, dtype=torch.float32), dim=0)
+        teacher = torch.log_softmax(
+            torch.arange(15, -1, -1, dtype=torch.float32), dim=0
+        )
         student = student.reshape(1, 1, 16)
         teacher = teacher.reshape(1, 1, 16)
         valid = torch.ones(1, 1, dtype=torch.bool)
@@ -100,15 +100,12 @@ class TopKOPDCoreTests(unittest.TestCase):
             "rac": torch.tensor([[0.1, 0.2, 0.0], [0.4, 0.8, 1.0]]),
         }
         for weights in allocations.values():
-            numerator, denominator = weighted_token_sums(
-                per_position, weights, valid
-            )
+            numerator, denominator = weighted_token_sums(per_position, weights, valid)
             expected_weights = weights * valid
             self.assertTrue(
                 torch.allclose(
                     numerator / denominator,
-                    (per_position * expected_weights).sum()
-                    / expected_weights.sum(),
+                    (per_position * expected_weights).sum() / expected_weights.sum(),
                 )
             )
 

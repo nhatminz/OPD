@@ -13,6 +13,8 @@ from typing import Any
 import torch
 import yaml
 
+from .fsdp import is_fsdp_model, scatter_full_optimizer_state_dict
+
 
 _CHECKPOINT_PATTERN = re.compile(r"^checkpoint-(\d+)$")
 _SELECTOR_CHUNK_PATTERN = re.compile(
@@ -123,10 +125,66 @@ def _restore_rng_states(payload: dict[str, Any], device: torch.device) -> None:
 
 
 def restore_optimizer(
-    optimizer, checkpoint: str | Path, device: torch.device
+    optimizer,
+    checkpoint: str | Path,
+    device: torch.device,
+    *,
+    model=None,
+    distributed=None,
 ) -> ResumeState:
     checkpoint = Path(checkpoint).resolve()
     optimizer_path = checkpoint / "optimizer.pt"
+    if model is not None and is_fsdp_model(model):
+        if distributed is None:
+            raise ValueError("FSDP optimizer restore requires distributed context")
+        payload = (
+            _torch_load(optimizer_path, torch.device("cpu"))
+            if distributed.is_main
+            else None
+        )
+        metadata = (
+            {key: value for key, value in payload.items() if key != "optimizer"}
+            if payload is not None
+            else None
+        )
+        metadata = distributed.broadcast_object(metadata)
+        if not isinstance(metadata, dict) or "step" not in metadata:
+            raise ValueError(f"Invalid FSDP optimizer checkpoint {optimizer_path}")
+        if metadata.get("optimizer_format") != "fsdp_full_v1":
+            raise ValueError(
+                "This optimizer checkpoint was not saved in FSDP full-state "
+                "format. Its HF model weights remain usable as initialization, "
+                "but true FSDP optimizer resume is unavailable."
+            )
+        sharded_state = scatter_full_optimizer_state_dict(
+            payload["optimizer"] if payload is not None else None,
+            model,
+            optimizer,
+        )
+        optimizer.load_state_dict(sharded_state)
+        step = int(metadata["step"])
+        if step < 0:
+            raise ValueError(f"Resume step must be non-negative, got {step}")
+        rng_states = metadata.get("rng_states")
+        if isinstance(rng_states, list) and rng_states:
+            rank_state = rng_states[
+                distributed.rank if distributed.rank < len(rng_states) else 0
+            ]
+            _restore_rng_states(
+                {
+                    "torch_rng_state": rank_state["torch_rng_state"],
+                    "cuda_rng_state_all": [rank_state["cuda_rng_state"]],
+                },
+                device,
+            )
+        match = _CHECKPOINT_PATTERN.match(checkpoint.name)
+        if match is not None and int(match.group(1)) != step:
+            raise ValueError(
+                f"Checkpoint directory says step {int(match.group(1))}, but "
+                f"optimizer.pt says step {step}"
+            )
+        return ResumeState(checkpoint, optimizer_path, step)
+
     payload = _torch_load(optimizer_path, device)
     if (
         not isinstance(payload, dict)
@@ -441,6 +499,7 @@ def validate_resume_config(
     keys = (
         "experiment.method",
         "experiment.seed",
+        "distributed.strategy",
         "models.student_path",
         "models.teacher_path",
         "data.path",

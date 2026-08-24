@@ -78,9 +78,7 @@ def base_evaluation_cache_key(
         "model_path": str(model_path),
         "model_signature": _model_signature(model_path),
         "model_dtype": config.get("models", {}).get("dtype"),
-        "chat_template_kwargs": config.get("data", {}).get(
-            "chat_template_kwargs", {}
-        ),
+        "chat_template_kwargs": config.get("data", {}).get("chat_template_kwargs", {}),
         "runtime_settings": runtime_settings,
         "benchmarks": benchmark_signatures,
     }
@@ -284,16 +282,12 @@ def evaluate_or_reuse_base(
         )
         if cached is not None:
             return (
-                materialize_evaluation(
-                    cache_entry, destination, model_name=model_name
-                ),
+                materialize_evaluation(cache_entry, destination, model_name=model_name),
                 "shared",
             )
 
         suite = evaluator()
-        verified = load_compatible_evaluation(
-            destination, model_path, runtime_settings
-        )
+        verified = load_compatible_evaluation(destination, model_path, runtime_settings)
         if verified is None:
             raise RuntimeError(
                 "Base evaluator completed without a compatible summary/prediction set"

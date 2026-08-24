@@ -34,9 +34,10 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 | AIME 2024 | `nlp/minhpn19/data/eval/aime24` |
 | AIME 2025 | `nlp/minhpn19/data/eval/aime25` |
 
-Training luôn đọc toàn bộ split `all`; batch cuối không được pad hay lặp. Loader hỗ trợ parquet,
-JSON và JSONL. Evaluation chọn file hỗ trợ theo thứ tự xác định, xác minh schema question/answer và
-lưu schema đã dùng trong output.
+Training luôn đọc toàn bộ split `all`. Nếu batch cuối không chia hết cho hai rank, rank ngắn hơn
+dùng một trajectory filler xác định chỉ để giữ lịch collective FSDP giống nhau; filler bị loại khỏi
+loss, selector, metric và log nên mỗi sample thật vẫn được dùng đúng một lần. Loader hỗ trợ parquet,
+JSON và JSONL.
 
 ## Common Top-K OPD core
 
@@ -50,7 +51,7 @@ ell_t     = sum_k PPOClippedLoss(log p_t(k), log p_old,t(k), A_t,k)
 ```
 
 `K=16` là optimization support thật, không phải diagnostic và không còn objective sampled-token-only.
-Sau đó cả ba method dùng cùng normalization trên **global rollout batch**, bao gồm mọi DDP rank:
+Sau đó cả ba method dùng cùng normalization trên **global rollout batch**, bao gồm mọi FSDP rank:
 
 ```text
 L = sum_t w_t * ell_t / sum_t w_t
@@ -69,7 +70,7 @@ D_t = KL(qbar_t^U || pbar_t^U)
 C_t = sum_{v in TopK(student)} q_t(v)
 ```
 
-`D` và `C` được robust-normalize trên **toàn global rollout batch**, kể cả khi dùng DDP:
+`D` và `C` được robust-normalize trên **toàn global rollout batch**, kể cả khi dùng FSDP:
 
 ```text
 Norm_B(z) = clip((z - Q05(z)) / (Q95(z) - Q05(z) + eps), 0, 1)
@@ -109,21 +110,23 @@ trong shared config để audit fairness.
 
 ## Hot path
 
-- Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server;
-  HF fallback có thể bật bằng `ROLLOUT_BACKEND=hf`.
+- Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server
+  TP=1 trên từng rank. HF fallback chỉ dành cho single-process/DDP debug; production FSDP yêu cầu
+  vLLM để mọi rank có lịch collective xác định.
 - Common core score student Top-K và teacher-on-student IDs một lần. Với TA/RAC, student và teacher
   được forward chung theo từng bounded micro-batch: code lấy luôn student-on-teacher Top-K từ logit
   view đang có, nên literal union vẫn chính xác nhưng bỏ được forward student thứ ba. OPD không cần
   thống kê chéo này. Mọi scoring chỉ giữ tensor `[B,T,K]` qua toàn rollout; hai full-vocabulary logit
   view BF16 chỉ cùng tồn tại bên trong một scoring micro-batch rồi được giải phóng.
-  Mỗi prompt được interleave `n=4` lần và gửi thành bốn request có seed riêng; RAC không yêu cầu
-  counterfactual generation.
+  Default `n=1`: 64 prompt toàn cục tạo đúng 64 trajectory độc lập, tức 32 trajectory/GPU trên hai
+  GPU; RAC không yêu cầu counterfactual generation.
 - TA top-K/KL, actual-token log-prob ratio, global quantiles, RAC weights và loss weighting đều là
   tensor operations trên GPU, với BF16 model forward và FP32 cho logsumexp/score/reduction nhạy số.
 - Bellman mặc định dùng associative affine suffix scan O(log T), vector hóa theo batch. Backend
   `reference` chứa recurrence rõ ràng để debug/cross-check.
-- BF16, FlashAttention 2 nếu có (SDPA fallback), fused AdamW nếu runtime hỗ trợ, DDP world size tự
-  phát hiện và vLLM CUDA-IPC live-weight sync được giữ nguyên.
+- Student và frozen teacher đều dùng FSDP `FULL_SHARD`, Qwen3 decoder-layer auto wrap,
+  `use_orig_params=True`, BF16 và FSDP-aware global gradient clipping. Trước mỗi rollout, mọi rank
+  cùng materialize full student trên GPU và gửi current HF-named weights tới vLLM local qua CUDA IPC.
 
 Không có speedup nào được khẳng định trước khi đo trên B200. Metrics tách riêng rollout, teacher
 score, TA local score, Bellman scan, forward/backward, optimizer, evaluation, throughput và peak
@@ -145,17 +148,16 @@ rollout, seed, batch, optimizer, schedule và evaluation settings được kế 
 Các launcher đều expose:
 
 ```text
-LR EPOCHS MAX_STEPS BATCH_SIZE MICRO_BATCH_SIZE NUM_RESPONSES
+LR EPOCHS MAX_STEPS BATCH_SIZE MICRO_BATCH_SIZE_PER_GPU NUM_RESPONSES
 MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TOP_K TA_RHO
 RAC_GAMMA RAC_W_MIN RAC_BETA RAC_SCAN_BACKEND
 EVAL_INTERVAL SAVE_INTERVAL LOG_INTERVAL SEED
 ```
 
-Defaults là BF16, full-parameter student, `LR=1e-6`, một epoch, prompt batch 16, `n=4`
-(tối đa 64 trajectories), micro-batch 1, prompt/response `1024/7168`, eval/save mỗi 50 step. Đây là
-điểm bắt đầu thận trọng nhưng **không phải
-cam kết fit** cho mọi driver/package/GPU layout; chạy preflight và điều chỉnh batch/length/memory
-fraction đối xứng cho OPD, TA và RAC.
+Production defaults là hai rank FSDP, BF16 full-parameter student, `LR=1e-6`, một epoch, global
+prompt batch 64, `n=1`, local trajectories 32/GPU, micro-batch 8/GPU và bốn accumulated
+microbatch/GPU/step. Prompt/response là `1024/7168`, eval/save mỗi 50 step. Micro-batch không tự
+giảm khi OOM và LR không tự scale; thử `8 → 16`, rồi lùi về `4` nếu thiếu VRAM, giữ global batch 64.
 
 Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric
 chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
@@ -179,10 +181,11 @@ ta_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
 rac_bellman_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
 ```
 
-Mỗi output chứa `resolved_config.yaml`, metadata, `metrics.jsonl`, `train_metrics.csv`,
+Mỗi output chứa `resolved_config.yaml`, metadata, `metrics.jsonl`, `train_metrics.csv`, TensorBoard,
 `eval_metrics.csv`, periodic full eval, compact `token_score_stats`, checkpoints và `latest.json`.
-Checkpoint được ghi qua temporary directory rồi atomic rename; model, optimizer step/state và
-Torch/CUDA RNG state được khôi phục. Dùng checkpoint cụ thể hoặc `RESUME=auto` cùng tên run cũ.
+Checkpoint được ghi qua temporary directory rồi atomic rename. Mọi rank tham gia full state-dict;
+rank 0 ghi checkpoint HF load trực tiếp được và FSDP full optimizer state portable cùng step/RNG.
+Dùng checkpoint cụ thể hoặc `RESUME=auto` cùng tên run cũ.
 
 Eval thủ công một checkpoint bất kỳ dùng
 `scripts/eval_checkpoint_b200.sh METHOD CHECKPOINT [OUTPUT_DIR]`, trong đó `METHOD` là `opd`,
@@ -202,11 +205,13 @@ mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn t�
 
 ## Validation
 
-Các test nhẹ bao phủ Top-K OPD khớp upstream trên synthetic logits, n=4 expansion, global
-weighted-token mean/DDP, uniform pure-OPD allocation, literal TA formula, robust normalization,
+Các test nhẹ bao phủ Top-K OPD khớp upstream trên synthetic logits, `n=1`, global
+weighted-token mean, FSDP batching/accumulation, uniform pure-OPD allocation, literal TA formula,
 Bellman recurrence tính tay,
 padding/trajectory reset, bounds, detachment, gradient path, optimized/reference equivalence,
-global DDP normalization/budget, resume, eval schedule, loaders, vLLM wrappers và plotting.
+global distributed normalization/budget, tail padding, resume, eval schedule, minimal TensorBoard,
+loaders, vLLM wrappers và plotting. Test tích hợp hai CUDA rank kiểm tra FULL_SHARD student/teacher,
+HF parameter names/shapes, FSDP-aware update, full checkpoint và optimizer scatter-resume.
 
 ```bash
 python -m unittest discover -s tests -v
@@ -217,3 +222,5 @@ bash -n scripts/*.sh
 `scripts/smoke_test_b200.sh` chạy unit tests rồi preflight model/data/GPU; nó không tự bắt đầu full
 training trừ khi chủ động bật batch autotune. Khi autotune được bật, step đầu của OPD/TA/RAC còn
 phải có cùng rollout hash và đúng allocation policy trước khi batch candidate được chấp nhận.
+`scripts/smoke_test_fsdp_2gpu.sh` là smoke thật hai step trên hai GPU, bao gồm lần sync weight thứ
+hai, vLLM/HF log-prob check, checkpoint reload và kiểm tra chính xác TensorBoard tags.

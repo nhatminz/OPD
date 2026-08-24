@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 @dataclass(frozen=True)
 class DistributedContext:
-    """Small, explicit wrapper around single-node DDP state."""
+    """Small, explicit wrapper around single-node distributed state."""
 
     rank: int
     local_rank: int
@@ -41,6 +41,9 @@ class DistributedContext:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return float(tensor.item())
 
+    def mean_float(self, value: float) -> float:
+        return self.sum_float(value) / self.world_size
+
     def max_float(self, value: float) -> float:
         tensor = torch.tensor(value, dtype=torch.float64, device=self.device)
         if self.enabled:
@@ -55,6 +58,20 @@ class DistributedContext:
 
     def any(self, value: bool) -> bool:
         return self.max_int(int(value)) != 0
+
+    def all_gather_objects(self, value):
+        if not self.enabled:
+            return [value]
+        gathered = [None for _ in range(self.world_size)]
+        dist.all_gather_object(gathered, value)
+        return gathered
+
+    def broadcast_object(self, value, source: int = 0):
+        if not self.enabled:
+            return value
+        values = [value if self.rank == source else None]
+        dist.broadcast_object_list(values, src=source, device=self.device)
+        return values[0]
 
     def all_gather_variable_1d(
         self, values: torch.Tensor
@@ -128,6 +145,82 @@ def contiguous_partition(total: int, rank: int, world_size: int) -> tuple[int, i
     start = rank * quotient + min(rank, remainder)
     length = quotient + int(rank < remainder)
     return start, start + length
+
+
+@dataclass(frozen=True)
+class BatchLayout:
+    global_prompt_batch_size: int
+    world_size: int
+    local_prompt_batch_size: int
+    num_responses: int
+    global_trajectory_batch_size: int
+    local_trajectory_batch_size: int
+    micro_batch_size_per_gpu: int
+    micro_batches_per_gpu: int
+
+
+def batch_layout(
+    global_prompt_batch_size: int,
+    num_responses: int,
+    world_size: int,
+    micro_batch_size_per_gpu: int,
+) -> BatchLayout:
+    """Resolve explicit global/local batch semantics for one training step."""
+    values = {
+        "global_prompt_batch_size": int(global_prompt_batch_size),
+        "num_responses": int(num_responses),
+        "world_size": int(world_size),
+        "micro_batch_size_per_gpu": int(micro_batch_size_per_gpu),
+    }
+    invalid = {name: value for name, value in values.items() if value <= 0}
+    if invalid:
+        raise ValueError(f"Batch layout values must be positive: {invalid}")
+    local_prompts = (
+        values["global_prompt_batch_size"] + values["world_size"] - 1
+    ) // values["world_size"]
+    return BatchLayout(
+        global_prompt_batch_size=values["global_prompt_batch_size"],
+        world_size=values["world_size"],
+        local_prompt_batch_size=local_prompts,
+        num_responses=values["num_responses"],
+        global_trajectory_batch_size=(
+            values["global_prompt_batch_size"] * values["num_responses"]
+        ),
+        local_trajectory_batch_size=local_prompts * values["num_responses"],
+        micro_batch_size_per_gpu=values["micro_batch_size_per_gpu"],
+        micro_batches_per_gpu=(
+            local_prompts * values["num_responses"]
+            + values["micro_batch_size_per_gpu"]
+            - 1
+        )
+        // values["micro_batch_size_per_gpu"],
+    )
+
+
+def padded_local_indices(
+    global_indices: list[int], rank: int, world_size: int
+) -> tuple[list[int], list[bool]]:
+    """Return equal-sized rank batches while marking deterministic tail padding.
+
+    Every real index remains present exactly once. At an uneven dataset tail the
+    shorter ranks repeat one local index only to keep FSDP collective schedules
+    identical; callers must exclude entries whose active flag is false from the
+    objective and all scientific metrics.
+    """
+    total = len(global_indices)
+    if total <= 0:
+        raise ValueError("Global batch must contain at least one real prompt")
+    start, end = contiguous_partition(total, rank, world_size)
+    local = list(global_indices[start:end])
+    target = (total + world_size - 1) // world_size
+    active = [True] * len(local)
+    # Empty ranks (possible for a one-sample final tail) use a global sample as
+    # collective-only filler. It remains inactive and contributes nowhere.
+    filler = local[-1] if local else global_indices[-1]
+    while len(local) < target:
+        local.append(filler)
+        active.append(False)
+    return local, active
 
 
 def unique_free_port(context: DistributedContext, attempts: int = 10) -> int:

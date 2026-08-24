@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 export OPD_RUN_NAME="${OPD_RUN_NAME:-opd_qwen3_4b_to_1p7b_${RUN_TIMESTAMP}}"
 export TA_RUN_NAME="${TA_RUN_NAME:-ta_qwen3_4b_to_1p7b_${RUN_TIMESTAMP}}"
@@ -12,10 +12,10 @@ export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_bellman_qwen3_4b_to_1p7b_${RUN_TIMESTAM
 export RUN_NAME="${RUN_NAME:-comparison_${RUN_TIMESTAMP}}"
 # Shared GLOBAL rollout/micro-batch for all methods. Changing the visible GPU
 # count changes only the per-GPU shard; it does not change optimizer semantics.
-export GLOBAL_BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-16}}}"
+export GLOBAL_BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}"
 export BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
-export NUM_RESPONSES="${NUM_RESPONSES:-4}"
-export MICRO_BATCH_SIZE="${MICRO:-${MICRO_BATCH_SIZE:-1}}"
+export NUM_RESPONSES="${NUM_RESPONSES:-1}"
+export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}}"
 export DDP_BUCKET_CAP_MB="${DDP_BUCKET_CAP_MB:-100}"
 # Set true only when you explicitly want smoke_test_b200.sh to search candidates.
 export USE_BATCH_AUTOTUNE="${USE_BATCH_AUTOTUNE:-false}"

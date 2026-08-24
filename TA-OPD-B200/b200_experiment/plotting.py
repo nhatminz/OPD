@@ -505,9 +505,7 @@ def plot_training_progress(
     compared_names = ", ".join(
         _PROGRESS_METHODS[item]["label"] for item in selected_methods
     )
-    fig.suptitle(
-        f"Evaluation {metric_name} during {compared_names} training", y=1.02
-    )
+    fig.suptitle(f"Evaluation {metric_name} during {compared_names} training", y=1.02)
     fig.tight_layout()
     progress_path = plots_dir / "accuracy_over_steps.png"
     _save_figure(fig, progress_path)

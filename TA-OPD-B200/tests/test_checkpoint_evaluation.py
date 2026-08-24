@@ -54,9 +54,7 @@ class CheckpointEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = self._make_run(Path(temporary), "opd")
 
-            _, _, targets, max_steps = discover_evaluation_targets(
-                output, "opd", "OPD"
-            )
+            _, _, targets, max_steps = discover_evaluation_targets(output, "opd", "OPD")
 
             self.assertEqual([target.step for target in targets], [0, 50, 100])
             self.assertEqual(targets[-1].model_path.name, "final")
@@ -68,7 +66,9 @@ class CheckpointEvaluationTests(unittest.TestCase):
             unmatched = output / "training_eval/step-000075"
             unmatched.mkdir(parents=True)
 
-            with self.assertRaisesRegex(ValueError, "without a matching saved checkpoint"):
+            with self.assertRaisesRegex(
+                ValueError, "without a matching saved checkpoint"
+            ):
                 discover_evaluation_targets(output, "ta", "TA-OPD")
 
     def test_new_history_and_metrics_replace_old_files(self):
@@ -110,8 +110,7 @@ class CheckpointEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outputs = {
-                method: self._make_run(root, method)
-                for method in ("opd", "ta", "rac")
+                method: self._make_run(root, method) for method in ("opd", "ta", "rac")
             }
 
             return_code = main(
