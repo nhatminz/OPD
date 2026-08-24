@@ -102,12 +102,12 @@ def record_messages(
 
 
 def stable_sample_id(record: dict[str, Any], dataset_index: int) -> str:
-    for key in ("id", "index", "uuid", "sample_id"):
+    for key in ("id", "index", "uuid", "sample_id", "unique_id"):
         if key in record and record[key] is not None:
             return str(record[key])
     extra = record.get("extra_info")
     if isinstance(extra, dict):
-        for key in ("id", "index", "uuid", "sample_id"):
+        for key in ("id", "index", "uuid", "sample_id", "unique_id"):
             if key in extra and extra[key] is not None:
                 return str(extra[key])
     return str(dataset_index)

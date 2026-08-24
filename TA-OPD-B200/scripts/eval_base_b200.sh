@@ -3,7 +3,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 resolve_run_paths
-MODEL_PATH="${BASE_CHECKPOINT:-${STORAGE_ROOT}/models/Qwen3-1.7B}"
+MODEL_PATH="${BASE_CHECKPOINT:-${STORAGE_ROOT}/nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}"
 EVAL_OUTPUT="${BASE_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/base}"
 require_file "${MODEL_PATH}/config.json"
 cd "${REPO_DIR}"

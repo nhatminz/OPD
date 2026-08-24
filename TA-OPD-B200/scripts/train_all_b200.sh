@@ -6,9 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-export OPD_RUN_NAME="${OPD_RUN_NAME:-opd_qwen3_4b_to_1p7b_${RUN_TIMESTAMP}}"
-export TA_RUN_NAME="${TA_RUN_NAME:-ta_qwen3_4b_to_1p7b_${RUN_TIMESTAMP}}"
-export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_bellman_qwen3_4b_to_1p7b_${RUN_TIMESTAMP}}"
+export OPD_RUN_NAME="${OPD_RUN_NAME:-opd_qwen3_8b_to_1p7b_base_${RUN_TIMESTAMP}}"
+export TA_RUN_NAME="${TA_RUN_NAME:-ta_qwen3_8b_to_1p7b_base_${RUN_TIMESTAMP}}"
+export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_bellman_qwen3_8b_to_1p7b_base_${RUN_TIMESTAMP}}"
 export RUN_NAME="${RUN_NAME:-comparison_${RUN_TIMESTAMP}}"
 # Shared GLOBAL rollout/micro-batch for all methods. Changing the visible GPU
 # count changes only the per-GPU shard; it does not change optimizer semantics.

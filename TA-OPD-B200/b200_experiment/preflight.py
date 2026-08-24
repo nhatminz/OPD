@@ -34,7 +34,7 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
         config["data"]["path"], split=config["data"].get("split")
     )
     if not records:
-        raise ValueError("DAPO training dataset is empty")
+        raise ValueError("Competition-MATH training dataset is empty")
     prompt_key = config["data"].get("prompt_key", "prompt")
     examples = []
     for index, row in enumerate(records[:3]):

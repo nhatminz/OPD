@@ -13,8 +13,8 @@ from transformers import AutoTokenizer
 
 from .config import load_config
 from .evaluation import (
-    BENCHMARK_ORDER,
     _grade,
+    configured_benchmark_names,
     detailed_model_output_record,
     evaluation_metric_name,
     load_benchmark,
@@ -88,10 +88,9 @@ def evaluate_vllm_suite(
     if samples_per_problem <= 0:
         raise ValueError("Evaluation num_responses must be positive")
     limit = runtime_settings.get("limit")
-    benchmark_names = tuple(runtime_settings.get("benchmark_names", BENCHMARK_ORDER))
-    unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
-    if unknown:
-        raise ValueError(f"Unknown training-evaluation benchmarks: {sorted(unknown)}")
+    benchmark_names = configured_benchmark_names(
+        config, runtime_settings.get("benchmark_names")
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     loaded: dict[str, tuple[list[dict[str, str]], dict[str, Any]]] = {}

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================== RAC PARAMETERS: EDIT HERE ===================
 # A fresh invocation gets a local-time run name automatically. You can still
 # pass RUN_NAME=... explicitly, especially when resuming an existing run.
-export RUN_NAME="${RUN_NAME:-rac_bellman_qwen3_4b_to_1p7b_$(date +%Y%m%d_%H%M%S)}"
+export RUN_NAME="${RUN_NAME:-rac_bellman_qwen3_8b_to_1p7b_base_$(date +%Y%m%d_%H%M%S)}"
 export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export SEED="${SEED:-42}"

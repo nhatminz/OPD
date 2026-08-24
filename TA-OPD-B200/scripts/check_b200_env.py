@@ -21,9 +21,13 @@ def _version(name: str) -> str:
 def main() -> int:
     storage = Path(os.environ.get("STORAGE_ROOT", "/workspace/storage-shared"))
     paths = {
-        "teacher": storage / "models/Qwen3-4B",
-        "student": storage / "models/Qwen3-1.7B",
-        "training_data": storage / "nlp/minhpn19/data/DAPO-Math-17k-Processed",
+        "teacher": storage / "models/Qwen3-8B",
+        "student": storage
+        / "nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base",
+        "training_data": storage
+        / "nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet",
+        "competition_math_test": storage
+        / "nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet",
         "math500": storage / "nlp/minhpn19/data/eval/math500",
         "aime24": storage / "nlp/minhpn19/data/eval/aime24",
         "aime25": storage / "nlp/minhpn19/data/eval/aime25",

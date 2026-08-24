@@ -32,17 +32,17 @@ paths:
   storage_root: /workspace/storage-shared
 
 models:
-  teacher_path: models/Qwen3-4B
-  student_path: models/Qwen3-1.7B
+  teacher_path: models/Qwen3-8B
+  student_path: nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
   dtype: bfloat16
   attention_implementation: auto
 
 data:
-  path: nlp/minhpn19/data/DAPO-Math-17k-Processed
-  # The root also contains language-specific mirrors; "all" is the complete
-  # 17k split and avoids duplicating cn/en rows.
-  split: all
-  prompt_key: prompt
+  # Local copy of nlile/hendrycks-MATH-benchmark. Use only its train split for
+  # optimization; the disjoint test parquet is configured below for evaluation.
+  path: nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+  split: null
+  prompt_key: problem
   prefer_source_prompt: false
   max_prompt_tokens: 1024
   chat_template_kwargs:
@@ -185,7 +185,7 @@ training_evaluation:
   interval_steps: 50
   eval_at_start: true
   eval_at_end: true
-  benchmark_names: [MATH-500, AIME24, AIME25]
+  benchmark_names: [Competition-MATH, MATH-500, AIME24, AIME25]
   # Used only by the Hugging Face fallback backend.
   batch_size: 1
   max_new_tokens: 7168
@@ -240,6 +240,11 @@ evaluation:
     async_scheduling: true
     seed: 1234
   benchmarks:
+    Competition-MATH:
+      path: nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet
+      question_key: problem
+      answer_key: answer
+      id_key: unique_id
     MATH-500:
       path: nlp/minhpn19/data/eval/math500
     AIME24:

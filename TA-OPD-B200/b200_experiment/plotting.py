@@ -108,12 +108,29 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
     if not rows:
         raise ValueError(f"{spec['label']} evaluation history is empty: {history_path}")
     rows.sort(key=lambda row: int(row["step"]))
+    expected_benchmarks: tuple[str, ...] | None = None
     for row in rows:
+        reported = row.get("benchmarks", {})
+        unknown = set(reported) - set(BENCHMARK_ORDER)
+        benchmark_names = tuple(
+            benchmark for benchmark in BENCHMARK_ORDER if benchmark in reported
+        )
+        if unknown or not benchmark_names:
+            raise ValueError(
+                f"{spec['label']} evaluation at step {row.get('step')} has invalid "
+                f"benchmarks: {tuple(reported)}"
+            )
+        if expected_benchmarks is None:
+            expected_benchmarks = benchmark_names
+        elif benchmark_names != expected_benchmarks:
+            raise ValueError(
+                f"{spec['label']} evaluation history mixes benchmark sets: "
+                f"{expected_benchmarks} vs {benchmark_names}"
+            )
         missing = [
             benchmark
-            for benchmark in BENCHMARK_ORDER
-            if benchmark not in row.get("benchmarks", {})
-            or "accuracy" not in row["benchmarks"][benchmark]
+            for benchmark in benchmark_names
+            if "accuracy" not in reported[benchmark]
         ]
         if missing:
             raise ValueError(
@@ -121,6 +138,23 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
                 f"accuracy for: {', '.join(missing)}"
             )
     return rows
+
+
+def _shared_history_benchmarks(histories: dict[str, list[dict]]) -> tuple[str, ...]:
+    shared: tuple[str, ...] | None = None
+    for method, rows in histories.items():
+        reported = rows[0]["benchmarks"]
+        current = tuple(name for name in BENCHMARK_ORDER if name in reported)
+        if shared is None:
+            shared = current
+        elif current != shared:
+            raise ValueError(
+                "Cannot compare histories with different benchmark sets: "
+                f"{shared} vs {current} for {method}"
+            )
+    if not shared:
+        raise ValueError("No common evaluation benchmarks were found")
+    return shared
 
 
 def _history_metric_name(histories: dict[str, list[dict]]) -> str:
@@ -306,22 +340,28 @@ def _plot_token_score_distributions(
 
 
 def _plot_single_method_accuracy(
-    plots_dir: Path, method: str, rows: list[dict], metric_name: str
+    plots_dir: Path,
+    method: str,
+    rows: list[dict],
+    metric_name: str,
+    benchmark_names: tuple[str, ...],
 ) -> Path:
     spec = _PROGRESS_METHODS[method]
     colors = {
+        "Competition-MATH": "tab:purple",
         "MATH-500": "tab:blue",
         "AIME24": "tab:orange",
         "AIME25": "tab:green",
     }
     line_styles = {
+        "Competition-MATH": ":",
         "MATH-500": "-",
         "AIME24": "--",
         "AIME25": "-.",
     }
     steps = [int(row["step"]) for row in rows]
     fig, axis = plt.subplots(figsize=(9, 5.5))
-    for benchmark in BENCHMARK_ORDER:
+    for benchmark in benchmark_names:
         values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
         axis.plot(
             steps,
@@ -350,16 +390,18 @@ def _write_training_history(
     results_dir: Path,
     histories: dict[str, list[dict]],
     base_accuracy: dict[str, float],
+    benchmark_names: tuple[str, ...],
     filename_prefix: str = "",
 ) -> tuple[Path, Path]:
     combined_rows = []
-    if all(benchmark in base_accuracy for benchmark in BENCHMARK_ORDER):
+    if all(benchmark in base_accuracy for benchmark in benchmark_names):
         combined_rows.append(
             {
                 "Method": "Base",
                 "Step": 0,
                 **{
-                    benchmark: base_accuracy[benchmark] for benchmark in BENCHMARK_ORDER
+                    benchmark: base_accuracy[benchmark]
+                    for benchmark in benchmark_names
                 },
             }
         )
@@ -371,13 +413,15 @@ def _write_training_history(
                     "Step": int(row["step"]),
                     **{
                         benchmark: float(row["benchmarks"][benchmark]["accuracy"])
-                        for benchmark in BENCHMARK_ORDER
+                        for benchmark in benchmark_names
                     },
                 }
             )
     csv_path = results_dir / f"{filename_prefix}training_eval_history.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("Method", "Step", *BENCHMARK_ORDER))
+        writer = csv.DictWriter(
+            handle, fieldnames=("Method", "Step", *benchmark_names)
+        )
         writer.writeheader()
         writer.writerows(combined_rows)
     json_path = results_dir / f"{filename_prefix}training_eval_history.json"
@@ -412,10 +456,11 @@ def plot_training_progress(
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
         for item in selected_methods
     }
+    benchmark_names = _shared_history_benchmarks(histories)
     metric_name = _history_metric_name(histories)
 
     base_accuracy: dict[str, float] = {}
-    for benchmark in BENCHMARK_ORDER:
+    for benchmark in benchmark_names:
         candidates = [
             float(rows[0]["benchmarks"][benchmark]["accuracy"])
             for rows in histories.values()
@@ -433,11 +478,15 @@ def plot_training_progress(
         selected_method = selected_methods[0]
         rows = next(iter(histories.values()))
         progress_path = _plot_single_method_accuracy(
-            plots_dir, selected_method, rows, metric_name
+            plots_dir, selected_method, rows, metric_name, benchmark_names
         )
         prefix = f"{_PROGRESS_METHODS[selected_method]['slug']}_"
         history_csv, history_json = _write_training_history(
-            results_dir, histories, base_accuracy, filename_prefix=prefix
+            results_dir,
+            histories,
+            base_accuracy,
+            benchmark_names,
+            filename_prefix=prefix,
         )
         return {
             "method": _PROGRESS_METHODS[selected_method]["label"],
@@ -447,13 +496,19 @@ def plot_training_progress(
             "history_json": str(history_json),
         }
 
-    fig, axes = plt.subplots(1, len(BENCHMARK_ORDER), figsize=(15, 4.8), sharey=True)
+    fig, axes = plt.subplots(
+        1,
+        len(benchmark_names),
+        figsize=(5 * len(benchmark_names), 4.8),
+        sharey=True,
+    )
+    axes = np.atleast_1d(axes)
     colors = {
         spec["label"]: spec["color"]
         for item, spec in _PROGRESS_METHODS.items()
         if item in selected_methods
     }
-    for axis, benchmark in zip(axes, BENCHMARK_ORDER):
+    for axis, benchmark in zip(axes, benchmark_names):
         maximum_step = 0
         for method, rows in histories.items():
             steps = [int(row["step"]) for row in rows]
@@ -487,7 +542,7 @@ def plot_training_progress(
                 colors="black",
                 linestyles="--",
                 linewidth=1.5,
-                label="Base Qwen3-1.7B",
+                label="Base student",
             )
         axis.set_title(benchmark)
         axis.set_xlabel("Optimizer step")
@@ -512,7 +567,7 @@ def plot_training_progress(
     plt.close(fig)
 
     history_csv, history_json = _write_training_history(
-        results_dir, histories, base_accuracy
+        results_dir, histories, base_accuracy, benchmark_names
     )
     selected_outputs = {
         item: outputs[item] for item in selected_methods if outputs[item] is not None
@@ -543,6 +598,21 @@ def plot_results(
     comparison_path = results_dir / "comparison.csv"
     with comparison_path.open(encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"comparison.csv is empty: {comparison_path}")
+    benchmark_names = tuple(
+        benchmark for benchmark in BENCHMARK_ORDER if benchmark in rows[0]
+    )
+    if not benchmark_names:
+        raise ValueError(
+            f"comparison.csv contains none of the supported benchmarks: {BENCHMARK_ORDER}"
+        )
+    for row in rows:
+        missing = [name for name in benchmark_names if row.get(name) in (None, "")]
+        if missing:
+            raise ValueError(
+                f"comparison.csv row {row.get('Method')} is missing: {missing}"
+            )
     by_method = {row["Method"]: row for row in rows}
     plotted_models = tuple(by_method)
     expected_models = tuple(item for item in MODEL_ORDER if item in by_method)
@@ -573,20 +643,20 @@ def plot_results(
         if configured_metrics:
             metric_name = configured_metrics.pop()
 
-    x = np.arange(len(BENCHMARK_ORDER))
+    x = np.arange(len(benchmark_names))
     width = min(0.8 / len(plotted_models), 0.24)
-    fig, axis = plt.subplots(figsize=(9, 5.5))
+    fig, axis = plt.subplots(figsize=(max(9, 2.4 * len(benchmark_names)), 5.5))
     center = (len(plotted_models) - 1) / 2
     for offset, method in enumerate(plotted_models):
-        values = [float(by_method[method][benchmark]) for benchmark in BENCHMARK_ORDER]
+        values = [float(by_method[method][benchmark]) for benchmark in benchmark_names]
         bars = axis.bar(x + (offset - center) * width, values, width, label=method)
         axis.bar_label(
             bars, labels=[f"{value:.3f}" for value in values], padding=3, fontsize=9
         )
-    axis.set_xticks(x, BENCHMARK_ORDER)
+    axis.set_xticks(x, benchmark_names)
     axis.set_ylim(0.0, 1.08)
     axis.set_ylabel(metric_name)
-    axis.set_title("Qwen3-1.7B: " + " vs ".join(plotted_models))
+    axis.set_title("Final evaluation: " + " vs ".join(plotted_models))
     axis.grid(axis="y", alpha=0.25)
     axis.legend()
     fig.tight_layout()

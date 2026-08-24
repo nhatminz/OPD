@@ -16,8 +16,37 @@ from .models import choose_attention_implementation, model_dtype_kwargs
 
 transformers_logging.disable_progress_bar()
 
-BENCHMARK_ORDER = ("MATH-500", "AIME24", "AIME25")
+BENCHMARK_ORDER = ("Competition-MATH", "MATH-500", "AIME24", "AIME25")
 MODEL_ORDER = ("Base", "OPD", "TA-OPD", "RAC")
+
+
+def configured_benchmark_names(
+    config: dict[str, Any], requested: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    """Return a validated canonical benchmark subset for this resolved config."""
+    specs = config.get("evaluation", {}).get("benchmarks", {})
+    names = (
+        tuple(requested)
+        if requested is not None
+        else tuple(name for name in BENCHMARK_ORDER if name in specs)
+    )
+    if not names:
+        raise ValueError("Evaluation must configure at least one benchmark")
+    if len(names) != len(set(names)):
+        raise ValueError(f"Evaluation benchmark names contain duplicates: {names}")
+    unknown = set(names) - set(BENCHMARK_ORDER)
+    if unknown:
+        raise ValueError(f"Unknown evaluation benchmarks: {sorted(unknown)}")
+    missing = [name for name in names if name not in specs]
+    if missing:
+        raise ValueError(f"Missing evaluation benchmark configuration for: {missing}")
+    canonical = tuple(name for name in BENCHMARK_ORDER if name in names)
+    if names != canonical:
+        raise ValueError(
+            f"Evaluation benchmarks must follow canonical order {BENCHMARK_ORDER}; "
+            f"got {names}"
+        )
+    return names
 
 
 def evaluation_metric_name(samples_per_problem: int) -> str:
@@ -88,7 +117,7 @@ ANSWER_ALIASES = (
     "final_answer",
     "solution",
 )
-ID_ALIASES = ("id", "index", "sample_id", "uuid")
+ID_ALIASES = ("id", "index", "sample_id", "unique_id", "uuid")
 
 
 def _plain(value: Any) -> Any:
@@ -226,7 +255,7 @@ def load_benchmark(
 def inspect_evaluation_data(config: dict[str, Any]) -> dict[str, Any]:
     specs = config["evaluation"]["benchmarks"]
     report = {}
-    for name in BENCHMARK_ORDER:
+    for name in configured_benchmark_names(config):
         _, report[name] = load_benchmark(name, specs[name])
     return report
 
@@ -311,10 +340,9 @@ def evaluate_loaded_suite(
         raise ValueError("Evaluation num_responses must be positive")
     do_sample = True
     limit = evaluation.get("limit")
-    benchmark_names = tuple(evaluation.get("benchmark_names", BENCHMARK_ORDER))
-    unknown = set(benchmark_names) - set(BENCHMARK_ORDER)
-    if unknown:
-        raise ValueError(f"Unknown training-evaluation benchmarks: {sorted(unknown)}")
+    benchmark_names = configured_benchmark_names(
+        config, evaluation.get("benchmark_names")
+    )
     loaded = {}
     total_samples = 0
     for benchmark in benchmark_names:
@@ -542,7 +570,7 @@ def evaluate_suite(
                 "num_responses": evaluation.get("num_responses", 16),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),
-                "benchmark_names": list(BENCHMARK_ORDER),
+                "benchmark_names": list(configured_benchmark_names(config)),
                 "vllm": evaluation.get("vllm", {}),
             },
         )
@@ -581,22 +609,44 @@ def aggregate_evaluations(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     rows, details = [], {}
+    benchmark_names: tuple[str, ...] | None = None
     for model_name in requested_order:
         source = Path(model_result_dirs[model_name]).resolve() / "summary.json"
         result = json.loads(source.read_text(encoding="utf-8"))
         details[model_name] = result
+        current_names = tuple(result.get("benchmarks", {}))
+        unknown = set(current_names) - set(BENCHMARK_ORDER)
+        canonical = tuple(name for name in BENCHMARK_ORDER if name in current_names)
+        if not current_names or unknown or current_names != canonical:
+            raise ValueError(
+                f"{model_name} has invalid benchmark order {current_names}; "
+                f"supported order is {BENCHMARK_ORDER}"
+            )
+        if benchmark_names is None:
+            benchmark_names = current_names
+        elif current_names != benchmark_names:
+            raise ValueError(
+                "Cannot aggregate evaluations with different benchmark sets: "
+                f"{benchmark_names} vs {current_names} for {model_name}"
+            )
         row = {"Method": model_name}
-        for benchmark in BENCHMARK_ORDER:
+        for benchmark in benchmark_names:
             row[benchmark] = result["benchmarks"][benchmark]["accuracy"]
         rows.append(row)
-    payload = {"schema_version": 1, "rows": rows, "details": details}
+    assert benchmark_names is not None
+    payload = {
+        "schema_version": 1,
+        "benchmarks": list(benchmark_names),
+        "rows": rows,
+        "details": details,
+    }
     with (output_dir / "comparison.json").open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     with (output_dir / "comparison.csv").open(
         "w", newline="", encoding="utf-8"
     ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=("Method", *BENCHMARK_ORDER))
+        writer = csv.DictWriter(handle, fieldnames=("Method", *benchmark_names))
         writer.writeheader()
         writer.writerows(rows)
     return rows

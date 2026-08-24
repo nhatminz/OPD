@@ -1,6 +1,6 @@
 # Pure OPD vs TA-OPD vs Bellman-RAC trên NVIDIA B200
 
-Project độc lập này huấn luyện cùng student Qwen3-1.7B từ teacher Qwen3-4B bằng ba phương pháp:
+Project độc lập này huấn luyện cùng student Qwen3-1.7B-Base từ teacher Qwen3-8B bằng ba phương pháp:
 
 - **OPD thuần**: mọi valid response token có uniform weight `1`.
 - **TA-OPD gốc**: local teachability và hard top-`rho` token budget.
@@ -27,14 +27,15 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 
 | Asset | Relative path dưới `STORAGE_ROOT` |
 |---|---|
-| Teacher | `models/Qwen3-4B` |
-| Student | `models/Qwen3-1.7B` |
-| Full DAPO | `nlp/minhpn19/data/DAPO-Math-17k-Processed` |
+| Teacher | `models/Qwen3-8B` |
+| Student | `nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base` |
+| Competition-MATH train | `nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet` |
+| Competition-MATH test | `nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet` |
 | MATH-500 | `nlp/minhpn19/data/eval/math500` |
 | AIME 2024 | `nlp/minhpn19/data/eval/aime24` |
 | AIME 2025 | `nlp/minhpn19/data/eval/aime25` |
 
-Training luôn đọc toàn bộ split `all`. Nếu batch cuối không chia hết cho hai rank, rank ngắn hơn
+Training đọc toàn bộ file Competition-MATH train đã cấu hình (`split: null`). Nếu batch cuối không chia hết cho hai rank, rank ngắn hơn
 dùng một trajectory filler xác định chỉ để giữ lịch collective FSDP giống nhau; filler bị loại khỏi
 loss, selector, metric và log nên mỗi sample thật vẫn được dùng đúng một lần. Loader hỗ trợ parquet,
 JSON và JSONL.
@@ -163,7 +164,8 @@ Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `ma
 chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
 lưu và thay thế lịch sử/file eval cũ, dùng
 `scripts/reeval_all_checkpoints_b200.sh`; lệnh dry-run/chạy thật nằm trong `RUN_B200.md`.
-560 problem tạo đúng 8.960 responses. Step-0 base giống hệt giữa ba method nên được generate một
+1.060 problem trên Competition-MATH test, MATH-500, AIME24 và AIME25 tạo đúng 16.960 responses.
+Step-0 base giống hệt giữa ba method nên được generate một
 lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng. Evaluator bật vLLM
 `performance_mode=throughput`, chunked prefill và async scheduling mặc định.
 
@@ -176,9 +178,9 @@ lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng. 
 Fresh launch tự tạo tên:
 
 ```text
-opd_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
-ta_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
-rac_bellman_qwen3_4b_to_1p7b_YYYYMMDD_HHMMSS
+opd_qwen3_8b_to_1p7b_base_YYYYMMDD_HHMMSS
+ta_qwen3_8b_to_1p7b_base_YYYYMMDD_HHMMSS
+rac_bellman_qwen3_8b_to_1p7b_base_YYYYMMDD_HHMMSS
 ```
 
 Mỗi output chứa `resolved_config.yaml`, metadata, `metrics.jsonl`, `train_metrics.csv`, TensorBoard,
@@ -200,7 +202,7 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
 cho avg@16, loss, TA score distribution, Bellman-RAC `g/V/w`, và mean alignment/V/weight.
 `plot_training_progress.sh` hỗ trợ `PLOT_METHODS='opd ta rac'` với một, hai hoặc cả ba method.
-Một method tạo ba đường MATH-500/AIME24/AIME25; từ hai method trở lên tạo ba subplot benchmark,
+Một method tạo bốn đường Competition-MATH/MATH-500/AIME24/AIME25; từ hai method trở lên tạo bốn subplot benchmark,
 mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn tương thích và có nghĩa TA+RAC.
 
 ## Validation

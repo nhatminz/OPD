@@ -18,11 +18,13 @@ from typing import Any
 
 from .config import load_config, resolve_runtime_paths
 from .distributed import isolate_distributed_subprocess_environment
-from .evaluation import evaluation_metric_name
+from .evaluation import (
+    configured_benchmark_names,
+    evaluation_metric_name,
+)
 from .evaluation_cache import evaluate_or_reuse_base
 
 
-BENCHMARK_ORDER = ("MATH-500", "AIME24", "AIME25")
 METHODS = (
     ("opd", "OPD", "opd"),
     ("ta", "TA-OPD", "ta_opd"),
@@ -313,7 +315,11 @@ def _runtime_settings(
             )
         ),
         "limit": None,
-        "benchmark_names": list(BENCHMARK_ORDER),
+        "benchmark_names": list(
+            configured_benchmark_names(
+                config, training_evaluation.get("benchmark_names")
+            )
+        ),
         "vllm": vllm_settings,
     }
 
@@ -427,10 +433,11 @@ def _reevaluate_method(
                 settings["num_responses"]
             ):
                 raise AssertionError("Evaluator did not honor requested response count")
-            if tuple(suite["benchmarks"]) != BENCHMARK_ORDER:
+            expected_benchmarks = tuple(settings["benchmark_names"])
+            if tuple(suite["benchmarks"]) != expected_benchmarks:
                 raise AssertionError(
                     f"Evaluator returned benchmarks {tuple(suite['benchmarks'])}, "
-                    f"expected {BENCHMARK_ORDER}"
+                    f"expected {expected_benchmarks}"
                 )
             for benchmark, result in suite["benchmarks"].items():
                 prediction = Path(result["predictions"])
@@ -521,7 +528,7 @@ def _reevaluate_method(
         "num_responses": settings["num_responses"],
         "metric": evaluation_metric_name(settings["num_responses"]),
         "backend": "vllm",
-        "full_benchmarks": list(BENCHMARK_ORDER),
+        "full_benchmarks": list(settings["benchmark_names"]),
         "history": str((run_output / "eval_history.jsonl").resolve()),
         "metrics": str((run_output / "eval_metrics.csv").resolve()),
         "evaluated": evaluated,

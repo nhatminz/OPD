@@ -42,7 +42,7 @@ from .distributed import (
     unwrap_model,
 )
 from .evaluation import (
-    BENCHMARK_ORDER,
+    configured_benchmark_names,
     evaluate_loaded_suite,
     evaluation_metric_name,
 )
@@ -584,7 +584,9 @@ def _run_training_evaluation(
             )
         ),
         "limit": settings.get("limit", config["evaluation"].get("limit")),
-        "benchmark_names": settings.get("benchmark_names", list(BENCHMARK_ORDER)),
+        "benchmark_names": list(
+            configured_benchmark_names(config, settings.get("benchmark_names"))
+        ),
         "vllm": settings.get("vllm", {}),
     }
     started = time.perf_counter()

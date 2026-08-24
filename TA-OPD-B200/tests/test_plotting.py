@@ -157,6 +157,36 @@ class PlottingTests(unittest.TestCase):
             )
             self.assertEqual({row["Method"] for row in rows}, {"Base", "TA-OPD"})
 
+    def test_new_history_adds_competition_math_to_plot_and_csv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "opd"
+            self._write_training_output(output, 0.25)
+            history_path = output / "eval_history.jsonl"
+            rows = [json.loads(line) for line in history_path.read_text().splitlines()]
+            for row in rows:
+                row["benchmarks"] = {
+                    "Competition-MATH": {"accuracy": 0.4},
+                    **row["benchmarks"],
+                }
+            history_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+            paths = plot_training_progress(
+                root / "results", opd_output=output, methods=["opd"]
+            )
+
+            with Path(paths["history_csv"]).open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                csv_rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                tuple(csv_rows[0]),
+                ("Method", "Step", "Competition-MATH", "MATH-500", "AIME24", "AIME25"),
+            )
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+
     def test_single_rac_plot_does_not_require_ta_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

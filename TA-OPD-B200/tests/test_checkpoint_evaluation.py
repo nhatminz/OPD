@@ -13,6 +13,7 @@ from b200_experiment.checkpoint_evaluation import (
     discover_evaluation_targets,
     main,
 )
+from b200_experiment.evaluation import BENCHMARK_ORDER
 
 
 class CheckpointEvaluationTests(unittest.TestCase):
@@ -32,7 +33,12 @@ class CheckpointEvaluationTests(unittest.TestCase):
             "models": {"student_path": str(base), "teacher_path": str(teacher)},
             "data": {"path": str(root / "data")},
             "training_evaluation": {"output_subdir": "training_eval"},
-            "evaluation": {"benchmarks": {}},
+            "evaluation": {
+                "benchmarks": {
+                    name: {"path": str(root / f"{name}.jsonl")}
+                    for name in BENCHMARK_ORDER
+                }
+            },
         }
         (output / "resolved_config.yaml").write_text(
             yaml.safe_dump(config), encoding="utf-8"

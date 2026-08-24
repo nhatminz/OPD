@@ -10,8 +10,18 @@ import pandas as pd
 from b200_experiment.config import load_config, resolve_runtime_paths
 import torch
 
-from b200_experiment.data import epoch_batch_indices, expand_prompt_batch, read_records
-from b200_experiment.evaluation import aggregate_evaluations, load_benchmark
+from b200_experiment.data import (
+    epoch_batch_indices,
+    expand_prompt_batch,
+    read_records,
+    record_messages,
+    stable_sample_id,
+)
+from b200_experiment.evaluation import (
+    BENCHMARK_ORDER,
+    aggregate_evaluations,
+    load_benchmark,
+)
 
 
 class DataEvaluationConfigTests(unittest.TestCase):
@@ -83,6 +93,60 @@ class DataEvaluationConfigTests(unittest.TestCase):
             self.assertEqual(len(records), 3)
             self.assertEqual(len(files), 2)
 
+    def test_competition_math_train_schema_uses_problem_and_unique_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "train-00000-of-00001.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "problem": "Find $1+1$.",
+                        "solution": "It is two.",
+                        "answer": "2",
+                        "subject": "Prealgebra",
+                        "level": 1,
+                        "unique_id": "train/prealgebra/1",
+                    }
+                ]
+            ).to_parquet(path)
+
+            records, files = read_records(path, split=None)
+
+            self.assertEqual(files, [path.resolve()])
+            self.assertEqual(
+                record_messages(records[0], prompt_key="problem"),
+                [{"role": "user", "content": "Find $1+1$."}],
+            )
+            self.assertEqual(stable_sample_id(records[0], 0), "train/prealgebra/1")
+
+    def test_competition_math_eval_uses_answer_not_worked_solution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "test-00000-of-00001.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "problem": "Find $2+2$.",
+                        "solution": "Adding gives four.",
+                        "answer": "4",
+                        "subject": "Prealgebra",
+                        "level": 1,
+                        "unique_id": "test/prealgebra/1",
+                    }
+                ]
+            ).to_parquet(path)
+
+            rows, schema = load_benchmark(
+                "Competition-MATH",
+                {
+                    "path": str(path),
+                    "question_key": "problem",
+                    "answer_key": "answer",
+                    "id_key": "unique_id",
+                },
+            )
+
+            self.assertEqual(rows[0], {"id": "test/prealgebra/1", "problem": "Find $2+2$.", "answer": "4"})
+            self.assertEqual(schema["answer_key"], "answer")
+
     def test_b200_aime24_and_aime25_schema_normalization(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -109,11 +173,28 @@ class DataEvaluationConfigTests(unittest.TestCase):
         ta = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_ta.yaml"))
         rac = resolve_runtime_paths(load_config(root / "configs/qwen3_b200_rac.yaml"))
         self.assertEqual(
-            base["models"]["teacher_path"], "/workspace/storage-shared/models/Qwen3-4B"
+            base["models"]["teacher_path"], "/workspace/storage-shared/models/Qwen3-8B"
         )
         self.assertEqual(
             base["models"]["student_path"],
-            "/workspace/storage-shared/models/Qwen3-1.7B",
+            "/workspace/storage-shared/nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base",
+        )
+        self.assertEqual(
+            base["data"]["path"],
+            "/workspace/storage-shared/nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet",
+        )
+        self.assertIsNone(base["data"]["split"])
+        self.assertEqual(base["data"]["prompt_key"], "problem")
+        self.assertEqual(
+            base["evaluation"]["benchmarks"]["Competition-MATH"]["path"],
+            "/workspace/storage-shared/nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet",
+        )
+        self.assertEqual(
+            tuple(base["training_evaluation"]["benchmark_names"]), BENCHMARK_ORDER
+        )
+        self.assertEqual(
+            base["evaluation"]["benchmarks"]["Competition-MATH"]["answer_key"],
+            "answer",
         )
         self.assertEqual(
             base["evaluation"]["benchmarks"]["AIME24"]["path"],

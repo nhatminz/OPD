@@ -48,9 +48,9 @@ Tạo một comparison ID rồi giữ mọi shared knob giống hệt nhau:
 
 ```bash
 PAIR=$(date +%Y%m%d_%H%M%S)
-export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
-export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
-export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
+export OPD_RUN_NAME="opd_qwen3_8b_to_1p7b_base_${PAIR}"
+export TA_RUN_NAME="ta_qwen3_8b_to_1p7b_base_${PAIR}"
+export RAC_RUN_NAME="rac_bellman_qwen3_8b_to_1p7b_base_${PAIR}"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export DISTRIBUTED_STRATEGY=fsdp
@@ -82,8 +82,8 @@ checkpoint và lịch
 eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
 tài nguyên giữa các run.
 
-Full eval có 560 problem và `n=16`, vì vậy progress của vLLM hiển thị 8.960 generated responses
-(`560 * 16`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
+Full eval có 1.060 problem và `n=16`, vì vậy progress của vLLM hiển thị 16.960 generated responses
+(`1.060 * 16`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
 được cache theo fingerprint của model, dataset, evaluator và toàn bộ protocol. OPD sinh lần đầu;
 TA-OPD/RAC copy đúng cùng prediction. Một run bị lỗi trước step train đầu tiên cũng tái sử dụng
 `training_eval/step-000000` hợp lệ khi chạy lại. Có thể tắt bằng
@@ -171,16 +171,16 @@ metric; TA thêm selected-token fraction, RAC thêm normalized effective-token f
 vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được reduce
 toàn cục trước khi rank 0 ghi.
 
-Full avg@16 trên 560 problem bắt buộc sinh 8.960 response cho mỗi checkpoint khác nhau; không thể
+Full avg@16 trên 1.060 problem bắt buộc sinh 16.960 response cho mỗi checkpoint khác nhau; không thể
 giảm con số này mà vẫn giữ nguyên metric. Nếu ưu tiên thời gian train không bị chặn bởi eval, có thể
 lưu đúng mỗi 50 step, tắt eval inline, rồi chạy evaluator trên các checkpoint sau train (kết quả
 checkpoint không đổi, nhưng về mặt vận hành đây không còn là eval đồng bộ bên trong train):
 
 ```bash
 PAIR=$(date +%Y%m%d_%H%M%S)
-export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
-export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
-export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
+export OPD_RUN_NAME="opd_qwen3_8b_to_1p7b_base_${PAIR}"
+export TA_RUN_NAME="ta_qwen3_8b_to_1p7b_base_${PAIR}"
+export RAC_RUN_NAME="rac_bellman_qwen3_8b_to_1p7b_base_${PAIR}"
 export TRAIN_EVAL_TEMPERATURE=1
 TRAIN_EVAL_ENABLED=false SAVE_INTERVAL=50 bash scripts/train_all_b200.sh
 
@@ -196,7 +196,7 @@ tại; các thay đổi đó nhanh hơn nhưng là thí nghiệm khác.
 ### Accuracy một response thay cho avg@16
 
 Nếu không cần avg@16, đặt `TRAIN_EVAL_NUM_RESPONSES=1`. Mỗi checkpoint chỉ sinh một response cho
-mỗi problem, tức 560 generation trên ba bộ thay vì 8.960. Output, CSV và biểu đồ tự ghi nhãn
+mỗi problem, tức 1.060 generation trên bốn bộ thay vì 16.960. Output, CSV và biểu đồ tự ghi nhãn
 `accuracy`, không còn ghi nhầm `avg@16`:
 
 ```bash
@@ -278,7 +278,7 @@ CUDA_VISIBLE_DEVICES=2 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
 `EVAL_BACKEND=hf`. Mặc định riêng của launcher chung là `temperature=1`, `n=16`; đặt
 `EVAL_NUM_RESPONSES=1` để lấy accuracy một response thay vì avg@n.
 
-Mỗi thư mục eval chứa `summary.json`, ba file `*_predictions.jsonl.gz`, và file gộp
+Mỗi thư mục eval chứa `summary.json`, bốn file `*_predictions.jsonl.gz`, và file gộp
 `model_outputs_detailed.jsonl.gz`. File gộp lưu dataset, ID, đề bài, đáp án chuẩn, prompt thực tế,
 toàn bộ response, đúng/sai từng response và generation parameters. Đọc nhanh bằng:
 
@@ -286,7 +286,7 @@ toàn bộ response, đúng/sai từng response và generation parameters. Đọ
 gzip -cd results/checkpoint_eval/opd_step50/model_outputs_detailed.jsonl.gz | less
 ```
 
-Eval một RAC checkpoint trên full MATH-500/AIME24/AIME25:
+Eval một RAC checkpoint trên full Competition-MATH/MATH-500/AIME24/AIME25:
 
 ```bash
 RUN_NAME="$RAC_RUN_NAME" \
@@ -376,7 +376,7 @@ TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh --plot-name ta_vs_rac
 ```
 
-Vẽ riêng một phương pháp để báo cáo, với ba đường MATH-500/AIME24/AIME25 trong cùng một ảnh:
+Vẽ riêng một phương pháp để báo cáo, với bốn đường Competition-MATH/MATH-500/AIME24/AIME25 trong cùng một ảnh:
 
 ```bash
 RUN_NAME="$OPD_RUN_NAME" PLOT_METHODS=opd \

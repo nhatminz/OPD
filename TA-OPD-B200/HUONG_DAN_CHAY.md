@@ -21,9 +21,9 @@ CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_2gpu.sh
 
 ```bash
 PAIR=$(date +%Y%m%d_%H%M%S)
-export OPD_RUN_NAME="opd_qwen3_4b_to_1p7b_${PAIR}"
-export TA_RUN_NAME="ta_qwen3_4b_to_1p7b_${PAIR}"
-export RAC_RUN_NAME="rac_bellman_qwen3_4b_to_1p7b_${PAIR}"
+export OPD_RUN_NAME="opd_qwen3_8b_to_1p7b_base_${PAIR}"
+export TA_RUN_NAME="ta_qwen3_8b_to_1p7b_base_${PAIR}"
+export RAC_RUN_NAME="rac_bellman_qwen3_8b_to_1p7b_base_${PAIR}"
 
 RUN_NAME="$OPD_RUN_NAME" CUDA_VISIBLE_DEVICES=0,1 \
   bash scripts/train_opd_b200.sh
@@ -35,7 +35,7 @@ RUN_NAME="$RAC_RUN_NAME" CUDA_VISIBLE_DEVICES=0,1 \
   bash scripts/train_rac_b200.sh
 ```
 
-Không đặt `MAX_STEPS` (hoặc để `-1`) để dùng toàn bộ epoch/full DAPO. OPD dùng uniform weight `1`
+Không đặt `MAX_STEPS` (hoặc để `-1`) để dùng toàn bộ epoch/full Competition-MATH train. OPD dùng uniform weight `1`
 trên mọi valid response token. Cả ba method dùng cùng vLLM rollout và eval step 0 / mỗi 50 step /
 final. Nếu cần hạ memory, đặt cùng giá trị cho cả ba lệnh.
 
@@ -106,7 +106,7 @@ OPD_RUN_NAME="$OPD_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh --plot-name opd_vs_rac
 ```
 
-Vẽ riêng avg@16 của một method trên cả ba bộ eval (ba đường trong cùng một ảnh):
+Vẽ riêng avg@16 của một method trên cả bốn bộ eval (bốn đường trong cùng một ảnh):
 
 ```bash
 RUN_NAME="$OPD_RUN_NAME" PLOT_METHODS=opd \
@@ -145,14 +145,14 @@ Nếu bỏ đối số output cuối, script tự tạo thư mục timestamp. K�
 prediction theo dataset và `model_outputs_detailed.jsonl.gz` chứa prompt, đáp án chuẩn, toàn bộ
 response cùng cờ đúng/sai của từng response.
 
-Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
+Periodic và final eval luôn chạy toàn bộ Competition-MATH test, MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
 không phải subset size.
-Ba bộ có tổng cộng 560 problem; `n=16` nên vLLM báo 8.960 processed responses. Base step 0 chỉ
+Bốn bộ có tổng cộng 1.060 problem; `n=16` nên vLLM báo 16.960 processed responses. Base step 0 chỉ
 generate một lần rồi dùng cùng artifact đã kiểm tra fingerprint cho OPD/TA-OPD/RAC. Những step
 sau vẫn phải generate riêng vì weights của ba method đã khác nhau.
 
 Nếu chỉ cần một kết quả cho mỗi problem, thêm
-`TRAIN_EVAL_NUM_RESPONSES=1 TRAIN_EVAL_TEMPERATURE=1` khi train. Khi đó mỗi checkpoint chỉ có 560
+`TRAIN_EVAL_NUM_RESPONSES=1 TRAIN_EVAL_TEMPERATURE=1` khi train. Khi đó mỗi checkpoint chỉ có 1.060
 generation và metric/biểu đồ được ghi đúng là `accuracy`. Eval final dùng
 `EVAL_NUM_RESPONSES=1`; re-eval checkpoint dùng `REEVAL_NUM_RESPONSES=1`.
 
