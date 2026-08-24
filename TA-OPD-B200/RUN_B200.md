@@ -388,6 +388,35 @@ Script chạy tuần tự một subprocess vLLM cho mỗi checkpoint để trả
 ghi lịch sử mới nếu phát hiện thư mục eval cũ không có checkpoint tương ứng, tránh trộn kết quả
 protocol cũ và mới. Sau khi hoàn tất, chạy lại lệnh plot periodic training evaluation bên dưới.
 
+### Re-eval checkpoint của riêng một method
+
+Launcher riêng nhận `METHOD` và `RUN_NAME`, không yêu cầu output của hai method còn lại. Luôn nên
+dry-run trước để xem chính xác step 0, các `checkpoint-*` và `final` sẽ được xử lý:
+
+```bash
+REEVAL_DRY_RUN=true REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_method_checkpoints_b200.sh opd "$OPD_RUN_NAME"
+```
+
+Chạy thật và ghi đè evaluation/history cũ của riêng OPD:
+
+```bash
+REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_method_checkpoints_b200.sh opd "$OPD_RUN_NAME"
+```
+
+Đổi `opd` thành `ta` hoặc `rac` và truyền run name tương ứng. Với avg@16, đổi
+`REEVAL_NUM_RESPONSES=16`. Nếu đã export `OPD_RUN_NAME`, có thể bỏ đối số run name. Cũng có thể
+chỉ trực tiếp output không theo layout mặc định:
+
+```bash
+OPD_OUTPUT_DIR=/absolute/path/to/run/opd \
+  REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_method_checkpoints_b200.sh opd
+```
+
 ## Plot periodic training evaluation
 
 So sánh cả ba phương pháp:

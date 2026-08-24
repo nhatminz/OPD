@@ -106,10 +106,6 @@ if ! [[ "${VALIDATION_WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "TRAIN_NPROC_PER_NODE must be a positive integer, got ${VALIDATION_WORLD_SIZE}" >&2
   return 2 2>/dev/null || exit 2
 fi
-if (( VALIDATION_WORLD_SIZE > ${#_B200_VISIBLE_DEVICES[@]} )); then
-  echo "Requested ${VALIDATION_WORLD_SIZE} workers but only ${#_B200_VISIBLE_DEVICES[@]} GPUs are visible" >&2
-  return 2 2>/dev/null || exit 2
-fi
 PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu.json}"
 AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/autotuned/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu.yaml}"
 AUTOTUNE_OUTPUT_ROOT="${AUTOTUNE_OUTPUT_ROOT:-${REPO_DIR}/outputs/autotune/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu}"

@@ -169,8 +169,9 @@ giảm khi OOM và LR không tự scale; thử `8 → 16`, rồi lùi về `4` n
 
 Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric
 chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
-lưu và thay thế lịch sử/file eval cũ, dùng
-`scripts/reeval_all_checkpoints_b200.sh`; lệnh dry-run/chạy thật nằm trong `RUN_B200.md`.
+lưu và thay thế lịch sử/file eval cũ, dùng `scripts/reeval_all_checkpoints_b200.sh`; để chỉ chạy một
+method, dùng `scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]`. Lệnh dry-run/chạy thật
+nằm trong `RUN_B200.md`.
 1.060 problem trên Competition-MATH test, MATH-500, AIME24 và AIME25 tạo đúng 16.960 responses.
 Step-0 base giống hệt giữa ba method nên được generate một
 lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng. Evaluator bật vLLM

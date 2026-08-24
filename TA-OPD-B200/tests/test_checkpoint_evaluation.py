@@ -137,6 +137,29 @@ class CheckpointEvaluationTests(unittest.TestCase):
             for output in outputs.values():
                 self.assertFalse((output / "eval_history.jsonl").exists())
 
+    def test_dry_run_can_select_only_opd_without_other_output_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self._make_run(Path(temporary), "opd")
+
+            return_code = main(
+                [
+                    "--methods",
+                    "opd",
+                    "--opd-output",
+                    str(output),
+                    "--temperature",
+                    "1.0",
+                    "--dry-run",
+                ]
+            )
+
+            self.assertEqual(return_code, 0)
+            self.assertFalse((output / "eval_history.jsonl").exists())
+
+    def test_selected_method_requires_only_its_matching_output(self):
+        with self.assertRaisesRegex(ValueError, "provide --opd-output"):
+            main(["--methods", "opd", "--dry-run"])
+
 
 if __name__ == "__main__":
     unittest.main()

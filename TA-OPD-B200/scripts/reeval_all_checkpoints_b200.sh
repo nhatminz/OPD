@@ -3,18 +3,32 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 resolve_run_paths
-for path in "${OPD_RUN_OUTPUT}" "${TA_RUN_OUTPUT}" "${RAC_RUN_OUTPUT}"; do
-  if [[ ! -d "${path}" ]]; then
-    echo "Missing training output directory: ${path}" >&2
-    exit 1
+
+METHOD_INPUT="${REEVAL_METHODS:-opd ta rac}"
+METHOD_INPUT="${METHOD_INPUT//,/ }"
+read -r -a REQUESTED_METHODS <<< "${METHOD_INPUT}"
+SELECTED_METHODS=()
+for method in "${REQUESTED_METHODS[@]}"; do
+  case "${method,,}" in
+    opd|pure-opd|pure_opd) canonical="opd" ;;
+    ta|ta-opd|ta_opd) canonical="ta" ;;
+    rac|bellman-rac|bellman_rac) canonical="rac" ;;
+    *)
+      echo "Unknown REEVAL_METHODS entry: ${method}; use opd, ta, or rac" >&2
+      exit 2
+      ;;
+  esac
+  if [[ " ${SELECTED_METHODS[*]} " != *" ${canonical} "* ]]; then
+    SELECTED_METHODS+=("${canonical}")
   fi
-  require_file "${path}/resolved_config.yaml"
 done
+if (( ${#SELECTED_METHODS[@]} == 0 )); then
+  echo "REEVAL_METHODS must select at least one of: opd, ta, rac" >&2
+  exit 2
+fi
 
 ARGS=(
-  --opd-output "${OPD_RUN_OUTPUT}"
-  --ta-output "${TA_RUN_OUTPUT}"
-  --rac-output "${RAC_RUN_OUTPUT}"
+  --methods "${SELECTED_METHODS[@]}"
   --temperature "${REEVAL_TEMPERATURE:-0.7}"
   --top-p "${REEVAL_TOP_P:-0.95}"
   --num-responses "${REEVAL_NUM_RESPONSES:-16}"
@@ -27,6 +41,22 @@ ARGS=(
   --seed "${REEVAL_SEED:-1234}"
   --base-cache-dir "${REEVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 )
+
+SELECTED_OUTPUTS=()
+for method in "${SELECTED_METHODS[@]}"; do
+  case "${method}" in
+    opd) path="${OPD_RUN_OUTPUT}" ;;
+    ta) path="${TA_RUN_OUTPUT}" ;;
+    rac) path="${RAC_RUN_OUTPUT}" ;;
+  esac
+  if [[ ! -d "${path}" ]]; then
+    echo "Missing ${method} training output directory: ${path}" >&2
+    exit 1
+  fi
+  require_file "${path}/resolved_config.yaml"
+  ARGS+=("--${method}-output" "${path}")
+  SELECTED_OUTPUTS+=("${method}=${path}")
+done
 
 case "${REEVAL_SKIP_BASE:-false}" in
   true|TRUE|1|yes|YES) ARGS+=(--skip-base) ;;
@@ -45,7 +75,7 @@ case "${REEVAL_DRY_RUN:-false}" in
   *) IS_DRY_RUN=false ;;
 esac
 
-echo "Re-evaluating every saved OPD, TA-OPD, and RAC checkpoint."
+echo "Re-evaluating every saved checkpoint for: ${SELECTED_METHODS[*]}."
 if [[ "${REEVAL_NUM_RESPONSES:-16}" == "1" ]]; then
   REEVAL_METRIC_LABEL="accuracy"
 else
@@ -57,9 +87,9 @@ if [[ "${IS_DRY_RUN}" == "true" ]]; then
 else
   echo "Existing training_eval/step-*, eval_history.jsonl, and eval_metrics.csv will be replaced."
 fi
-echo "OPD output: ${OPD_RUN_OUTPUT}"
-echo "TA output:  ${TA_RUN_OUTPUT}"
-echo "RAC output: ${RAC_RUN_OUTPUT}"
+for selected in "${SELECTED_OUTPUTS[@]}"; do
+  echo "Selected output: ${selected}"
+done
 
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.checkpoint_evaluation "${ARGS[@]}"

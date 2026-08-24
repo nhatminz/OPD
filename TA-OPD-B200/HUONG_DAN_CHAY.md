@@ -205,3 +205,18 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 
 Dòng đầu chỉ kiểm tra danh sách; dòng thứ hai mới thực sự ghi đè. Script mặc định eval lại cả base
 step 0 để không trộn protocol eval giữa baseline và checkpoint, nhưng chỉ generate base một lần.
+
+Chỉ re-eval toàn bộ checkpoint của riêng OPD ở temperature 1, mỗi problem một response:
+
+```bash
+REEVAL_DRY_RUN=true REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_method_checkpoints_b200.sh opd "$OPD_RUN_NAME"
+
+REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 \
+  CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/reeval_method_checkpoints_b200.sh opd "$OPD_RUN_NAME"
+```
+
+Đổi `opd` thành `ta` hoặc `rac`; đổi response count thành `16` nếu cần avg@16. Chỉ method được
+chọn bị thay thế `training_eval/step-*`, `eval_history.jsonl` và `eval_metrics.csv`.

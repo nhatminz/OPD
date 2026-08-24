@@ -3,6 +3,11 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 cd "${REPO_DIR}"
+SMOKE_VISIBLE_GPU_COUNT="$(visible_gpu_count)"
+if (( VALIDATION_WORLD_SIZE > SMOKE_VISIBLE_GPU_COUNT )); then
+  echo "Requested ${VALIDATION_WORLD_SIZE} workers but only ${SMOKE_VISIBLE_GPU_COUNT} GPUs are visible" >&2
+  exit 2
+fi
 case "${SMOKE_RUN_GPU_UNIT_TESTS:-false}" in
   true|TRUE|1|yes|YES)
     "${PYTHON_BIN}" -m unittest discover -s tests -v

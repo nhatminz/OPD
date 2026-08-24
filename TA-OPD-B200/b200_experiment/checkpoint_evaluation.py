@@ -545,13 +545,20 @@ def _reevaluate_method(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Re-evaluate every saved OPD/TA-OPD/RAC checkpoint and replace the "
-            "periodic-evaluation history"
+            "Re-evaluate every saved checkpoint for selected OPD/TA-OPD/RAC "
+            "methods and replace their periodic-evaluation histories"
         )
     )
-    parser.add_argument("--opd-output", required=True)
-    parser.add_argument("--ta-output", required=True)
-    parser.add_argument("--rac-output", required=True)
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=[method for method, _display_name, _output_slug in METHODS],
+        default=[method for method, _display_name, _output_slug in METHODS],
+        help="Methods to re-evaluate; defaults to all three",
+    )
+    parser.add_argument("--opd-output")
+    parser.add_argument("--ta-output")
+    parser.add_argument("--rac-output")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--num-responses", type=int, default=16)
@@ -578,14 +585,24 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("Checkpoint re-evaluation top_p must be in (0, 1]")
     if args.num_responses <= 0:
         raise ValueError("Checkpoint re-evaluation num_responses must be positive")
+    selected_methods = tuple(dict.fromkeys(args.methods))
     requested = {
-        "opd": Path(args.opd_output),
-        "ta": Path(args.ta_output),
-        "rac": Path(args.rac_output),
+        "opd": args.opd_output,
+        "ta": args.ta_output,
+        "rac": args.rac_output,
     }
+    missing = [method for method in selected_methods if requested[method] is None]
+    if missing:
+        required_flags = ", ".join(f"--{method}-output" for method in missing)
+        raise ValueError(
+            f"Missing output path for selected method(s): {', '.join(missing)}; "
+            f"provide {required_flags}"
+        )
     results = []
     for method, display_name, _output_slug in METHODS:
-        run_output = requested[method].expanduser().resolve()
+        if method not in selected_methods:
+            continue
+        run_output = Path(requested[method]).expanduser().resolve()
         config_path, config, targets, max_steps = discover_evaluation_targets(
             run_output,
             method,
