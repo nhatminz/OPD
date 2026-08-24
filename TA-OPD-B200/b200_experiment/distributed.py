@@ -2,10 +2,54 @@ from __future__ import annotations
 
 import os
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
+
+_DISTRIBUTED_LAUNCH_ENVIRONMENT = frozenset(
+    {
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "GROUP_WORLD_SIZE",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "ROLE_NAME",
+        "NODE_RANK",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    }
+)
+
+
+def isolate_distributed_subprocess_environment(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Remove the parent launcher's identity from a standalone child process.
+
+    In particular, torchrun exports ``TORCHELASTIC_USE_AGENT_STORE=True``.
+    In affected PyTorch versions this makes *every* rank created through a
+    ``tcp://`` rendezvous a TCPStore client.  vLLM 0.17.1 uses such a rendezvous
+    for its own internal process group, whose rank 0 must instead host that new
+    store.  Passing the torchrun flag to vLLM therefore leaves no store server
+    and blocks startup until the ten-minute TCP timeout.
+
+    Strip all torchrun rank/rendezvous fields and every TORCHELASTIC field, not
+    only the currently documented subset, so descendants of the child remain
+    independent from the trainer process group.
+    """
+    isolated = dict(os.environ if environment is None else environment)
+    for name in tuple(isolated):
+        if name in _DISTRIBUTED_LAUNCH_ENVIRONMENT or name.startswith(
+            "TORCHELASTIC_"
+        ):
+            isolated.pop(name)
+    return isolated
 
 
 @dataclass(frozen=True)
@@ -27,7 +71,10 @@ class DistributedContext:
 
     def barrier(self) -> None:
         if self.enabled:
-            dist.barrier()
+            if self.device.type == "cuda":
+                dist.barrier(device_ids=[self.device.index])
+            else:
+                dist.barrier()
 
     def sum_int(self, value: int) -> int:
         tensor = torch.tensor(value, dtype=torch.int64, device=self.device)
@@ -131,7 +178,13 @@ def initialize_distributed(backend: str = "nccl") -> DistributedContext:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend=backend, init_method="env://")
+        kwargs = {"backend": backend, "init_method": "env://"}
+        if backend == "nccl":
+            # Bind this process group to the already selected local GPU.  This
+            # prevents NCCL from guessing a device from the global rank and
+            # removes the barrier warning seen under torchrun.
+            kwargs["device_id"] = device
+        dist.init_process_group(**kwargs)
     return DistributedContext(rank, local_rank, world_size, device)
 
 

@@ -84,15 +84,33 @@ class VLLMRolloutTests(unittest.TestCase):
                     "RANK": "1",
                     "LOCAL_RANK": "1",
                     "WORLD_SIZE": "3",
+                    "GROUP_WORLD_SIZE": "1",
+                    "ROLE_NAME": "default",
                     "MASTER_PORT": "12345",
+                    "TORCHELASTIC_USE_AGENT_STORE": "True",
+                    "TORCHELASTIC_RESTART_COUNT": "0",
+                    "TORCHELASTIC_ERROR_FILE": "/tmp/elastic-error.json",
                 },
                 clear=False,
             ):
                 environment = engine._server_environment()
             engine.close()
         self.assertEqual(environment["CUDA_VISIBLE_DEVICES"], "4")
-        for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_PORT"):
+        for name in (
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "GROUP_WORLD_SIZE",
+            "ROLE_NAME",
+            "MASTER_PORT",
+            "TORCHELASTIC_USE_AGENT_STORE",
+            "TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_ERROR_FILE",
+        ):
             self.assertNotIn(name, environment)
+        self.assertFalse(
+            any(name.startswith("TORCHELASTIC_") for name in environment)
+        )
 
     def test_token_ids_preserve_left_padded_prompt_and_response_mask(self):
         prompt_ids = torch.tensor([[0, 11, 12], [21, 22, 23]])

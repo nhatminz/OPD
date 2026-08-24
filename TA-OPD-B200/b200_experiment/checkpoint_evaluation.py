@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_runtime_paths
+from .distributed import isolate_distributed_subprocess_environment
 from .evaluation import evaluation_metric_name
 from .evaluation_cache import evaluate_or_reuse_base
 
@@ -269,25 +270,12 @@ def _write_history_atomically(
 
 
 def _subprocess_environment(repo_root: Path) -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = isolate_distributed_subprocess_environment()
     environment["VLLM_LOGGING_LEVEL"] = environment.get("VLLM_LOGGING_LEVEL", "WARNING")
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
     )
-    for name in (
-        "RANK",
-        "LOCAL_RANK",
-        "WORLD_SIZE",
-        "LOCAL_WORLD_SIZE",
-        "GROUP_RANK",
-        "ROLE_RANK",
-        "ROLE_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "TORCHELASTIC_RUN_ID",
-    ):
-        environment.pop(name, None)
     return environment
 
 

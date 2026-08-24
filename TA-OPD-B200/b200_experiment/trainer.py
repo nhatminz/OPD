@@ -36,6 +36,7 @@ from .distributed import (
     batch_layout,
     contiguous_partition,
     initialize_distributed,
+    isolate_distributed_subprocess_environment,
     padded_local_indices,
     unique_free_port,
     unwrap_model,
@@ -521,25 +522,12 @@ def _evaluate_vllm_subprocess(
         _save_inference_snapshot(model, tokenizer, model_path)
 
     repo_root = Path(__file__).resolve().parents[1]
-    environment = os.environ.copy()
+    environment = isolate_distributed_subprocess_environment()
     environment["VLLM_LOGGING_LEVEL"] = environment.get("VLLM_LOGGING_LEVEL", "WARNING")
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
     )
-    for name in (
-        "RANK",
-        "LOCAL_RANK",
-        "WORLD_SIZE",
-        "LOCAL_WORLD_SIZE",
-        "GROUP_RANK",
-        "ROLE_RANK",
-        "ROLE_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "TORCHELASTIC_RUN_ID",
-    ):
-        environment.pop(name, None)
     command = [
         sys.executable,
         "-m",

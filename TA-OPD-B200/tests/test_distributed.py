@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -16,6 +18,8 @@ from b200_experiment.distributed import (
     DistributedContext,
     batch_layout,
     contiguous_partition,
+    initialize_distributed,
+    isolate_distributed_subprocess_environment,
     padded_local_indices,
     unique_free_port,
 )
@@ -196,6 +200,59 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
 
 
 class DistributedInvariantTests(unittest.TestCase):
+    def test_nccl_process_group_is_bound_to_the_local_cuda_device(self):
+        with patch.dict(
+            os.environ,
+            {"WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"},
+            clear=False,
+        ), patch(
+            "b200_experiment.distributed.torch.cuda.is_available", return_value=True
+        ), patch(
+            "b200_experiment.distributed.torch.cuda.device_count", return_value=2
+        ), patch(
+            "b200_experiment.distributed.torch.cuda.set_device"
+        ) as set_device, patch(
+            "b200_experiment.distributed.dist.is_initialized", return_value=False
+        ), patch(
+            "b200_experiment.distributed.dist.init_process_group"
+        ) as initialize:
+            context = initialize_distributed()
+
+        self.assertEqual(context.device, torch.device("cuda", 1))
+        set_device.assert_called_once_with(1)
+        initialize.assert_called_once_with(
+            backend="nccl",
+            init_method="env://",
+            device_id=torch.device("cuda", 1),
+        )
+
+    def test_cuda_barrier_names_its_local_device(self):
+        context = DistributedContext(1, 1, 2, torch.device("cuda", 1))
+        with patch("b200_experiment.distributed.dist.barrier") as barrier:
+            context.barrier()
+        barrier.assert_called_once_with(device_ids=[1])
+
+    def test_standalone_child_drops_all_torchrun_rendezvous_metadata(self):
+        source = {
+            "PATH": "/bin",
+            "CUDA_VISIBLE_DEVICES": "2,4",
+            "RANK": "1",
+            "LOCAL_RANK": "1",
+            "WORLD_SIZE": "2",
+            "GROUP_WORLD_SIZE": "1",
+            "ROLE_NAME": "default",
+            "MASTER_ADDR": "10.0.0.2",
+            "MASTER_PORT": "29500",
+            "TORCHELASTIC_USE_AGENT_STORE": "True",
+            "TORCHELASTIC_RESTART_COUNT": "0",
+            "TORCHELASTIC_FUTURE_FIELD": "must-also-be-removed",
+        }
+
+        isolated = isolate_distributed_subprocess_environment(source)
+
+        self.assertEqual(isolated, {"PATH": "/bin", "CUDA_VISIBLE_DEVICES": "2,4"})
+        self.assertIn("TORCHELASTIC_USE_AGENT_STORE", source)
+
     def test_production_batch_layout_is_explicit(self):
         layout = batch_layout(64, 1, 2, 8)
         self.assertEqual(layout.global_prompt_batch_size, 64)

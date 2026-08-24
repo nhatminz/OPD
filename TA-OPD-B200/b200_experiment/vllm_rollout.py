@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 from tqdm.auto import tqdm
 
+from .distributed import isolate_distributed_subprocess_environment
 from .fsdp import (
     is_fsdp_model,
     materialize_full_parameters,
@@ -180,25 +181,12 @@ class VLLMRolloutEngine:
         return command
 
     def _server_environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
+        environment = isolate_distributed_subprocess_environment()
         environment["VLLM_SERVER_DEV_MODE"] = "1"
         environment["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         environment["VLLM_LOGGING_LEVEL"] = environment.get(
             "VLLM_LOGGING_LEVEL", "WARNING"
         )
-        for name in (
-            "RANK",
-            "LOCAL_RANK",
-            "WORLD_SIZE",
-            "LOCAL_WORLD_SIZE",
-            "GROUP_RANK",
-            "ROLE_RANK",
-            "ROLE_WORLD_SIZE",
-            "MASTER_ADDR",
-            "MASTER_PORT",
-            "TORCHELASTIC_RUN_ID",
-        ):
-            environment.pop(name, None)
         # torchrun workers see every listed GPU. Restrict this child to the
         # worker's matching physical device so each rank owns one colocated
         # vLLM server and CUDA-IPC transfers target the correct B200.
@@ -252,8 +240,10 @@ class VLLMRolloutEngine:
                     pass
                 time.sleep(0.5)
             else:
+                tail = self._server_log_tail(log_path)
                 raise TimeoutError(
-                    f"vLLM rollout server did not become ready; see {log_path}"
+                    "vLLM rollout server did not become ready; "
+                    f"see {log_path}\nLast server log lines:\n{tail}"
                 )
             self._post("/init_weight_transfer_engine", json={"init_info": {}})
             # Discard dummy weights and KV cache before loading the two HF models.
@@ -263,9 +253,20 @@ class VLLMRolloutEngine:
             raise
 
     def _raise_server_failure(self, log_path: Path) -> None:
-        self.log_handle.flush()
-        tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
-        raise RuntimeError("vLLM rollout server exited:\n" + "\n".join(tail))
+        raise RuntimeError(
+            "vLLM rollout server exited:\n" + self._server_log_tail(log_path)
+        )
+
+    def _server_log_tail(self, log_path: Path, lines: int = 40) -> str:
+        if self.log_handle is not None:
+            self.log_handle.flush()
+        try:
+            tail = log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()[-lines:]
+        except OSError as error:
+            return f"<could not read server log: {error}>"
+        return "\n".join(tail) or "<server log is empty>"
 
     def _post(self, path: str, **kwargs):
         if self.process is None or self.process.poll() is not None:
@@ -305,7 +306,7 @@ class VLLMRolloutEngine:
                 raise RuntimeError(
                     "Distributed vLLM synchronization requires a process group"
                 )
-            dist.barrier()
+            dist.barrier(device_ids=[torch.cuda.current_device()])
         torch.cuda.synchronize()
         materialize_started = time.perf_counter()
         with materialize_full_parameters(model) as full_model:
@@ -321,9 +322,9 @@ class VLLMRolloutEngine:
             # Keep every rank's full tensors alive until all local vLLM servers
             # have completed their independent CUDA-IPC imports.
             if self.world_size > 1:
-                dist.barrier()
+                dist.barrier(device_ids=[torch.cuda.current_device()])
         if self.world_size > 1:
-            dist.barrier()
+            dist.barrier(device_ids=[torch.cuda.current_device()])
         return {
             "full_weight_materialization_time": materialization_seconds
             if is_fsdp_model(model)
