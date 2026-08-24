@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import yaml
 
-from .config import load_config
+from .config import apply_overrides, load_config
 from .metadata import gpu_inventory
 
 
@@ -69,10 +69,12 @@ def run_batch_autotune(
     generated_config: str | Path,
     candidates: list[int] | None = None,
     opd_config: str | Path | None = None,
+    overrides: list[str] | None = None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("Batch autotune requires CUDA")
-    base = load_config(ta_config)
+    overrides = list(overrides or [])
+    base = apply_overrides(load_config(ta_config), overrides)
     candidates = candidates or [
         int(item) for item in base["autotune"]["batch_candidates"]
     ]
@@ -125,6 +127,8 @@ def run_batch_autotune(
                 "--set",
                 "rollout.backend=vllm",
             ]
+            for override in overrides:
+                command.extend(("--set", override))
             completed = subprocess.run(command, cwd=repo_root, check=False)
             method_result: dict[str, Any] = {
                 "returncode": completed.returncode,

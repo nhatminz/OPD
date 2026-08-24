@@ -52,7 +52,7 @@ from .eval_schedule import (
     training_evaluation_steps,
 )
 from .metadata import collect_metadata, save_metadata
-from .models import load_models
+from .models import load_models, validate_shared_tokenizer_protocol
 from .fsdp import (
     clip_grad_norm,
     distributed_strategy,
@@ -1011,6 +1011,9 @@ def run_training(
     method = str(experiment["method"]).lower()
     if method not in {"opd", "ta", "rac"}:
         raise ValueError(f"Training method must be opd, ta, or rac, got {method!r}")
+    # Fail before starting vLLM or loading either model if a launch override
+    # accidentally enables thinking or proposes a teacher tokenizer path.
+    validate_shared_tokenizer_protocol(config)
     global_prompt_batch_size = int(config["rollout"]["batch_size"])
     num_responses = int(config["rollout"].get("num_responses", 1))
     micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
@@ -1135,7 +1138,7 @@ def run_training(
         config["data"]["path"], split=config["data"].get("split")
     )
     if not records:
-        raise ValueError("Full DAPO dataset is empty")
+        raise ValueError("Configured training dataset is empty")
     setup_progress.update(1)
     setup_progress.set_postfix_str(
         f"stage=start-rollout-{rollout_backend}", refresh=True

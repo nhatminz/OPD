@@ -32,9 +32,11 @@ class _RecordingQwenModel(_FakeModel):
         super().__init__(logits)
         self.config = SimpleNamespace(model_type="qwen3")
         self.calls = []
+        self.input_id_calls = []
 
     def __call__(self, **kwargs):
         input_ids = kwargs["input_ids"]
+        self.input_id_calls.append(input_ids.detach().clone())
         rows = input_ids[:, 0].long() - 1
         logits = self.logits.index_select(0, rows)[:, : input_ids.shape[1]]
         logits_to_keep = kwargs.get("logits_to_keep")
@@ -106,15 +108,29 @@ class ScoringTests(unittest.TestCase):
             temperature=student_temperature,
             micro_batch_size=2,
         )
+        joint_student_model = _RecordingQwenModel(student_logits)
+        joint_teacher_model = _RecordingQwenModel(teacher_logits)
         joint_student, joint_teacher = score_student_teacher_rollout(
-            _RecordingQwenModel(student_logits),
-            _RecordingQwenModel(teacher_logits),
+            joint_student_model,
+            joint_teacher_model,
             rollout,
             top_k=5,
             student_temperature=student_temperature,
             teacher_temperature=teacher_temperature,
             micro_batch_size=2,
         )
+
+        # Teacher scoring consumes the exact same student-tokenizer IDs. There
+        # is deliberately no decode -> teacher-tokenize boundary.
+        self.assertEqual(
+            len(joint_student_model.input_id_calls),
+            len(joint_teacher_model.input_id_calls),
+        )
+        for student_ids, teacher_ids in zip(
+            joint_student_model.input_id_calls,
+            joint_teacher_model.input_id_calls,
+        ):
+            self.assertTrue(torch.equal(student_ids, teacher_ids))
 
         valid = rollout.valid_mask
         self.assertTrue(

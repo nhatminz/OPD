@@ -25,6 +25,34 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 `smoke_test_b200.sh` chạy unit tests và preflight, đọc full training/eval schema nhưng không train full.
 Báo cáo nằm ở `results/preflight.json`.
 
+### Chọn model pair và train dataset
+
+Hãy chọn asset trước khi chạy preflight. Ba launcher đọc chung block đầu `scripts/common_b200.sh`.
+Có thể override tại command line mà không sửa YAML:
+
+```bash
+export TEACHER_MODEL_PATH=models/Qwen3-8B
+export STUDENT_MODEL_PATH=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+export TRAIN_DATASET=competition_math  # hoặc dapo_math
+```
+
+`competition_math` tương ứng file train Competition-MATH, `split=null`, `prompt_key=problem`;
+`dapo_math` tương ứng `nlp/minhpn19/data/DAPO-Math-17k-Processed`, `split=all`,
+`prompt_key=prompt`. Dataset tùy ý:
+
+```bash
+export TRAIN_DATASET=custom
+export TRAIN_DATA_PATH=/absolute/or/storage-relative/train.parquet
+export TRAIN_DATA_SPLIT=null
+export TRAIN_PROMPT_KEY=problem
+export TRAIN_PREFER_SOURCE_PROMPT=false
+```
+
+Path model/data nhận cả absolute path và path tương đối dưới `STORAGE_ROOT`. Mỗi selection cần một
+preflight mới. Token-ID mapping giữa teacher/student phải hoàn toàn giống nhau; chỉ
+`special_tokens_map` được phép khác. Student tokenizer render prompt với `enable_thinking=false`,
+và cùng tensor integer IDs được đưa thẳng vào teacher scoring, không có teacher re-tokenization.
+
 Chạy smoke FSDP thật hai step trên hai GPU trước full run (đổi `METHOD` để kiểm tra từng method):
 
 ```bash

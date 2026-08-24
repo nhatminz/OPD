@@ -185,6 +185,8 @@ class DataEvaluationConfigTests(unittest.TestCase):
         )
         self.assertIsNone(base["data"]["split"])
         self.assertEqual(base["data"]["prompt_key"], "problem")
+        self.assertFalse(base["data"]["chat_template_kwargs"]["enable_thinking"])
+        self.assertTrue(base["models"]["teacher_no_think"])
         self.assertEqual(
             base["evaluation"]["benchmarks"]["Competition-MATH"]["path"],
             "/workspace/storage-shared/nlp/minhpn19/data/competition_math/data/test-00000-of-00001.parquet",

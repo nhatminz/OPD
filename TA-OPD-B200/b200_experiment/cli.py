@@ -49,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     tune.add_argument("--output", required=True)
     tune.add_argument("--generated-config", required=True)
     tune.add_argument("--candidates", nargs="+", type=int)
+    tune.add_argument(
+        "--set", action="append", default=[], dest="overrides", metavar="KEY=VALUE"
+    )
 
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--config", required=True)
@@ -123,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
             args.generated_config,
             args.candidates,
             opd_config=args.opd_config,
+            overrides=args.overrides,
         )
     elif args.command == "evaluate":
         result = evaluate_suite(args.name, args.model, _configured(args), args.output)

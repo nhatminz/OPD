@@ -9,6 +9,7 @@ require_file "${MODEL_PATH}/config.json"
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${RAC_CONFIG}" --name "RAC" --model "${MODEL_PATH}" \
+  "${ASSET_CONFIG_ARGS[@]}" \
   --output "${EVAL_OUTPUT}" \
   --set "paths.storage_root=${STORAGE_ROOT}" \
   --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \

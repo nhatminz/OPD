@@ -35,23 +35,52 @@ def _vocab_digest(tokenizer) -> str:
 def assert_tokenizer_compatibility(
     student_tokenizer, teacher_tokenizer, student_config, teacher_config
 ):
-    checks: dict[str, Any] = {
+    # OPD shares the student's integer token IDs with the teacher.  Therefore
+    # the token-to-ID mapping must be exact.  The semantic roles assigned to
+    # those IDs (special_tokens_map) may legitimately differ between a Base
+    # student and an Instruct teacher and are not used for teacher scoring.
+    fatal_checks: dict[str, Any] = {
         "vocab_mapping": student_tokenizer.get_vocab() == teacher_tokenizer.get_vocab(),
         "added_vocab": student_tokenizer.get_added_vocab()
         == teacher_tokenizer.get_added_vocab(),
-        "special_tokens": student_tokenizer.special_tokens_map
-        == teacher_tokenizer.special_tokens_map,
         "model_vocab_size": int(student_config.vocab_size)
         == int(teacher_config.vocab_size),
         "tokenizer_length": len(student_tokenizer) == len(teacher_tokenizer),
     }
-    if not all(checks.values()):
-        failed = [name for name, passed in checks.items() if not passed]
+    if not all(fatal_checks.values()):
+        failed = [name for name, passed in fatal_checks.items() if not passed]
         raise ValueError(
             "Student/teacher token IDs are incompatible: " + ", ".join(failed)
         )
+    checks = dict(fatal_checks)
+    checks["special_tokens_map_equal"] = (
+        student_tokenizer.special_tokens_map == teacher_tokenizer.special_tokens_map
+    )
     checks["vocab_sha256"] = _vocab_digest(student_tokenizer)
     return checks
+
+
+def validate_shared_tokenizer_protocol(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate the fixed student-tokenizer/no-think teacher protocol."""
+    if config.get("models", {}).get("teacher_no_think") is not True:
+        raise ValueError(
+            "models.teacher_no_think must be true: the teacher is always run "
+            "with the shared no-think prompt protocol"
+        )
+    enable_thinking = (
+        config.get("data", {}).get("chat_template_kwargs", {}).get("enable_thinking")
+    )
+    if enable_thinking is not False:
+        raise ValueError(
+            "data.chat_template_kwargs.enable_thinking must be false because the "
+            "student-rendered prompt IDs are shared directly with the no-think teacher"
+        )
+    return {
+        "tokenizer_source": "student",
+        "teacher_input": "shared_student_token_ids",
+        "teacher_retokenization": False,
+        "teacher_no_think": True,
+    }
 
 
 def choose_attention_implementation(requested: str) -> str:
@@ -75,6 +104,7 @@ def model_dtype_kwargs(dtype: torch.dtype) -> dict[str, torch.dtype]:
 
 def inspect_model_assets(config: dict[str, Any]) -> dict[str, Any]:
     model_cfg = config["models"]
+    tokenizer_protocol = validate_shared_tokenizer_protocol(config)
     student_path = Path(model_cfg["student_path"]).resolve()
     teacher_path = Path(model_cfg["teacher_path"]).resolve()
     for role, path in (("student", student_path), ("teacher", teacher_path)):
@@ -99,6 +129,7 @@ def inspect_model_assets(config: dict[str, Any]) -> dict[str, Any]:
         "student_parameters_declared": getattr(student_config, "num_parameters", None),
         "teacher_parameters_declared": getattr(teacher_config, "num_parameters", None),
         "compatibility": compatibility,
+        "tokenizer_protocol": tokenizer_protocol,
         "attention_implementation": choose_attention_implementation(
             model_cfg.get("attention_implementation", "auto")
         ),
@@ -110,6 +141,9 @@ def load_models(config: dict[str, Any], device: torch.device):
     student_path = Path(model_cfg["student_path"]).resolve()
     teacher_path = Path(model_cfg["teacher_path"]).resolve()
     assets = inspect_model_assets(config)
+    # This is intentionally the only runtime tokenizer.  Rollout response IDs
+    # and the full prompt+response IDs are passed straight to teacher.forward;
+    # teacher text is never decoded and re-tokenized.
     tokenizer = AutoTokenizer.from_pretrained(student_path, local_files_only=True)
     dtype = _dtype(model_cfg.get("dtype", "bfloat16"))
     attention = assets["attention_implementation"]

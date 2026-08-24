@@ -27,6 +27,7 @@ fi
 cd "${REPO_DIR}"
 run_training_cli train \
   --config "${METHOD_CONFIG}" \
+  "${ASSET_CONFIG_ARGS[@]}" \
   --set "experiment.output_dir=${SMOKE_OUTPUT}" \
   --set "distributed.strategy=fsdp" \
   --set "rollout.backend=vllm" \
@@ -108,6 +109,7 @@ if [[ "${SMOKE_TEST_RESUME:-true}" == "true" ]]; then
   fi
   run_training_cli train \
     --config "${METHOD_CONFIG}" \
+    "${ASSET_CONFIG_ARGS[@]}" \
     --set "experiment.output_dir=${RESUME_OUTPUT}" \
     --set "distributed.strategy=fsdp" \
     --set "rollout.backend=vllm" \

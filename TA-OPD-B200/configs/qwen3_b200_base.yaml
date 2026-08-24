@@ -34,6 +34,9 @@ paths:
 models:
   teacher_path: models/Qwen3-8B
   student_path: nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+  # The student tokenizer is the sole tokenizer. Its prompt/trajectory IDs are
+  # sent directly to the teacher; there is no teacher decode/re-tokenize path.
+  teacher_no_think: true
   dtype: bfloat16
   attention_implementation: auto
 
@@ -46,7 +49,9 @@ data:
   prefer_source_prompt: false
   max_prompt_tokens: 1024
   chat_template_kwargs:
-    enable_thinking: true
+    # Shared prompt IDs condition the teacher, so this is deliberately fixed
+    # to Qwen3's hard no-think chat-template switch.
+    enable_thinking: false
 
 rollout:
   # Default training rollout uses a persistent, same-GPU vLLM server. Student

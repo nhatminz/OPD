@@ -77,6 +77,7 @@ echo "Protocol: backend=${EVAL_BACKEND:-vllm}, temperature=${EVAL_TEMPERATURE:-1
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${METHOD_CONFIG}" \
+  "${ASSET_CONFIG_ARGS[@]}" \
   --name "${MODEL_NAME}" \
   --model "${CHECKPOINT_PATH}" \
   --output "${EVAL_OUTPUT}" \

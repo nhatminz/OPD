@@ -3,12 +3,13 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 resolve_run_paths
-MODEL_PATH="${BASE_CHECKPOINT:-${STORAGE_ROOT}/nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}"
+MODEL_PATH="${BASE_CHECKPOINT:-${STUDENT_MODEL_ABS}}"
 EVAL_OUTPUT="${BASE_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/base}"
 require_file "${MODEL_PATH}/config.json"
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${BASE_CONFIG}" --name "Base" --model "${MODEL_PATH}" \
+  "${ASSET_CONFIG_ARGS[@]}" \
   --output "${EVAL_OUTPUT}" \
   --set "paths.storage_root=${STORAGE_ROOT}" \
   --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \

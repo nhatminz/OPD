@@ -14,12 +14,88 @@ export PYTHONUNBUFFERED=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 
+# ================= MODEL / TRAIN-DATA PRESET: EDIT HERE =================
+# Paths may be absolute or relative to STORAGE_ROOT. Environment overrides
+# take precedence, so the same launchers work for any vocabulary-compatible
+# teacher/student pair without editing YAML files.
+export TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${TEACHER_PATH:-models/Qwen3-8B}}"
+export STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-${STUDENT_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
+export TRAIN_DATASET="${TRAIN_DATASET:-competition_math}"  # competition_math, dapo_math, custom
+
+case "${TRAIN_DATASET,,}" in
+  competition_math|competition-math|math)
+    PRESET_TRAIN_DATA_PATH="nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet"
+    PRESET_TRAIN_DATA_SPLIT="null"
+    PRESET_TRAIN_PROMPT_KEY="problem"
+    PRESET_TRAIN_PREFER_SOURCE_PROMPT="false"
+    ;;
+  dapo_math|dapo-math|dapo)
+    PRESET_TRAIN_DATA_PATH="nlp/minhpn19/data/DAPO-Math-17k-Processed"
+    PRESET_TRAIN_DATA_SPLIT="all"
+    PRESET_TRAIN_PROMPT_KEY="prompt"
+    PRESET_TRAIN_PREFER_SOURCE_PROMPT="false"
+    ;;
+  custom)
+    if [[ -z "${TRAIN_DATA_PATH:-}" || -z "${TRAIN_PROMPT_KEY:-}" ]]; then
+      echo "TRAIN_DATASET=custom requires TRAIN_DATA_PATH and TRAIN_PROMPT_KEY" >&2
+      return 2 2>/dev/null || exit 2
+    fi
+    PRESET_TRAIN_DATA_PATH="${TRAIN_DATA_PATH}"
+    PRESET_TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-null}"
+    PRESET_TRAIN_PROMPT_KEY="${TRAIN_PROMPT_KEY}"
+    PRESET_TRAIN_PREFER_SOURCE_PROMPT="${TRAIN_PREFER_SOURCE_PROMPT:-false}"
+    ;;
+  *)
+    echo "Unknown TRAIN_DATASET=${TRAIN_DATASET}; use competition_math, dapo_math, or custom" >&2
+    return 2 2>/dev/null || exit 2
+    ;;
+esac
+
+export TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${PRESET_TRAIN_DATA_PATH}}"
+export TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-${PRESET_TRAIN_DATA_SPLIT}}"
+export TRAIN_PROMPT_KEY="${TRAIN_PROMPT_KEY:-${PRESET_TRAIN_PROMPT_KEY}}"
+export TRAIN_PREFER_SOURCE_PROMPT="${TRAIN_PREFER_SOURCE_PROMPT:-${PRESET_TRAIN_PREFER_SOURCE_PROMPT}}"
+# This experiment intentionally has no teacher-tokenizer path. Qwen3's hard
+# no-think switch is always applied while the student tokenizer renders the one
+# shared prompt. Trainer validation rejects attempts to enable thinking.
+# ========================================================================
+
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
 OPD_CONFIG="${REPO_DIR}/configs/qwen3_b200_opd.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/qwen3_b200_autotuned.yaml}"
 PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight.json}"
+
+storage_asset_path() {
+  if [[ "$1" == /* ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s/%s\n' "${STORAGE_ROOT%/}" "$1"
+  fi
+}
+
+TEACHER_MODEL_ABS="$(storage_asset_path "${TEACHER_MODEL_PATH}")"
+STUDENT_MODEL_ABS="$(storage_asset_path "${STUDENT_MODEL_PATH}")"
+TRAIN_DATA_ABS="$(storage_asset_path "${TRAIN_DATA_PATH}")"
+
+ASSET_CONFIG_ARGS=(
+  --set "models.teacher_path=${TEACHER_MODEL_PATH}"
+  --set "models.student_path=${STUDENT_MODEL_PATH}"
+  --set "models.teacher_no_think=true"
+  --set "data.path=${TRAIN_DATA_PATH}"
+  --set "data.split=${TRAIN_DATA_SPLIT}"
+  --set "data.prompt_key=${TRAIN_PROMPT_KEY}"
+  --set "data.prefer_source_prompt=${TRAIN_PREFER_SOURCE_PROMPT}"
+  --set "data.chat_template_kwargs.enable_thinking=false"
+)
+
+print_asset_selection() {
+  echo "Teacher model: ${TEACHER_MODEL_ABS}"
+  echo "Student model/tokenizer: ${STUDENT_MODEL_ABS}"
+  echo "Training dataset: preset=${TRAIN_DATASET}, path=${TRAIN_DATA_ABS}, split=${TRAIN_DATA_SPLIT}, prompt_key=${TRAIN_PROMPT_KEY}"
+  echo "Teacher protocol: no-think, shared student token IDs, no teacher re-tokenization"
+}
 
 resolve_run_paths() {
   RUN_NAME="${RUN_NAME:-run01}"
@@ -96,7 +172,12 @@ require_b200_validation() {
     echo "Run: bash scripts/smoke_test_b200.sh" >&2
     return 1
   }
-  "${PYTHON_BIN}" - "${PREFLIGHT_REPORT}" <<'PY'
+  "${PYTHON_BIN}" - \
+    "${PREFLIGHT_REPORT}" \
+    "${TEACHER_MODEL_ABS}" \
+    "${STUDENT_MODEL_ABS}" \
+    "${TRAIN_DATA_ABS}" \
+    "${TRAIN_DATA_SPLIT}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -104,6 +185,30 @@ from pathlib import Path
 preflight = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if preflight.get("status") != "passed":
     raise SystemExit("B200 preflight did not pass")
+expected_split = None if sys.argv[5] == "null" else sys.argv[5]
+expected = {
+    "teacher": str(Path(sys.argv[2]).resolve()),
+    "student": str(Path(sys.argv[3]).resolve()),
+    "training_data": str(Path(sys.argv[4]).resolve()),
+    "split": expected_split,
+}
+actual = {
+    "teacher": str(Path(preflight["models"]["teacher_path"]).resolve()),
+    "student": str(Path(preflight["models"]["student_path"]).resolve()),
+    "training_data": str(Path(preflight["training_data"]["path"]).resolve()),
+    "split": preflight["training_data"].get("split"),
+}
+if actual != expected:
+    raise SystemExit(
+        "B200 preflight belongs to a different model/data selection; "
+        "rerun bash scripts/smoke_test_b200.sh. "
+        f"expected={expected}, actual={actual}"
+    )
+protocol = preflight["models"].get("tokenizer_protocol", {})
+if protocol.get("tokenizer_source") != "student" or not protocol.get(
+    "teacher_no_think"
+):
+    raise SystemExit("B200 preflight did not validate the no-think shared-token protocol")
 PY
   if batch_autotune_enabled; then
     require_file "${AUTOTUNE_CONFIG}" || {
@@ -156,6 +261,7 @@ build_training_args() {
   local process_count="${TRAIN_NPROC_PER_NODE:-$(visible_gpu_count)}"
   local local_trajectory_batch=$(((trajectory_batch + process_count - 1) / process_count))
   COMMON_TRAIN_ARGS=(
+    "${ASSET_CONFIG_ARGS[@]}"
     --set "experiment.output_dir=${output_dir}"
     --set "paths.storage_root=${STORAGE_ROOT}"
     --set "experiment.seed=${SEED:-${EXPERIMENT_SEED:-42}}"

@@ -35,6 +35,13 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 | AIME 2024 | `nlp/minhpn19/data/eval/aime24` |
 | AIME 2025 | `nlp/minhpn19/data/eval/aime25` |
 
+Không cần sửa YAML khi đổi cặp model hoặc train dataset. Các launcher nhận
+`TEACHER_MODEL_PATH`, `STUDENT_MODEL_PATH` và `TRAIN_DATASET=competition_math|dapo_math|custom`;
+default tập trung tại `scripts/common_b200.sh`. Teacher/student phải có cùng exact token-to-ID vocab,
+added vocab, model vocab size và tokenizer length. Khác biệt `special_tokens_map` giữa Base và
+Instruct không còn bị coi là lỗi vì student tokenizer là tokenizer duy nhất, và teacher scoring nhận
+trực tiếp cùng integer IDs. Prompt dùng Qwen3 `enable_thinking=false`, nên teacher luôn no-think.
+
 Training đọc toàn bộ file Competition-MATH train đã cấu hình (`split: null`). Nếu batch cuối không chia hết cho hai rank, rank ngắn hơn
 dùng một trajectory filler xác định chỉ để giữ lịch collective FSDP giống nhau; filler bị loại khỏi
 loss, selector, metric và log nên mỗi sample thật vẫn được dùng đúng một lần. Loader hỗ trợ parquet,

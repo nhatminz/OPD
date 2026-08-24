@@ -15,6 +15,33 @@ CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_2gpu.sh
 ```
 
+Hãy đặt các biến dưới đây trước khi chạy các lệnh kiểm tra phía trên. Model và train dataset có thể
+chọn ngay bằng biến môi trường; không cần sửa YAML. Default hiện tại là
+Qwen3-8B → Qwen3-1.7B-Base trên Competition-MATH:
+
+```bash
+export TEACHER_MODEL_PATH=models/Qwen3-8B
+export STUDENT_MODEL_PATH=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+export TRAIN_DATASET=competition_math
+```
+
+Chuyển sang full DAPO-Math-17k-Processed:
+
+```bash
+export TRAIN_DATASET=dapo_math
+```
+
+Preset DAPO tự đặt path `nlp/minhpn19/data/DAPO-Math-17k-Processed`, split `all`, prompt key
+`prompt`; preset Competition-MATH tự đặt file train, split `null`, prompt key `problem`. Dataset
+khác dùng `TRAIN_DATASET=custom TRAIN_DATA_PATH=... TRAIN_DATA_SPLIT=... TRAIN_PROMPT_KEY=...`.
+Có thể sửa các default tập trung trong `scripts/common_b200.sh`. Sau mỗi lần đổi model/data phải chạy
+lại `smoke_test_b200.sh`; launcher từ chối dùng preflight của cặp cũ.
+
+Student tokenizer là tokenizer duy nhất. Teacher nhận trực tiếp cùng prompt/trajectory token IDs,
+không decode rồi tokenize lại. `special_tokens_map` được phép khác, nhưng `get_vocab()`, added vocab,
+model vocab size và tokenizer length vẫn bắt buộc khớp tuyệt đối. Prompt chung luôn dùng
+`enable_thinking=false`, nên teacher luôn no-think.
+
 ## 2. Chạy full và công bằng
 
 Đặt ba tên riêng nhưng dùng cùng suffix và cùng mọi shared hyperparameter:

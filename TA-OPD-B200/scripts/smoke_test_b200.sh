@@ -6,6 +6,7 @@ cd "${REPO_DIR}"
 "${PYTHON_BIN}" -m unittest discover -s tests -v
 "${PYTHON_BIN}" -m b200_experiment.cli preflight \
   --config "${BASE_CONFIG}" \
+  "${ASSET_CONFIG_ARGS[@]}" \
   --output "${PREFLIGHT_REPORT}"
 
 if batch_autotune_enabled; then
@@ -15,6 +16,7 @@ if batch_autotune_enabled; then
     --rac-config "${RAC_CONFIG}"
     --output "${REPO_DIR}/outputs/autotune"
     --generated-config "${AUTOTUNE_CONFIG}"
+    "${ASSET_CONFIG_ARGS[@]}"
   )
   if [[ -n "${BATCH_CANDIDATES:-}" ]]; then
     read -r -a CANDIDATES <<< "${BATCH_CANDIDATES}"
