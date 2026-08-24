@@ -70,6 +70,12 @@ class BaseEvaluationCacheTests(unittest.TestCase):
                             "accuracy": 1 / 16,
                             "predictions": str(prediction),
                         }
+                    detailed_outputs = destination / "model_outputs_detailed.jsonl.gz"
+                    with gzip.open(
+                        detailed_outputs, "wt", encoding="utf-8"
+                    ) as handle:
+                        handle.write('{"response":"2"}\n')
+                    suite["detailed_outputs"] = str(detailed_outputs)
                     (destination / "summary.json").write_text(
                         json.dumps(suite), encoding="utf-8"
                     )
@@ -106,6 +112,8 @@ class BaseEvaluationCacheTests(unittest.TestCase):
             for result in suite["benchmarks"].values():
                 self.assertEqual(Path(result["predictions"]).parent, second)
                 self.assertTrue(Path(result["predictions"]).is_file())
+            self.assertEqual(Path(suite["detailed_outputs"]).parent, second)
+            self.assertTrue(Path(suite["detailed_outputs"]).is_file())
 
             _suite, status = evaluate_or_reuse_base(
                 config=config,

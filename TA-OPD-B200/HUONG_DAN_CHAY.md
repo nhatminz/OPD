@@ -120,6 +120,21 @@ RAC_CHECKPOINT="outputs/$RAC_RUN_NAME/rac_opd/checkpoint-000100" \
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
 ```
 
+Hoặc dùng một launcher chung cho checkpoint bất kỳ của OPD, TA-OPD hoặc RAC:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
+  bash scripts/eval_checkpoint_b200.sh opd \
+  outputs/my_run/opd/checkpoint-000050 \
+  results/checkpoint_eval/opd_step50
+
+# Thay opd bằng ta-opd hoặc rac và thay đường dẫn checkpoint tương ứng.
+```
+
+Nếu bỏ đối số output cuối, script tự tạo thư mục timestamp. Kết quả có `summary.json`, các file
+prediction theo dataset và `model_outputs_detailed.jsonl.gz` chứa prompt, đáp án chuẩn, toàn bộ
+response cùng cờ đúng/sai của từng response.
+
 Periodic và final eval luôn chạy toàn bộ MATH-500, AIME24, AIME25; `max_num_seqs` là concurrency,
 không phải subset size.
 Ba bộ có tổng cộng 560 problem; `n=16` nên vLLM báo 8.960 processed responses. Base step 0 chỉ

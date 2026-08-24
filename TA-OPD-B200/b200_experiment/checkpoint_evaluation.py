@@ -449,6 +449,12 @@ def _reevaluate_method(
                         f"Missing staged predictions for {benchmark}: {prediction}"
                     )
                 result["predictions"] = str(step_dir / prediction.name)
+            detailed_outputs = Path(suite["detailed_outputs"])
+            if not detailed_outputs.is_file():
+                raise FileNotFoundError(
+                    f"Missing staged detailed outputs: {detailed_outputs}"
+                )
+            suite["detailed_outputs"] = str(step_dir / detailed_outputs.name)
             summary_path.write_text(
                 json.dumps(suite, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",

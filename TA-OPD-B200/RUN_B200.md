@@ -226,6 +226,36 @@ resume sẽ tự rewind output về đúng step đó rồi ghi lại các step t
 
 ## Manual evaluation
 
+Một launcher chung có thể eval checkpoint bất kỳ của cả ba method. Đối số thứ ba là thư mục
+output và có thể bỏ qua (script sẽ tự tạo thư mục có timestamp):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
+  bash scripts/eval_checkpoint_b200.sh opd \
+  outputs/my_opd_run/opd/checkpoint-000050 \
+  results/checkpoint_eval/opd_step50
+
+CUDA_VISIBLE_DEVICES=1 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=16 \
+  bash scripts/eval_checkpoint_b200.sh ta-opd \
+  outputs/my_ta_run/ta_opd/checkpoint-000100
+
+CUDA_VISIBLE_DEVICES=2 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
+  bash scripts/eval_checkpoint_b200.sh rac \
+  outputs/my_rac_run/rac_opd/checkpoint-000150
+```
+
+`METHOD` nhận `opd`, `ta-opd` (hoặc `ta`) và `rac`. Script dùng vLLM mặc định; có thể đặt
+`EVAL_BACKEND=hf`. Mặc định riêng của launcher chung là `temperature=1`, `n=16`; đặt
+`EVAL_NUM_RESPONSES=1` để lấy accuracy một response thay vì avg@n.
+
+Mỗi thư mục eval chứa `summary.json`, ba file `*_predictions.jsonl.gz`, và file gộp
+`model_outputs_detailed.jsonl.gz`. File gộp lưu dataset, ID, đề bài, đáp án chuẩn, prompt thực tế,
+toàn bộ response, đúng/sai từng response và generation parameters. Đọc nhanh bằng:
+
+```bash
+gzip -cd results/checkpoint_eval/opd_step50/model_outputs_detailed.jsonl.gz | less
+```
+
 Eval một RAC checkpoint trên full MATH-500/AIME24/AIME25:
 
 ```bash

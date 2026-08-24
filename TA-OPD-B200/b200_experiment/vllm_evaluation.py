@@ -15,6 +15,7 @@ from .config import load_config
 from .evaluation import (
     BENCHMARK_ORDER,
     _grade,
+    detailed_model_output_record,
     evaluation_metric_name,
     load_benchmark,
 )
@@ -95,7 +96,7 @@ def evaluate_vllm_suite(
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     loaded: dict[str, tuple[list[dict[str, str]], dict[str, Any]]] = {}
     prompts: list[str] = []
-    prompt_rows: list[tuple[str, dict[str, str]]] = []
+    prompt_rows: list[tuple[str, dict[str, str], str]] = []
     for benchmark in benchmark_names:
         records, schema = load_benchmark(
             benchmark, config["evaluation"]["benchmarks"][benchmark]
@@ -104,8 +105,9 @@ def evaluate_vllm_suite(
             records = records[: int(limit)]
         loaded[benchmark] = (records, schema)
         for row in records:
-            prompts.append(_prompt(tokenizer, row["problem"], config))
-            prompt_rows.append((benchmark, row))
+            rendered_prompt = _prompt(tokenizer, row["problem"], config)
+            prompts.append(rendered_prompt)
+            prompt_rows.append((benchmark, row, rendered_prompt))
 
     vllm_settings = dict(runtime_settings.get("vllm", {}))
     engine_kwargs: dict[str, Any] = {
@@ -167,17 +169,19 @@ def evaluate_vllm_suite(
             **{key: value for key, value in engine_kwargs.items() if key != "model"},
         },
     }
-    grouped: dict[str, list[tuple[dict[str, str], list[str]]]] = {
+    grouped: dict[str, list[tuple[dict[str, str], str, list[str]]]] = {
         name: [] for name in benchmark_names
     }
-    for (benchmark, row), request_output in zip(prompt_rows, generated):
+    for (benchmark, row, rendered_prompt), request_output in zip(
+        prompt_rows, generated
+    ):
         if len(request_output.outputs) != samples_per_problem:
             raise RuntimeError(
                 f"vLLM returned {len(request_output.outputs)} responses for one "
                 f"problem, expected {samples_per_problem}"
             )
         responses = [item.text for item in request_output.outputs]
-        grouped[benchmark].append((row, responses))
+        grouped[benchmark].append((row, rendered_prompt, responses))
 
     grade_progress = tqdm(
         total=len(prompt_rows),
@@ -188,56 +192,83 @@ def evaluate_vllm_suite(
         disable=False,
         mininterval=0.2,
     )
-    for benchmark in benchmark_names:
-        records, schema = loaded[benchmark]
-        prediction_path = output_dir / (
-            f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
-        )
-        correct = graded = problems = 0
-        problem_score_sum = 0.0
-        with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
-            for row, responses in grouped[benchmark]:
-                correctness = [
-                    _grade(response, row["answer"]) for response in responses
-                ]
-                correct += sum(map(int, correctness))
-                graded += samples_per_problem
-                problems += 1
-                problem_score_sum += sum(correctness) / samples_per_problem
-                handle.write(
-                    json.dumps(
-                        {
-                            **row,
-                            "responses": responses,
-                            "correct": correctness,
-                            "problem_score": sum(correctness)
-                            / samples_per_problem,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+    detailed_output_path = output_dir / "model_outputs_detailed.jsonl.gz"
+    try:
+        with gzip.open(detailed_output_path, "wt", encoding="utf-8") as detailed:
+            for benchmark in benchmark_names:
+                records, schema = loaded[benchmark]
+                prediction_path = output_dir / (
+                    f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
                 )
-                grade_progress.set_postfix_str(
-                    f"{benchmark} {metric_name}="
-                    f"{correct / max(graded, 1):.3f}",
-                    refresh=False,
-                )
-                grade_progress.update(1)
-        avg_at_n = problem_score_sum / max(problems, 1)
-        benchmark_result = {
-            "correct": correct,
-            "total": graded,
-            "problems": len(records),
-            "samples_per_problem": samples_per_problem,
-            "avg_at_n": avg_at_n,
-            "accuracy": avg_at_n,
-            "predictions": str(prediction_path),
-            "schema": schema,
-        }
-        if samples_per_problem == 16:
-            benchmark_result["avg_at_16"] = avg_at_n
-        suite["benchmarks"][benchmark] = benchmark_result
-    grade_progress.close()
+                correct = graded = problems = 0
+                problem_score_sum = 0.0
+                with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
+                    for row, rendered_prompt, responses in grouped[benchmark]:
+                        correctness = [
+                            _grade(response, row["answer"])
+                            for response in responses
+                        ]
+                        correct += sum(map(int, correctness))
+                        graded += samples_per_problem
+                        problems += 1
+                        problem_score_sum += sum(correctness) / samples_per_problem
+                        detailed.write(
+                            json.dumps(
+                                detailed_model_output_record(
+                                    model_name=model_name,
+                                    model_path=model_path,
+                                    backend="vllm",
+                                    benchmark=benchmark,
+                                    row=row,
+                                    rendered_prompt=rendered_prompt,
+                                    responses=responses,
+                                    correctness=correctness,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    max_new_tokens=max_new_tokens,
+                                    seed=int(engine_kwargs["seed"]),
+                                ),
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        handle.write(
+                            json.dumps(
+                                {
+                                    **row,
+                                    "responses": responses,
+                                    "correct": correctness,
+                                    "problem_score": sum(correctness)
+                                    / samples_per_problem,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        grade_progress.set_postfix_str(
+                            f"{benchmark} {metric_name}="
+                            f"{correct / max(graded, 1):.3f}",
+                            refresh=False,
+                        )
+                        grade_progress.update(1)
+                avg_at_n = problem_score_sum / max(problems, 1)
+                benchmark_result = {
+                    "correct": correct,
+                    "total": graded,
+                    "problems": len(records),
+                    "samples_per_problem": samples_per_problem,
+                    "avg_at_n": avg_at_n,
+                    "accuracy": avg_at_n,
+                    "predictions": str(prediction_path),
+                    "schema": schema,
+                }
+                if samples_per_problem == 16:
+                    benchmark_result["avg_at_16"] = avg_at_n
+                suite["benchmarks"][benchmark] = benchmark_result
+    finally:
+        grade_progress.close()
+
+    suite["detailed_outputs"] = str(detailed_output_path.resolve())
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(suite, handle, indent=2, ensure_ascii=False)

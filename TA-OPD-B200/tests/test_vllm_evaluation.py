@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 import tempfile
@@ -87,6 +88,19 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(result["total"], 1)
             self.assertEqual(result["avg_at_n"], 1.0)
             self.assertNotIn("avg_at_16", result)
+            detailed_path = Path(suite["detailed_outputs"])
+            self.assertEqual(detailed_path.name, "model_outputs_detailed.jsonl.gz")
+            with gzip.open(detailed_path, "rt", encoding="utf-8") as handle:
+                detailed_rows = [json.loads(line) for line in handle]
+            self.assertEqual(len(detailed_rows), 1)
+            detailed = detailed_rows[0]
+            self.assertEqual(detailed["model_name"], "student")
+            self.assertEqual(detailed["backend"], "vllm")
+            self.assertEqual(detailed["benchmark"], "MATH-500")
+            self.assertEqual(detailed["rendered_prompt"], "Solve the problem step by step. End with only the final answer inside \\boxed{}.\n\n1?")
+            self.assertEqual(detailed["samples_per_problem"], 1)
+            self.assertEqual(detailed["outputs"][0]["response"], "1")
+            self.assertTrue(detailed["outputs"][0]["correct"])
 
     def test_auto_memory_uses_all_free_vram_except_headroom(self):
         gib = 2**30

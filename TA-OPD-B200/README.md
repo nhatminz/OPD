@@ -184,6 +184,12 @@ Mỗi output chứa `resolved_config.yaml`, metadata, `metrics.jsonl`, `train_me
 Checkpoint được ghi qua temporary directory rồi atomic rename; model, optimizer step/state và
 Torch/CUDA RNG state được khôi phục. Dùng checkpoint cụ thể hoặc `RESUME=auto` cùng tên run cũ.
 
+Eval thủ công một checkpoint bất kỳ dùng
+`scripts/eval_checkpoint_b200.sh METHOD CHECKPOINT [OUTPUT_DIR]`, trong đó `METHOD` là `opd`,
+`ta-opd` hoặc `rac`. Ngoài summary và prediction theo từng dataset, evaluator HF/vLLM đều ghi
+`model_outputs_detailed.jsonl.gz` gồm prompt đã render, reference answer, mọi model response và
+kết quả chấm từng response. Ví dụ lệnh đầy đủ nằm trong `RUN_B200.md`.
+
 Detailed TA selected-token JSONL được tắt mặc định để tránh tăng disk không giới hạn; compact global
 histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có thể chủ động bật bằng
 `--set logging.selected_tokens_enabled=true` cho một run audit ngắn.

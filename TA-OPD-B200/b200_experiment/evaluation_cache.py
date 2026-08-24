@@ -162,6 +162,10 @@ def load_compatible_evaluation(
             if not prediction.is_file():
                 return None
             result["predictions"] = str(prediction.resolve())
+        detailed_outputs = directory / Path(suite["detailed_outputs"]).name
+        if not detailed_outputs.is_file():
+            return None
+        suite["detailed_outputs"] = str(detailed_outputs.resolve())
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
         return None
     return suite
@@ -185,6 +189,12 @@ def materialize_evaluation(
         shutil.copy2(source_prediction, temporary)
         os.replace(temporary, destination_prediction)
         result["predictions"] = str(destination_prediction.resolve())
+    source_detailed = source / Path(suite["detailed_outputs"]).name
+    destination_detailed = destination / source_detailed.name
+    temporary = destination / f".{source_detailed.name}.{uuid.uuid4().hex}.tmp"
+    shutil.copy2(source_detailed, temporary)
+    os.replace(temporary, destination_detailed)
+    suite["detailed_outputs"] = str(destination_detailed.resolve())
     suite["model"] = model_name
     summary_temporary = destination / f".summary.{uuid.uuid4().hex}.tmp"
     summary_temporary.write_text(

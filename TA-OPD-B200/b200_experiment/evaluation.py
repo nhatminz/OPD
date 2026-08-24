@@ -25,6 +25,59 @@ def evaluation_metric_name(samples_per_problem: int) -> str:
     if samples <= 0:
         raise ValueError("Evaluation samples per problem must be positive")
     return "accuracy" if samples == 1 else f"avg@{samples}"
+
+
+def detailed_model_output_record(
+    *,
+    model_name: str,
+    model_path: str | Path | None,
+    backend: str,
+    benchmark: str,
+    row: dict[str, str],
+    rendered_prompt: str,
+    responses: list[str],
+    correctness: list[bool],
+    temperature: float,
+    top_p: float,
+    max_new_tokens: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Build one audit-friendly row containing every output for one problem."""
+    if len(responses) != len(correctness):
+        raise ValueError("Detailed responses and correctness flags must align")
+    samples = len(responses)
+    return {
+        "schema_version": 1,
+        "model_name": model_name,
+        "model_path": str(Path(model_path).resolve()) if model_path else None,
+        "backend": backend,
+        "benchmark": benchmark,
+        "problem_id": row["id"],
+        "problem": row["problem"],
+        "reference_answer": row["answer"],
+        "rendered_prompt": rendered_prompt,
+        "samples_per_problem": samples,
+        "problem_score": sum(map(int, correctness)) / max(samples, 1),
+        "generation": {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_new_tokens": int(max_new_tokens),
+            "seed": int(seed),
+        },
+        "outputs": [
+            {
+                "sample_index": sample_index,
+                "response": response,
+                "correct": bool(is_correct),
+                "response_characters": len(response),
+            }
+            for sample_index, (response, is_correct) in enumerate(
+                zip(responses, correctness)
+            )
+        ],
+    }
+
+
 QUESTION_ALIASES = ("problem", "question", "prompt", "input", "query")
 ANSWER_ALIASES = (
     "answer",
@@ -298,6 +351,8 @@ def evaluate_loaded_suite(
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    detailed_output_path = output_dir / "model_outputs_detailed.jsonl.gz"
+    detailed_handle = gzip.open(detailed_output_path, "wt", encoding="utf-8")
     progress = tqdm(
         total=total_samples,
         desc=f"Eval {model_name}",
@@ -388,6 +443,30 @@ def evaluate_loaded_suite(
                         graded_generations += samples_per_problem
                         problems += 1
                         problem_score_sum += sum(correctness) / samples_per_problem
+                        detailed_handle.write(
+                            json.dumps(
+                                detailed_model_output_record(
+                                    model_name=model_name,
+                                    model_path=getattr(
+                                        getattr(model, "config", None),
+                                        "_name_or_path",
+                                        None,
+                                    ),
+                                    backend=str(evaluation.get("backend", "hf")),
+                                    benchmark=benchmark,
+                                    row=row,
+                                    rendered_prompt=prompts[row_index],
+                                    responses=responses,
+                                    correctness=correctness,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    max_new_tokens=max_new_tokens,
+                                    seed=seed,
+                                ),
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                         handle.write(
                             json.dumps(
                                 {
@@ -421,12 +500,14 @@ def evaluate_loaded_suite(
                 benchmark_result["avg_at_16"] = avg_at_n
             suite["benchmarks"][benchmark] = benchmark_result
     finally:
+        detailed_handle.close()
         progress.close()
         model.config.use_cache = previous_use_cache
         model.train(previous_training)
         torch.set_rng_state(cpu_rng_state)
         if cuda_rng_states:
             torch.cuda.set_rng_state_all(cuda_rng_states)
+    suite["detailed_outputs"] = str(detailed_output_path.resolve())
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(suite, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
