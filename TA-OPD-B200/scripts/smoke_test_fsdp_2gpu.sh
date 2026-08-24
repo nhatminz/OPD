@@ -4,11 +4,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 source "${SCRIPT_DIR}/common_b200.sh"
 
-export TRAIN_NPROC_PER_NODE=2
-if (( $(visible_gpu_count) < 2 )); then
-  echo "FSDP smoke test requires two visible GPUs" >&2
+export TRAIN_NPROC_PER_NODE="${TRAIN_NPROC_PER_NODE:-$(visible_gpu_count)}"
+if ! [[ "${TRAIN_NPROC_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TRAIN_NPROC_PER_NODE must be a positive integer" >&2
   exit 1
 fi
+if (( TRAIN_NPROC_PER_NODE < 2 )); then
+  echo "FSDP smoke test requires at least two visible GPUs" >&2
+  exit 1
+fi
+SMOKE_GLOBAL_BATCH_SIZE="${SMOKE_GLOBAL_BATCH_SIZE:-$((TRAIN_NPROC_PER_NODE > 4 ? TRAIN_NPROC_PER_NODE : 4))}"
 
 METHOD="${METHOD:-opd}"
 case "${METHOD}" in
@@ -18,7 +23,7 @@ case "${METHOD}" in
   *) echo "METHOD must be opd, ta, or rac" >&2; exit 1 ;;
 esac
 
-SMOKE_OUTPUT="${SMOKE_OUTPUT:-${REPO_DIR}/outputs/fsdp_smoke_${METHOD}_$(date +%Y%m%d_%H%M%S)}"
+SMOKE_OUTPUT="${SMOKE_OUTPUT:-${REPO_DIR}/outputs/fsdp_smoke_${METHOD}_${TRAIN_NPROC_PER_NODE}gpu_$(date +%Y%m%d_%H%M%S_%N)}"
 if [[ -e "${SMOKE_OUTPUT}" ]]; then
   echo "Refusing to overwrite smoke output: ${SMOKE_OUTPUT}" >&2
   exit 1
@@ -31,7 +36,7 @@ run_training_cli train \
   --set "experiment.output_dir=${SMOKE_OUTPUT}" \
   --set "distributed.strategy=fsdp" \
   --set "rollout.backend=vllm" \
-  --set "rollout.batch_size=4" \
+  --set "rollout.batch_size=${SMOKE_GLOBAL_BATCH_SIZE}" \
   --set "rollout.num_responses=1" \
   --set "data.max_prompt_tokens=128" \
   --set "rollout.max_new_tokens=64" \
@@ -54,7 +59,11 @@ run_training_cli train \
   --set "logging.token_score_stats_enabled=false" \
   --set "logging.tensorboard.enabled=true"
 
-"${PYTHON_BIN}" - "${SMOKE_OUTPUT}" "${METHOD}" <<'PY'
+"${PYTHON_BIN}" - \
+  "${SMOKE_OUTPUT}" \
+  "${METHOD}" \
+  "${TRAIN_NPROC_PER_NODE}" \
+  "${SMOKE_GLOBAL_BATCH_SIZE}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -63,13 +72,23 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 root = Path(sys.argv[1]).resolve()
 method = sys.argv[2]
+expected_world_size = int(sys.argv[3])
+expected_global_batch = int(sys.argv[4])
 rows = [json.loads(line) for line in (root / "metrics.jsonl").read_text().splitlines() if line]
 if [row["step"] for row in rows] != [1, 2]:
     raise SystemExit(f"Expected smoke steps [1, 2], got {[row['step'] for row in rows]}")
 last = rows[-1]
-if last["distributed_strategy"] != "fsdp" or last["distributed_world_size"] != 2:
-    raise SystemExit("Smoke run did not use two-rank FSDP")
-if last["global_prompt_batch_size"] != 4 or last["micro_batch_size_per_gpu"] != 1:
+if (
+    last["distributed_strategy"] != "fsdp"
+    or last["distributed_world_size"] != expected_world_size
+):
+    raise SystemExit(
+        f"Smoke run did not use {expected_world_size}-rank FSDP: {last}"
+    )
+if (
+    last["global_prompt_batch_size"] != expected_global_batch
+    or last["micro_batch_size_per_gpu"] != 1
+):
     raise SystemExit("Smoke batch layout is incorrect")
 if not last["vllm_logprob_sanity"].get("passed"):
     raise SystemExit(f"vLLM/HF log-prob validation failed: {last['vllm_logprob_sanity']}")
@@ -97,7 +116,7 @@ extra = {"ta/selected_token_fraction"} if method == "ta" else set()
 extra |= {"rac/effective_token_fraction"} if method == "rac" else set()
 if tags != base | extra:
     raise SystemExit(f"Unexpected TensorBoard tags: {sorted(tags)}")
-print(f"Validated two-GPU FSDP smoke output: {root}")
+print(f"Validated {expected_world_size}-GPU FSDP smoke output: {root}")
 PY
 
 RELOAD_CHECKPOINT="${SMOKE_OUTPUT}/final"
@@ -113,7 +132,7 @@ if [[ "${SMOKE_TEST_RESUME:-true}" == "true" ]]; then
     --set "experiment.output_dir=${RESUME_OUTPUT}" \
     --set "distributed.strategy=fsdp" \
     --set "rollout.backend=vllm" \
-    --set "rollout.batch_size=4" \
+    --set "rollout.batch_size=${SMOKE_GLOBAL_BATCH_SIZE}" \
     --set "rollout.num_responses=1" \
     --set "data.max_prompt_tokens=128" \
     --set "rollout.max_new_tokens=64" \
@@ -167,4 +186,4 @@ print("Reloaded the exported Hugging Face checkpoint successfully")
 PY
 fi
 
-echo "FSDP smoke test passed: ${SMOKE_OUTPUT}"
+echo "${TRAIN_NPROC_PER_NODE}-GPU FSDP smoke test passed: ${SMOKE_OUTPUT}"

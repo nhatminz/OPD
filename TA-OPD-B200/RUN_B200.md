@@ -22,8 +22,12 @@ python scripts/check_b200_env.py
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 ```
 
-`smoke_test_b200.sh` chạy unit tests và preflight, đọc full training/eval schema nhưng không train full.
-Báo cáo nằm ở `results/preflight.json`.
+`smoke_test_b200.sh` chạy unit tests ở chế độ không chiếm GPU rồi preflight model/data/GPU; nó
+không train full. Mỗi tổ hợp teacher/student/data tự nhận một fingerprint và báo cáo riêng dưới
+`results/preflight/asset-<fingerprint>-<N>gpu.json`, nên nhiều workload dùng chung project không
+ghi đè preflight của nhau. Hậu tố số GPU bảo đảm mỗi topology được kiểm tra đúng các GPU visible;
+file autotune cũng dùng cùng namespace vì batch layout phụ thuộc số rank. Đặt
+`SMOKE_RUN_GPU_UNIT_TESTS=true` chỉ khi chủ động muốn chạy thêm unit test CUDA.
 
 ### Chọn model pair và train dataset
 
@@ -48,20 +52,26 @@ export TRAIN_PROMPT_KEY=problem
 export TRAIN_PREFER_SOURCE_PROMPT=false
 ```
 
-Path model/data nhận cả absolute path và path tương đối dưới `STORAGE_ROOT`. Mỗi selection cần một
-preflight mới. Token-ID mapping giữa teacher/student phải hoàn toàn giống nhau; chỉ
+Path model/data nhận cả absolute path và path tương đối dưới `STORAGE_ROOT`. Selection mới tự dùng
+preflight filename mới; không cần đặt `PREFLIGHT_REPORT` thủ công. Token-ID mapping giữa
+teacher/student phải hoàn toàn giống nhau; chỉ
 `special_tokens_map` được phép khác. Student tokenizer render prompt với `enable_thinking=false`,
 và cùng tensor integer IDs được đưa thẳng vào teacher scoring, không có teacher re-tokenization.
 
-Chạy smoke FSDP thật hai step trên hai GPU trước full run (đổi `METHOD` để kiểm tra từng method):
+Chạy smoke FSDP thật hai step trên mọi GPU đang visible trước full run (đổi `METHOD` để kiểm tra
+từng method):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 METHOD=opd bash scripts/smoke_test_fsdp_2gpu.sh
-CUDA_VISIBLE_DEVICES=0,1 METHOD=ta  bash scripts/smoke_test_fsdp_2gpu.sh
-CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_2gpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=opd bash scripts/smoke_test_fsdp_multigpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=ta  bash scripts/smoke_test_fsdp_multigpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_multigpu.sh
+
+# Bốn rank FSDP:
+CUDA_VISIBLE_DEVICES=0,1,2,3 METHOD=opd bash scripts/smoke_test_fsdp_multigpu.sh
 ```
 
-Có thể chỉ inspect schema/path qua preflight CLI:
+Có thể chỉ inspect schema/path qua preflight CLI, nhưng cách này chủ động chọn output và không dùng
+cơ chế filename tự động của shell launcher:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m b200_experiment.cli preflight \

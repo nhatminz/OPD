@@ -9,6 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+from transformers.modeling_outputs import CausalLMOutput
 
 from b200_experiment.distributed import DistributedContext
 from b200_experiment.fsdp import (
@@ -50,7 +51,11 @@ class _TinyQwen3LM(nn.Module):
         hidden = self.embedding(input_ids)
         for layer in self.layers:
             hidden = layer(hidden)
-        return type("Output", (), {"logits": self.lm_head(hidden)})()
+        # Match the tensor-container output used by real Hugging Face causal
+        # LMs. FSDP traverses this ModelOutput to register its pre-backward
+        # hook; an arbitrary Python object hides the logits tensor from FSDP
+        # and leaves the root state IDLE during backward.
+        return CausalLMOutput(logits=self.lm_head(hidden))
 
 
 def _config() -> dict:

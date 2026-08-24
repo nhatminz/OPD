@@ -3,7 +3,16 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 cd "${REPO_DIR}"
-"${PYTHON_BIN}" -m unittest discover -s tests -v
+case "${SMOKE_RUN_GPU_UNIT_TESTS:-false}" in
+  true|TRUE|1|yes|YES)
+    "${PYTHON_BIN}" -m unittest discover -s tests -v
+    ;;
+  *)
+    # Generic preflight must not reserve/spawn extra GPUs from a live workload.
+    # The explicit smoke_test_fsdp_multigpu.sh performs the real distributed test.
+    CUDA_VISIBLE_DEVICES="" "${PYTHON_BIN}" -m unittest discover -s tests -v
+    ;;
+esac
 "${PYTHON_BIN}" -m b200_experiment.cli preflight \
   --config "${BASE_CONFIG}" \
   "${ASSET_CONFIG_ARGS[@]}" \
@@ -14,7 +23,7 @@ if batch_autotune_enabled; then
     --opd-config "${OPD_CONFIG}"
     --ta-config "${TA_CONFIG}"
     --rac-config "${RAC_CONFIG}"
-    --output "${REPO_DIR}/outputs/autotune"
+    --output "${AUTOTUNE_OUTPUT_ROOT}"
     --generated-config "${AUTOTUNE_CONFIG}"
     "${ASSET_CONFIG_ARGS[@]}"
   )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,13 @@ def run_preflight(config: dict[str, Any], output: str | Path) -> dict[str, Any]:
     }
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        # Atomic on the shared filesystem when source/destination share a dir.
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
     return report

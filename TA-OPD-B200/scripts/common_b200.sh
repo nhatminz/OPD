@@ -64,8 +64,6 @@ BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"
 OPD_CONFIG="${REPO_DIR}/configs/qwen3_b200_opd.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
-AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/qwen3_b200_autotuned.yaml}"
-PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight.json}"
 
 storage_asset_path() {
   if [[ "$1" == /* ]]; then
@@ -78,6 +76,43 @@ storage_asset_path() {
 TEACHER_MODEL_ABS="$(storage_asset_path "${TEACHER_MODEL_PATH}")"
 STUDENT_MODEL_ABS="$(storage_asset_path "${STUDENT_MODEL_PATH}")"
 TRAIN_DATA_ABS="$(storage_asset_path "${TRAIN_DATA_PATH}")"
+
+# Every model/data protocol gets an independent validation namespace.
+ASSET_FINGERPRINT="$(
+  "${PYTHON_BIN}" - \
+    "${TEACHER_MODEL_ABS}" \
+    "${STUDENT_MODEL_ABS}" \
+    "${TRAIN_DATA_ABS}" \
+    "${TRAIN_DATA_SPLIT}" \
+    "${TRAIN_PROMPT_KEY}" \
+    "${TRAIN_PREFER_SOURCE_PROMPT}" <<'PY'
+import hashlib
+import json
+import sys
+
+payload = json.dumps(sys.argv[1:], ensure_ascii=False, separators=(",", ":"))
+print(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20])
+PY
+)"
+
+# Preflight checks every visible GPU, while autotuning is also topology-
+# dependent. Keep both outputs separate per requested worker count so a
+# one-GPU and a four-GPU workload cannot consume or overwrite each other's
+# validation state.
+_B200_VISIBLE_DEVICES=()
+IFS=',' read -r -a _B200_VISIBLE_DEVICES <<< "${CUDA_VISIBLE_DEVICES:-0}"
+VALIDATION_WORLD_SIZE="${TRAIN_NPROC_PER_NODE:-${#_B200_VISIBLE_DEVICES[@]}}"
+if ! [[ "${VALIDATION_WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TRAIN_NPROC_PER_NODE must be a positive integer, got ${VALIDATION_WORLD_SIZE}" >&2
+  return 2 2>/dev/null || exit 2
+fi
+if (( VALIDATION_WORLD_SIZE > ${#_B200_VISIBLE_DEVICES[@]} )); then
+  echo "Requested ${VALIDATION_WORLD_SIZE} workers but only ${#_B200_VISIBLE_DEVICES[@]} GPUs are visible" >&2
+  return 2 2>/dev/null || exit 2
+fi
+PREFLIGHT_REPORT="${PREFLIGHT_REPORT:-${REPO_DIR}/results/preflight/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu.json}"
+AUTOTUNE_CONFIG="${AUTOTUNE_CONFIG:-${REPO_DIR}/configs/autotuned/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu.yaml}"
+AUTOTUNE_OUTPUT_ROOT="${AUTOTUNE_OUTPUT_ROOT:-${REPO_DIR}/outputs/autotune/asset-${ASSET_FINGERPRINT}-${VALIDATION_WORLD_SIZE}gpu}"
 
 ASSET_CONFIG_ARGS=(
   --set "models.teacher_path=${TEACHER_MODEL_PATH}"
@@ -95,6 +130,10 @@ print_asset_selection() {
   echo "Student model/tokenizer: ${STUDENT_MODEL_ABS}"
   echo "Training dataset: preset=${TRAIN_DATASET}, path=${TRAIN_DATA_ABS}, split=${TRAIN_DATA_SPLIT}, prompt_key=${TRAIN_PROMPT_KEY}"
   echo "Teacher protocol: no-think, shared student token IDs, no teacher re-tokenization"
+  echo "Asset fingerprint: ${ASSET_FINGERPRINT}"
+  echo "Preflight report: ${PREFLIGHT_REPORT}"
+  echo "Validation topology: ${VALIDATION_WORLD_SIZE} GPU(s)"
+  echo "Autotune config: ${AUTOTUNE_CONFIG}"
 }
 
 resolve_run_paths() {

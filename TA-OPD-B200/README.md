@@ -228,8 +228,12 @@ ruff check b200_experiment tests
 bash -n scripts/*.sh
 ```
 
-`scripts/smoke_test_b200.sh` chạy unit tests rồi preflight model/data/GPU; nó không tự bắt đầu full
-training trừ khi chủ động bật batch autotune. Khi autotune được bật, step đầu của OPD/TA/RAC còn
+`scripts/smoke_test_b200.sh` chạy CPU-only unit tests rồi preflight model/data/GPU; nó không tự bắt đầu full
+training trừ khi chủ động bật batch autotune. Mỗi tổ hợp teacher/student/data và số GPU có report riêng tại
+`results/preflight/asset-<fingerprint>-<N>gpu.json`; autotune cũng tách theo số GPU tại
+`configs/autotuned/asset-<fingerprint>-<N>gpu.yaml`. Vì vậy các workload dùng chung checkout không
+đọc hoặc ghi đè validation của cấu hình khác. Khi autotune được bật, step đầu của OPD/TA/RAC còn
 phải có cùng rollout hash và đúng allocation policy trước khi batch candidate được chấp nhận.
-`scripts/smoke_test_fsdp_2gpu.sh` là smoke thật hai step trên hai GPU, bao gồm lần sync weight thứ
-hai, vLLM/HF log-prob check, checkpoint reload và kiểm tra chính xác TensorBoard tags.
+`scripts/smoke_test_fsdp_multigpu.sh` là smoke thật hai step trên mọi GPU đang visible (tối thiểu
+hai GPU), bao gồm lần sync weight thứ hai, vLLM/HF log-prob check, checkpoint reload và kiểm tra
+chính xác TensorBoard tags. Tên cũ `smoke_test_fsdp_2gpu.sh` vẫn tương thích.

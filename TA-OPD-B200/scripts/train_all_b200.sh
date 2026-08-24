@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S_%N)"
 export OPD_RUN_NAME="${OPD_RUN_NAME:-opd_${RUN_TIMESTAMP}}"
 export TA_RUN_NAME="${TA_RUN_NAME:-ta_${RUN_TIMESTAMP}}"
 export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_${RUN_TIMESTAMP}}"

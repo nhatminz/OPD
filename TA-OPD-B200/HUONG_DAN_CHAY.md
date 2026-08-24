@@ -12,7 +12,7 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 python scripts/check_b200_env.py
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
-CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_2gpu.sh
+CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_multigpu.sh
 ```
 
 Hãy đặt các biến dưới đây trước khi chạy các lệnh kiểm tra phía trên. Model và train dataset có thể
@@ -34,8 +34,15 @@ export TRAIN_DATASET=dapo_math
 Preset DAPO tự đặt path `nlp/minhpn19/data/DAPO-Math-17k-Processed`, split `all`, prompt key
 `prompt`; preset Competition-MATH tự đặt file train, split `null`, prompt key `problem`. Dataset
 khác dùng `TRAIN_DATASET=custom TRAIN_DATA_PATH=... TRAIN_DATA_SPLIT=... TRAIN_PROMPT_KEY=...`.
-Có thể sửa các default tập trung trong `scripts/common_b200.sh`. Sau mỗi lần đổi model/data phải chạy
-lại `smoke_test_b200.sh`; launcher từ chối dùng preflight của cặp cũ.
+Có thể sửa các default tập trung trong `scripts/common_b200.sh`. Mỗi model/data selection và số
+GPU tự có `results/preflight/asset-<fingerprint>-<N>gpu.json`; chỉ cần chạy
+`smoke_test_b200.sh` lần đầu cho selection/topology mới. Các workload 1/2/4 GPU không ghi đè report
+của nhau; autotune cũng được lưu riêng theo cả fingerprint và số GPU. `smoke_test_b200.sh` ẩn GPU
+trong lúc chạy unit tests để không tự spawn thêm rank; smoke FSDP thật chạy riêng bằng:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 METHOD=opd bash scripts/smoke_test_fsdp_multigpu.sh
+```
 
 Student tokenizer là tokenizer duy nhất. Teacher nhận trực tiếp cùng prompt/trajectory token IDs,
 không decode rồi tokenize lại. `special_tokens_map` được phép khác, nhưng `get_vocab()`, added vocab,
