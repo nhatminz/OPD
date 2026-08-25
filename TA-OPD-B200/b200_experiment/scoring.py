@@ -139,6 +139,7 @@ class BaseScores:
     log_normalizers: torch.Tensor
     scaled_log_normalizers: torch.Tensor
     sampled_log_probs: torch.Tensor
+    entropies: torch.Tensor
     top_k_ids: torch.Tensor | None = None
     top_k_log_probs: torch.Tensor | None = None
     candidate_log_probs: torch.Tensor | None = None
@@ -176,6 +177,7 @@ def _reduce_response_logits(
 ) -> BaseScores:
     """Reduce one compact response-logit micro-batch to the tensors consumers use."""
     normalizer_chunks, scaled_normalizer_chunks, sampled_chunks = [], [], []
+    entropy_chunks = []
     top_id_chunks, top_log_prob_chunks, candidate_log_prob_chunks = [], [], []
     width = response_logits.shape[1]
     chunk_steps = max(1, int(score_chunk_steps))
@@ -199,6 +201,10 @@ def _reduce_response_logits(
         normalizer_chunks.append(normalizers)
         scaled_normalizer_chunks.append(scaled_normalizers)
         sampled_chunks.append(sampled)
+        probabilities = torch.softmax(chunk, dim=-1)
+        entropy_chunks.append(
+            scaled_normalizers - probabilities.mul_(chunk).sum(dim=-1)
+        )
         if top_k > 0:
             k = min(int(top_k), chunk.shape[-1])
             top_values, top_ids = torch.topk(chunk, k=k, dim=-1)
@@ -216,6 +222,7 @@ def _reduce_response_logits(
         log_normalizers=torch.cat(normalizer_chunks, dim=1),
         scaled_log_normalizers=torch.cat(scaled_normalizer_chunks, dim=1),
         sampled_log_probs=torch.cat(sampled_chunks, dim=1),
+        entropies=torch.cat(entropy_chunks, dim=1),
         top_k_ids=(torch.cat(top_id_chunks, dim=1) if top_id_chunks else None),
         top_k_log_probs=(
             torch.cat(top_log_prob_chunks, dim=1) if top_log_prob_chunks else None
@@ -291,6 +298,7 @@ def score_original_rollout(
     if length_bucketed and not keep_cache and score_micro_batch > 1:
         order = torch.argsort(response_lengths, descending=True, stable=True)
     normalizer_batches, scaled_normalizer_batches, sampled_batches = [], [], []
+    entropy_batches = []
     top_id_batches, top_log_prob_batches, candidate_log_prob_batches = [], [], []
     response_logit_batches = []
     cache = None
@@ -352,6 +360,7 @@ def score_original_rollout(
         sampled_batches.append(
             _pad_response_time(local_scores.sampled_log_probs, width)
         )
+        entropy_batches.append(_pad_response_time(local_scores.entropies, width))
         if local_scores.top_k_ids is not None:
             top_id_batches.append(_pad_response_time(local_scores.top_k_ids, width))
             top_log_prob_batches.append(
@@ -382,6 +391,7 @@ def score_original_rollout(
         log_normalizers=restored(normalizer_batches),
         scaled_log_normalizers=restored(scaled_normalizer_batches),
         sampled_log_probs=restored(sampled_batches),
+        entropies=restored(entropy_batches),
         top_k_ids=restored(top_id_batches),
         top_k_log_probs=restored(top_log_prob_batches),
         candidate_log_probs=restored(candidate_log_prob_batches),
@@ -440,6 +450,7 @@ def score_student_teacher_rollout(
         "log_normalizers",
         "scaled_log_normalizers",
         "sampled_log_probs",
+        "entropies",
         "top_k_ids",
         "top_k_log_probs",
         "candidate_log_probs",
@@ -544,6 +555,7 @@ def score_student_teacher_rollout(
             log_normalizers=restored("log_normalizers"),
             scaled_log_normalizers=restored("scaled_log_normalizers"),
             sampled_log_probs=restored("sampled_log_probs"),
+            entropies=restored("entropies"),
             top_k_ids=restored("top_k_ids"),
             top_k_log_probs=restored("top_k_log_probs"),
             candidate_log_probs=restored("candidate_log_probs"),

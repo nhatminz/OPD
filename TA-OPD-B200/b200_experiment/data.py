@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 
+from .math_prompts import math_messages
+
 
 def _plain(value: Any) -> Any:
     if hasattr(value, "tolist"):
@@ -88,17 +90,51 @@ def record_messages(
     prefer_source_prompt: bool = False,
 ):
     if prefer_source_prompt and record.get("source_prompt"):
-        messages = _plain(record["source_prompt"])
-        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
-            return messages
-    prompt = record.get(prompt_key)
-    if isinstance(prompt, list):
-        return prompt
-    if not isinstance(prompt, str):
-        raise TypeError(
-            f"Expected string/list in column {prompt_key!r}, got {type(prompt).__name__}"
-        )
-    return [{"role": "user", "content": prompt}]
+        prompt = _plain(record["source_prompt"])
+    else:
+        if prompt_key not in record:
+            available = ", ".join(sorted(map(str, record))) or "<none>"
+            raise KeyError(
+                f"Configured prompt field {prompt_key!r} is missing; "
+                f"available fields: {available}"
+            )
+        prompt = _plain(record[prompt_key])
+    try:
+        return math_messages(prompt)
+    except (TypeError, ValueError) as error:
+        available = ", ".join(sorted(map(str, record))) or "<none>"
+        raise type(error)(
+            f"Invalid configured prompt field {prompt_key!r}; available fields: "
+            f"{available}. {error}"
+        ) from error
+
+
+def render_record_prompt(record, tokenizer, data_config: dict[str, Any]) -> str:
+    return tokenizer.apply_chat_template(
+        record_messages(
+            record,
+            prompt_key=data_config.get("prompt_key", "prompt"),
+            prefer_source_prompt=bool(data_config.get("prefer_source_prompt", False)),
+        ),
+        tokenize=False,
+        add_generation_prompt=True,
+        **dict(data_config.get("chat_template_kwargs", {})),
+    )
+
+
+def validate_prompt_records(records, data_config: dict[str, Any]) -> None:
+    """Fail before model/vLLM startup if any row cannot form a math prompt."""
+    for row_index, record in enumerate(records):
+        try:
+            record_messages(
+                record,
+                prompt_key=data_config.get("prompt_key", "prompt"),
+                prefer_source_prompt=bool(
+                    data_config.get("prefer_source_prompt", False)
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise type(error)(f"Training row {row_index}: {error}") from error
 
 
 def stable_sample_id(record: dict[str, Any], dataset_index: int) -> str:
@@ -116,22 +152,7 @@ def stable_sample_id(record: dict[str, Any], dataset_index: int) -> str:
 def tokenize_prompts(
     records, tokenizer, data_config: dict[str, Any], device: torch.device
 ):
-    template_kwargs = dict(data_config.get("chat_template_kwargs", {}))
-    prompts = [
-        tokenizer.apply_chat_template(
-            record_messages(
-                record,
-                prompt_key=data_config.get("prompt_key", "prompt"),
-                prefer_source_prompt=bool(
-                    data_config.get("prefer_source_prompt", False)
-                ),
-            ),
-            tokenize=False,
-            add_generation_prompt=True,
-            **template_kwargs,
-        )
-        for record in records
-    ]
+    prompts = [render_record_prompt(record, tokenizer, data_config) for record in records]
     previous_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
     encoded = tokenizer(

@@ -15,13 +15,29 @@ from b200_experiment.data import (
     expand_prompt_batch,
     read_records,
     record_messages,
+    render_record_prompt,
     stable_sample_id,
+    validate_prompt_records,
 )
 from b200_experiment.evaluation import (
     BENCHMARK_ORDER,
     aggregate_evaluations,
     load_benchmark,
 )
+from b200_experiment.math_prompts import (
+    MATH_USER_INSTRUCTION,
+    build_math_user_prompt,
+    render_math_prompt,
+)
+
+
+class _TemplateTokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        return (
+            f"thinking={kwargs.get('enable_thinking')}|"
+            f"generation={kwargs['add_generation_prompt']}|"
+            f"{messages[0]['role']}:{messages[0]['content']}"
+        )
 
 
 class DataEvaluationConfigTests(unittest.TestCase):
@@ -114,9 +130,69 @@ class DataEvaluationConfigTests(unittest.TestCase):
             self.assertEqual(files, [path.resolve()])
             self.assertEqual(
                 record_messages(records[0], prompt_key="problem"),
-                [{"role": "user", "content": "Find $1+1$."}],
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Find $1+1$. "
+                            "Let's think step by step and output the final answer "
+                            "within \\boxed{}."
+                        ),
+                    }
+                ],
             )
             self.assertEqual(stable_sample_id(records[0], 0), "train/prealgebra/1")
+
+    def test_train_and_eval_share_one_idempotent_canonical_math_prompt(self):
+        problem = "Find $3+4$."
+        record = {"problem": problem}
+        data_config = {
+            "prompt_key": "problem",
+            "prefer_source_prompt": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        tokenizer = _TemplateTokenizer()
+
+        train_user_prompt = record_messages(record, prompt_key="problem")[0][
+            "content"
+        ]
+        eval_user_prompt = build_math_user_prompt(problem)
+        rendered_train_prompt = render_record_prompt(record, tokenizer, data_config)
+        rendered_eval_prompt = render_math_prompt(tokenizer, problem, data_config)
+
+        self.assertEqual(train_user_prompt, eval_user_prompt)
+        self.assertEqual(rendered_train_prompt, rendered_eval_prompt)
+        self.assertEqual(train_user_prompt.count(MATH_USER_INSTRUCTION), 1)
+        self.assertEqual(
+            build_math_user_prompt(train_user_prompt), train_user_prompt
+        )
+
+    def test_preformatted_dataset_prompt_does_not_duplicate_instruction(self):
+        formatted = build_math_user_prompt("What is $5+5$?")
+        messages = record_messages(
+            {"prompt": [{"role": "user", "content": formatted}]},
+            prompt_key="prompt",
+        )
+
+        self.assertEqual(messages[0]["content"], formatted)
+        self.assertEqual(messages[0]["content"].count(MATH_USER_INSTRUCTION), 1)
+
+    def test_missing_prompt_field_reports_available_columns(self):
+        with self.assertRaisesRegex(
+            KeyError, "prompt.*available fields: answer, problem"
+        ):
+            record_messages(
+                {"problem": "1+1?", "answer": "2"}, prompt_key="prompt"
+            )
+
+    def test_dataset_prompt_schema_validation_reports_row_before_training(self):
+        with self.assertRaisesRegex(
+            KeyError, "Training row 1:.*available fields: answer"
+        ):
+            validate_prompt_records(
+                [{"problem": "1+1?"}, {"answer": "2"}],
+                {"prompt_key": "problem", "prefer_source_prompt": False},
+            )
 
     def test_competition_math_eval_uses_answer_not_worked_solution(self):
         with tempfile.TemporaryDirectory() as temporary:

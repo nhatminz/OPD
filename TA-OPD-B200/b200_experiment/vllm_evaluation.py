@@ -19,6 +19,7 @@ from .evaluation import (
     evaluation_metric_name,
     load_benchmark,
 )
+from .math_prompts import render_math_prompt
 
 
 def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
@@ -45,21 +46,7 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
 
 
 def _prompt(tokenizer, problem: str, config: dict[str, Any]) -> str:
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                "Solve the problem step by step. End with only the final answer "
-                "inside \\boxed{}.\n\n" + problem
-            ),
-        }
-    ]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        **dict(config["data"].get("chat_template_kwargs", {})),
-    )
+    return render_math_prompt(tokenizer, problem, config["data"])
 
 
 def evaluate_vllm_suite(
@@ -107,6 +94,9 @@ def evaluate_vllm_suite(
             rendered_prompt = _prompt(tokenizer, row["problem"], config)
             prompts.append(rendered_prompt)
             prompt_rows.append((benchmark, row, rendered_prompt))
+
+    if prompts:
+        tqdm.write(f"Fully rendered EVAL prompt:\n{prompts[0]}")
 
     vllm_settings = dict(runtime_settings.get("vllm", {}))
     engine_kwargs: dict[str, Any] = {

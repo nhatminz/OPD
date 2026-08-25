@@ -13,6 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import logging as transformers_logging
 
 from .models import choose_attention_implementation, model_dtype_kwargs
+from .math_prompts import render_math_prompt
 
 transformers_logging.disable_progress_bar()
 
@@ -391,6 +392,7 @@ def evaluate_loaded_suite(
         mininterval=0.5,
     )
     try:
+        logged_eval_prompt = False
         for benchmark in benchmark_names:
             records, schema = loaded[benchmark]
             correct_generations = graded_generations = problems = 0
@@ -405,30 +407,13 @@ def evaluate_loaded_suite(
                         f"{correct_generations / max(graded_generations, 1):.3f}"
                     )
                     batch = records[begin : begin + batch_size]
-                    messages = [
-                        [
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Solve the problem step by step. End with only the final answer inside \\boxed{}.\n\n"
-                                    + row["problem"]
-                                ),
-                            }
-                        ]
+                    prompts = [
+                        render_math_prompt(tokenizer, row["problem"], config["data"])
                         for row in batch
                     ]
-                    template_kwargs = dict(
-                        config["data"].get("chat_template_kwargs", {})
-                    )
-                    prompts = [
-                        tokenizer.apply_chat_template(
-                            item,
-                            tokenize=False,
-                            add_generation_prompt=True,
-                            **template_kwargs,
-                        )
-                        for item in messages
-                    ]
+                    if prompts and not logged_eval_prompt:
+                        tqdm.write(f"Fully rendered EVAL prompt:\n{prompts[0]}")
+                        logged_eval_prompt = True
                     encoded = tokenizer(
                         prompts,
                         padding=True,

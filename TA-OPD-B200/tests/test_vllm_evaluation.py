@@ -99,7 +99,7 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(detailed["benchmark"], "MATH-500")
             self.assertEqual(
                 detailed["rendered_prompt"],
-                "Solve the problem step by step. End with only the final answer inside \\boxed{}.\n\n1?",
+                "1? Let's think step by step and output the final answer within \\boxed{}.",
             )
             self.assertEqual(detailed["samples_per_problem"], 1)
             self.assertEqual(detailed["outputs"][0]["response"], "1")

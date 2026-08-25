@@ -29,8 +29,16 @@ from b200_experiment.trainer import (
     _local_mask_from_global_budget,
     _opd_train_step,
 )
-from b200_experiment.opd_core import topk_reference_from_logits, weighted_token_sums
-from b200_experiment.scoring import RolloutBatch
+from b200_experiment.opd_core import (
+    build_topk_opd_reference,
+    topk_reference_from_logits,
+    weighted_token_sums,
+)
+from b200_experiment.scoring import (
+    RolloutBatch,
+    position_ids_from_mask,
+    score_original_rollout,
+)
 
 
 class _TinyCausalLM(nn.Module):
@@ -40,10 +48,20 @@ class _TinyCausalLM(nn.Module):
         self.output = nn.Linear(5, 11, bias=False)
         self.config = type("Config", (), {"use_cache": False})()
         self.forward_calls = 0
+        self.position_id_calls = []
 
-    def forward(self, input_ids, attention_mask, use_cache, return_dict):
-        del attention_mask, use_cache, return_dict
+    def forward(
+        self, input_ids, attention_mask, position_ids=None, use_cache=False, return_dict=True
+    ):
+        del use_cache, return_dict
         self.forward_calls += 1
+        self.position_id_calls.append(
+            None if position_ids is None else position_ids.detach().clone()
+        )
+        if position_ids is not None and not torch.equal(
+            position_ids, position_ids_from_mask(attention_mask)
+        ):
+            raise AssertionError("Forward received inconsistent position_ids")
         logits = self.output(self.embedding(input_ids))
         return type("Output", (), {"logits": logits})()
 
@@ -305,6 +323,50 @@ class DistributedInvariantTests(unittest.TestCase):
             DistributedContext(0, 0, 1, torch.device("cpu")),
         )
         self.assertEqual(model.forward_calls, 4)
+
+    def test_scoring_and_training_forward_share_left_padding_position_ids(self):
+        model = _TinyCausalLM()
+        rollout = RolloutBatch(
+            input_ids=torch.tensor([[0, 1, 2, 3, 4]]),
+            attention_mask=torch.tensor([[0, 1, 1, 1, 1]]),
+            response_ids=torch.tensor([[3, 4]]),
+            valid_mask=torch.ones((1, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((1, 2)),
+            prompt_width=3,
+        )
+        scores = score_original_rollout(
+            model,
+            rollout,
+            retain_response_logits=False,
+            top_k=5,
+            trim_padding=True,
+        )
+        scoring_position_ids = model.position_id_calls[-1]
+        # Use the exact scoring support so this verifies the actual
+        # differentiable _opd_train_step forward, not only the helper.
+        reference = build_topk_opd_reference(
+            scores.top_k_ids,
+            scores.top_k_log_probs,
+            scores.top_k_log_probs,
+            rollout.valid_mask,
+        )
+        model.position_id_calls.clear()
+        _opd_train_step(
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.01),
+            rollout,
+            rollout.valid_mask,
+            reference,
+            _tiny_config(1),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+        )
+        training_position_ids = model.position_id_calls[-1]
+
+        self.assertTrue(torch.equal(scoring_position_ids, training_position_ids))
+        self.assertTrue(
+            torch.equal(training_position_ids, torch.tensor([[0, 0, 1, 2]]))
+        )
 
     def test_gradient_accumulation_does_not_change_the_objective(self):
         torch.manual_seed(7)

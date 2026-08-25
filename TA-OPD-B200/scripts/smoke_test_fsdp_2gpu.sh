@@ -69,6 +69,7 @@ import sys
 from pathlib import Path
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from b200_experiment.tensorboard_logging import BASE_TAGS, RAC_TAGS, TA_TAGS
 
 root = Path(sys.argv[1]).resolve()
 method = sys.argv[2]
@@ -104,16 +105,17 @@ if not events:
 accumulator = EventAccumulator(str(root / "tensorboard"))
 accumulator.Reload()
 tags = set(accumulator.Tags().get("scalars", []))
-base = {
-    "train/loss", "train/grad_norm", "train/learning_rate",
-    "opd/advantage_abs_mean", "opd/teacher_student_logprob_gap",
-    "opd/clip_fraction", "rollout/response_length_mean",
-    "rollout/eos_fraction", "system/step_time", "system/rollout_time",
-    "system/tokens_per_second", "system/peak_vram_gb",
-    "debug/vllm_hf_logprob_mae",
-}
-extra = {"ta/selected_token_fraction"} if method == "ta" else set()
-extra |= {"rac/effective_token_fraction"} if method == "rac" else set()
+base = set(BASE_TAGS) | {"debug/vllm_hf_logprob_mae"}
+extra = (
+    set(TA_TAGS) | {"ta/selected_token_fraction"}
+    if method == "ta"
+    else set()
+)
+extra |= (
+    set(RAC_TAGS) | {"rac/effective_token_fraction"}
+    if method == "rac"
+    else set()
+)
 if tags != base | extra:
     raise SystemExit(f"Unexpected TensorBoard tags: {sorted(tags)}")
 print(f"Validated {expected_world_size}-GPU FSDP smoke output: {root}")

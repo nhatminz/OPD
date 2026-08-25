@@ -52,12 +52,18 @@ def tensor_summary(
     finite = values.detach().float()
     finite = finite[torch.isfinite(finite)]
     if finite.numel() == 0:
-        return {"mean": float("nan"), "min": float("nan"), "max": float("nan")}
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+        }
     quantiles = torch.quantile(
         finite, torch.tensor([0.05, 0.25, 0.50, 0.75, 0.95], device=finite.device)
     )
     return {
         "mean": float(finite.mean()),
+        "std": float(finite.std(unbiased=False)),
         "min": float(finite.min()),
         "max": float(finite.max()),
         **{

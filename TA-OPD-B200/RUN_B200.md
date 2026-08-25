@@ -19,11 +19,13 @@ requirements còn lại theo chính sách cluster.
 ```bash
 export STORAGE_ROOT=/workspace/storage-shared
 python scripts/check_b200_env.py
+# Optional diagnostic only:
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 ```
 
-`smoke_test_b200.sh` chạy unit tests ở chế độ không chiếm GPU rồi preflight model/data/GPU; nó
-không train full. Mỗi tổ hợp teacher/student/data tự nhận một fingerprint và báo cáo riêng dưới
+`smoke_test_b200.sh` chạy unit tests ở chế độ không chiếm GPU rồi preflight model/data/GPU; nó là
+diagnostic tùy chọn, không còn là điều kiện để launcher train khởi động. Mỗi tổ hợp
+teacher/student/data tự nhận một fingerprint và báo cáo riêng dưới
 `results/preflight/asset-<fingerprint>-<N>gpu.json`, nên nhiều workload dùng chung project không
 ghi đè preflight của nhau. Hậu tố số GPU bảo đảm mỗi topology được kiểm tra đúng các GPU visible;
 file autotune cũng dùng cùng namespace vì batch layout phụ thuộc số rank. Đặt
@@ -31,13 +33,13 @@ file autotune cũng dùng cùng namespace vì batch layout phụ thuộc số ra
 
 ### Chọn model pair và train dataset
 
-Hãy chọn asset trước khi chạy preflight. Ba launcher đọc chung block đầu `scripts/common_b200.sh`.
-Có thể override tại command line mà không sửa YAML:
+Ba launcher có block `USER CONFIG` riêng ở đầu file. Có thể override tại command line mà không sửa YAML:
 
 ```bash
-export TEACHER_MODEL_PATH=models/Qwen3-8B
-export STUDENT_MODEL_PATH=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
-export TRAIN_DATASET=competition_math  # hoặc dapo_math
+export TEACHER_MODEL=models/Qwen3-8B
+export STUDENT_MODEL=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+export TRAIN_DATA=nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+export PROMPT_KEY=problem
 ```
 
 `competition_math` tương ứng file train Competition-MATH, `split=null`, `prompt_key=problem`;
@@ -204,10 +206,11 @@ tensorboard --logdir_spec \
   --bind_all --port 6006
 ```
 
-Production event chỉ có loss/grad norm/LR, ba OPD diagnostic, response length/EOS, bốn system
-metric; TA thêm selected-token fraction, RAC thêm normalized effective-token fraction. Debug
-vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được reduce
-toàn cục trước khi rank 0 ghi.
+Production event giữ metric cũ và thêm Top-K loss/entropy/mass/overlap/KL, PPO ratio/clip/
+advantage, response length min/mean/max/clip/throughput, VRAM allocated/reserved và step time.
+TA thêm D/C/teachability/selected fraction; RAC thêm local teachability/alignment/V/weight stats.
+Debug vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được
+reduce toàn cục trước khi rank 0 ghi.
 
 Full avg@16 trên 1.060 problem bắt buộc sinh 16.960 response cho mỗi checkpoint khác nhau; không thể
 giảm con số này mà vẫn giữ nguyên metric. Nếu ưu tiên thời gian train không bị chặn bởi eval, có thể

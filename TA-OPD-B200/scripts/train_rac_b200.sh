@@ -2,9 +2,31 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ================== RAC PARAMETERS: EDIT HERE ===================
+# ================= USER CONFIG: RAC =============================
 # A fresh invocation gets a local-time run name automatically. You can still
 # pass RUN_NAME=... explicitly, especially when resuming an existing run.
+export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
+export TEACHER_MODEL="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-models/Qwen3-8B}}"
+case "${TRAIN_DATASET:-competition_math}" in
+  dapo_math|dapo-math|dapo)
+    _DEFAULT_TRAIN_DATA="nlp/minhpn19/data/DAPO-Math-17k-Processed"
+    _DEFAULT_PROMPT_KEY="prompt"
+    _DEFAULT_TRAIN_SPLIT="all"
+    ;;
+  *)
+    _DEFAULT_TRAIN_DATA="nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet"
+    _DEFAULT_PROMPT_KEY="problem"
+    _DEFAULT_TRAIN_SPLIT="null"
+    ;;
+esac
+export TRAIN_DATA="${TRAIN_DATA:-${TRAIN_DATA_PATH:-${_DEFAULT_TRAIN_DATA}}}"
+export PROMPT_KEY="${PROMPT_KEY:-${TRAIN_PROMPT_KEY:-${_DEFAULT_PROMPT_KEY}}}"
+export TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-${_DEFAULT_TRAIN_SPLIT}}"
+export STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-${STUDENT_MODEL}}"
+export TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${TEACHER_MODEL}}"
+export TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${TRAIN_DATA}}"
+export TRAIN_PROMPT_KEY="${TRAIN_PROMPT_KEY:-${PROMPT_KEY}}"
+
 export RUN_NAME="${RUN_NAME:-rac_$(date +%Y%m%d_%H%M%S_%N)}"
 export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -28,7 +50,6 @@ export LENGTH_BUCKETED_MICRO_BATCHES="${LENGTH_BUCKETED_MICRO_BATCHES:-true}"
 export JOINT_CROSS_SCORING="${JOINT_CROSS_SCORING:-true}"
 export SCORE_CHUNK_STEPS="${SCORE_CHUNK_STEPS:-128}"
 export TA_VOCAB_CHUNK_TOKENS="${TA_VOCAB_CHUNK_TOKENS:-2048}"
-export TA_RHO="${TA_RHO:-${RHO:-0.10}}"           # TA comparison config parity
 export RAC_GAMMA="${RAC_GAMMA:-0.995}"
 export RAC_W_MIN="${RAC_W_MIN:-0.10}"
 export RAC_BETA="${RAC_BETA:-2.0}"
@@ -65,7 +86,6 @@ export RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-${RESUME:-}}"
 source "${SCRIPT_DIR}/common_b200.sh"
 
 print_asset_selection
-require_b200_validation
 resolve_run_paths
 if [[ -n "${RESUME_FROM_CHECKPOINT}" && "${RESUME_FROM_CHECKPOINT}" != "auto" && -z "${OUTPUT_DIR:-}" ]]; then
   OUTPUT_DIR="$(dirname -- "${RESUME_FROM_CHECKPOINT}")"

@@ -46,8 +46,10 @@ class _TinyQwen3LM(nn.Module):
             "Config", (), {"use_cache": False, "model_type": "tiny_qwen3"}
         )()
 
-    def forward(self, input_ids, attention_mask, use_cache, return_dict):
-        del attention_mask, use_cache, return_dict
+    def forward(
+        self, input_ids, attention_mask, position_ids=None, use_cache=False, return_dict=True
+    ):
+        del attention_mask, position_ids, use_cache, return_dict
         hidden = self.embedding(input_ids)
         for layer in self.layers:
             hidden = layer(hidden)

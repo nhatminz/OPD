@@ -11,6 +11,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 python scripts/check_b200_env.py
+# Hai lệnh smoke dưới đây đều tùy chọn:
 CUDA_VISIBLE_DEVICES=0 bash scripts/smoke_test_b200.sh
 CUDA_VISIBLE_DEVICES=0,1 METHOD=rac bash scripts/smoke_test_fsdp_multigpu.sh
 ```
@@ -20,9 +21,10 @@ chọn ngay bằng biến môi trường; không cần sửa YAML. Default hiệ
 Qwen3-8B → Qwen3-1.7B-Base trên Competition-MATH:
 
 ```bash
-export TEACHER_MODEL_PATH=models/Qwen3-8B
-export STUDENT_MODEL_PATH=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
-export TRAIN_DATASET=competition_math
+export TEACHER_MODEL=models/Qwen3-8B
+export STUDENT_MODEL=nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+export TRAIN_DATA=nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+export PROMPT_KEY=problem
 ```
 
 Chuyển sang full DAPO-Math-17k-Processed:
@@ -34,11 +36,11 @@ export TRAIN_DATASET=dapo_math
 Preset DAPO tự đặt path `nlp/minhpn19/data/DAPO-Math-17k-Processed`, split `all`, prompt key
 `prompt`; preset Competition-MATH tự đặt file train, split `null`, prompt key `problem`. Dataset
 khác dùng `TRAIN_DATASET=custom TRAIN_DATA_PATH=... TRAIN_DATA_SPLIT=... TRAIN_PROMPT_KEY=...`.
-Có thể sửa các default tập trung trong `scripts/common_b200.sh`. Mỗi model/data selection và số
-GPU tự có `results/preflight/asset-<fingerprint>-<N>gpu.json`; chỉ cần chạy
-`smoke_test_b200.sh` lần đầu cho selection/topology mới. Các workload 1/2/4 GPU không ghi đè report
-của nhau; autotune cũng được lưu riêng theo cả fingerprint và số GPU. `smoke_test_b200.sh` ẩn GPU
-trong lúc chạy unit tests để không tự spawn thêm rank; smoke FSDP thật chạy riêng bằng:
+Có thể sửa block `USER CONFIG` ở đầu từng script train. Smoke test không bắt buộc; launcher train
+khởi động trực tiếp và vẫn kiểm tra model/data/schema ở runtime. Nếu chủ động chạy smoke, mỗi
+model/data selection và số GPU có `results/preflight/asset-<fingerprint>-<N>gpu.json`. Các workload
+1/2/4 GPU không ghi đè report của nhau; autotune cũng được lưu riêng theo cả fingerprint và số GPU.
+`smoke_test_b200.sh` ẩn GPU trong lúc chạy unit tests; smoke FSDP thật tùy chọn chạy riêng bằng:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 METHOD=opd bash scripts/smoke_test_fsdp_multigpu.sh

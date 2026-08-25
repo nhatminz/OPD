@@ -35,9 +35,9 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 | AIME 2024 | `nlp/minhpn19/data/eval/aime24` |
 | AIME 2025 | `nlp/minhpn19/data/eval/aime25` |
 
-Không cần sửa YAML khi đổi cặp model hoặc train dataset. Các launcher nhận
-`TEACHER_MODEL_PATH`, `STUDENT_MODEL_PATH` và `TRAIN_DATASET=competition_math|dapo_math|custom`;
-default tập trung tại `scripts/common_b200.sh`. Teacher/student phải có cùng exact token-to-ID vocab,
+Không cần sửa YAML khi đổi cặp model hoặc train dataset. Đầu mỗi launcher có block `USER CONFIG`
+và nhận `TEACHER_MODEL`, `STUDENT_MODEL`, `TRAIN_DATA`, `PROMPT_KEY`; các tên legacy vẫn tương thích.
+Teacher/student phải có cùng exact token-to-ID vocab,
 added vocab, model vocab size và tokenizer length. Khác biệt `special_tokens_map` giữa Base và
 Instruct không còn bị coi là lỗi vì student tokenizer là tokenizer duy nhất, và teacher scoring nhận
 trực tiếp cùng integer IDs. Prompt dùng Qwen3 `enable_thinking=false`, nên teacher luôn no-think.
@@ -219,7 +219,7 @@ Các test nhẹ bao phủ Top-K OPD khớp upstream trên synthetic logits, `n=1
 weighted-token mean, FSDP batching/accumulation, uniform pure-OPD allocation, literal TA formula,
 Bellman recurrence tính tay,
 padding/trajectory reset, bounds, detachment, gradient path, optimized/reference equivalence,
-global distributed normalization/budget, tail padding, resume, eval schedule, minimal TensorBoard,
+global distributed normalization/budget, tail padding, resume, eval schedule, TensorBoard diagnostics,
 loaders, vLLM wrappers và plotting. Test tích hợp hai CUDA rank kiểm tra FULL_SHARD student/teacher,
 HF parameter names/shapes, FSDP-aware update, full checkpoint và optimizer scatter-resume.
 
@@ -229,8 +229,9 @@ ruff check b200_experiment tests
 bash -n scripts/*.sh
 ```
 
-`scripts/smoke_test_b200.sh` chạy CPU-only unit tests rồi preflight model/data/GPU; nó không tự bắt đầu full
-training trừ khi chủ động bật batch autotune. Mỗi tổ hợp teacher/student/data và số GPU có report riêng tại
+`scripts/smoke_test_b200.sh` là diagnostic tùy chọn: nó chạy CPU-only unit tests rồi preflight
+model/data/GPU. Launcher train không đọc marker/report và bắt đầu trực tiếp. Smoke không tự bắt đầu
+full training trừ khi chủ động bật batch autotune. Mỗi tổ hợp teacher/student/data và số GPU có report riêng tại
 `results/preflight/asset-<fingerprint>-<N>gpu.json`; autotune cũng tách theo số GPU tại
 `configs/autotuned/asset-<fingerprint>-<N>gpu.yaml`. Vì vậy các workload dùng chung checkout không
 đọc hoặc ghi đè validation của cấu hình khác. Khi autotune được bật, step đầu của OPD/TA/RAC còn

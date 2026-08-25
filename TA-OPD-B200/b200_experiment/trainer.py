@@ -26,8 +26,10 @@ from .data import (
     epoch_batch_indices,
     expand_prompt_batch,
     read_records,
+    render_record_prompt,
     stable_sample_id,
     tokenize_prompts,
+    validate_prompt_records,
 )
 from .diagnostics import correlations, finite_or_raise, selector_summary
 from .distributed import (
@@ -45,6 +47,7 @@ from .evaluation import (
     configured_benchmark_names,
     evaluate_loaded_suite,
     evaluation_metric_name,
+    load_benchmark,
 )
 from .evaluation_cache import evaluate_or_reuse_base
 from .eval_schedule import (
@@ -53,6 +56,7 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import load_models, validate_shared_tokenizer_protocol
+from .math_prompts import render_math_prompt
 from .fsdp import (
     clip_grad_norm,
     distributed_strategy,
@@ -83,6 +87,7 @@ from .resume import (
 from .scoring import (
     cuda_sync,
     generate_on_policy,
+    position_ids_from_mask,
     score_original_rollout,
     score_student_teacher_rollout,
     supports_response_only_logits,
@@ -425,6 +430,22 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "weighted_final_loss",
         "base_topk_opd_loss",
         "unweighted_opd_loss",
+        "student_entropy",
+        "teacher_entropy",
+        "entropy_gap",
+        "topk_student_mass",
+        "topk_teacher_mass",
+        "topk_kl_mean",
+        "topk_kl_min",
+        "topk_kl_max",
+        "opd_ratio_mean",
+        "opd_ratio_min",
+        "opd_ratio_max",
+        "opd_clip_fraction",
+        "opd_advantage_mean",
+        "opd_advantage_abs_mean",
+        "opd_advantage_min",
+        "opd_advantage_max",
         "grad_norm",
         "num_valid_tokens",
         "mean_response_length",
@@ -454,7 +475,17 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
     statistics = tuple(
         f"{score}_{statistic}"
         for score in ("D", "C", "s_TA", "g", "alignment", "R", "M", "V", "z", "w")
-        for statistic in ("mean", "min", "max", "q05", "q25", "q50", "q75", "q95")
+        for statistic in (
+            "mean",
+            "std",
+            "min",
+            "max",
+            "q05",
+            "q25",
+            "q50",
+            "q75",
+            "q95",
+        )
     )
     _append_csv_row(path, row, common + statistics)
 
@@ -729,6 +760,32 @@ def _make_optimizer(parameters, training: dict[str, Any]):
     return torch.optim.AdamW(parameters, **kwargs), False
 
 
+def _global_tensor_stats(
+    values: torch.Tensor, distributed: DistributedContext
+) -> dict[str, float]:
+    """Globally reduce scalar statistics without gathering per-token tensors."""
+    with torch.inference_mode():
+        values = values.detach().float().reshape(-1)
+        local_count = values.numel()
+        local_sum = float(values.sum().item()) if local_count else 0.0
+        local_square_sum = float(values.square().sum().item()) if local_count else 0.0
+        local_min = float(values.min().item()) if local_count else float("inf")
+        local_max = float(values.max().item()) if local_count else float("-inf")
+    count = distributed.sum_int(local_count)
+    if count <= 0:
+        raise ValueError("Cannot summarize an empty global tensor")
+    total = distributed.sum_float(local_sum)
+    square_total = distributed.sum_float(local_square_sum)
+    mean = total / count
+    return {
+        "mean": mean,
+        "std": math.sqrt(max(square_total / count - mean * mean, 0.0)),
+        "min": -distributed.max_float(-local_min),
+        "max": distributed.max_float(local_max),
+        "count": float(count),
+    }
+
+
 def _opd_train_step(
     model,
     optimizer,
@@ -771,6 +828,9 @@ def _opd_train_step(
     forward_seconds = backward_seconds = optimizer_seconds = loss_value = 0.0
     base_loss_sum = 0.0
     local_clipped_candidates = local_candidate_count = 0
+    local_ratio_sum = 0.0
+    local_ratio_min = float("inf")
+    local_ratio_max = float("-inf")
     response_lengths = rollout.valid_mask.long().sum(dim=-1)
     order = torch.arange(local_batch_size, device=rollout.input_ids.device)
     if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
@@ -800,6 +860,7 @@ def _opd_train_step(
             forward_kwargs = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
+                "position_ids": position_ids_from_mask(attention_mask),
                 "use_cache": False,
                 "return_dict": True,
             }
@@ -862,7 +923,16 @@ def _opd_train_step(
                 candidate_valid = valid_chunk.unsqueeze(-1).expand_as(ratio)
                 clipped = ratio.lt(1.0 - eps_low) | ratio.gt(1.0 + eps_high)
                 local_clipped_candidates += int((clipped & candidate_valid).sum())
-                local_candidate_count += int(candidate_valid.sum())
+                ratio_values = ratio[candidate_valid]
+                local_candidate_count += ratio_values.numel()
+                if ratio_values.numel():
+                    local_ratio_sum += float(ratio_values.sum().item())
+                    local_ratio_min = min(
+                        local_ratio_min, float(ratio_values.min().item())
+                    )
+                    local_ratio_max = max(
+                        local_ratio_max, float(ratio_values.max().item())
+                    )
             # DDP and FSDP data-parallel reductions average synchronized rank
             # gradients. The world-size factor therefore yields exactly:
             # global sum(w_t*l_t) / global sum(w_t), including accumulation.
@@ -887,6 +957,7 @@ def _opd_train_step(
                 loss,
                 input_ids,
                 attention_mask,
+                forward_kwargs,
                 candidate_ids,
                 chunk_weights,
             )
@@ -905,6 +976,11 @@ def _opd_train_step(
     global_valid_tokens = distributed.sum_int(int(objective_valid.sum().item()))
     global_clipped_candidates = distributed.sum_int(local_clipped_candidates)
     global_candidate_count = distributed.sum_int(local_candidate_count)
+    global_ratio_mean = distributed.sum_float(local_ratio_sum) / max(
+        global_candidate_count, 1
+    )
+    global_ratio_min = -distributed.max_float(-local_ratio_min)
+    global_ratio_max = distributed.max_float(local_ratio_max)
     return {
         "loss": global_loss,
         "weighted_final_loss": global_loss,
@@ -916,6 +992,9 @@ def _opd_train_step(
         "optimizer_time": optimizer_seconds,
         "global_weight_mass": global_weight_mass,
         "clip_fraction": global_clipped_candidates / max(global_candidate_count, 1),
+        "ratio_mean": global_ratio_mean,
+        "ratio_min": global_ratio_min,
+        "ratio_max": global_ratio_max,
     }
 
 
@@ -1139,6 +1218,7 @@ def run_training(
     )
     if not records:
         raise ValueError("Configured training dataset is empty")
+    validate_prompt_records(records, config["data"])
     setup_progress.update(1)
     setup_progress.set_postfix_str(
         f"stage=start-rollout-{rollout_backend}", refresh=True
@@ -1277,6 +1357,24 @@ def run_training(
         save_metadata(metadata, output_dir, filename=metadata_filename)
     setup_progress.update(1)
     setup_progress.close()
+    if distributed.is_main:
+        rendered_train_prompt = render_record_prompt(
+            records[0], tokenizer, config["data"]
+        )
+        first_benchmark = configured_benchmark_names(config)[0]
+        evaluation_records, _ = load_benchmark(
+            first_benchmark,
+            config["evaluation"]["benchmarks"][first_benchmark],
+        )
+        if not evaluation_records:
+            raise ValueError(f"Configured evaluation benchmark {first_benchmark} is empty")
+        rendered_eval_prompt = render_math_prompt(
+            tokenizer, evaluation_records[0]["problem"], config["data"]
+        )
+        tqdm.write(f"Fully rendered TRAIN prompt:\n{rendered_train_prompt}")
+        tqdm.write(
+            f"Fully rendered EVAL prompt ({first_benchmark}):\n{rendered_eval_prompt}"
+        )
     selector_cfg = config["selector"]
     top_k = int(selector_cfg.get("top_k", 16))
     if top_k <= 0:
@@ -1537,15 +1635,13 @@ def run_training(
             valid,
         )
         finite_or_raise("Top-K OPD advantages", opd_reference.advantages[valid])
-        local_advantage_abs_sum = float(
-            opd_reference.advantages[valid].abs().sum().item()
+        advantage_stats = _global_tensor_stats(
+            opd_reference.advantages[valid], distributed
         )
-        global_advantage_count = distributed.sum_int(
-            opd_reference.advantages[valid].numel()
+        advantage_abs_stats = _global_tensor_stats(
+            opd_reference.advantages[valid].abs(), distributed
         )
-        opd_advantage_abs_mean = distributed.sum_float(local_advantage_abs_sum) / max(
-            global_advantage_count, 1
-        )
+        opd_advantage_abs_mean = advantage_abs_stats["mean"]
         local_logprob_gap = (
             teacher_scores.sampled_log_probs[valid]
             - student_scores.sampled_log_probs[valid]
@@ -1562,10 +1658,26 @@ def run_training(
             float(overlap_values.sum().item())
         ) / max(global_overlap_count, 1)
         local_divergence = -opd_reference.advantages.sum(dim=-1)[valid]
-        global_divergence_count = distributed.sum_int(local_divergence.numel())
-        student_teacher_topk_divergence = distributed.sum_float(
-            float(local_divergence.sum().item())
-        ) / max(global_divergence_count, 1)
+        kl_stats = _global_tensor_stats(local_divergence, distributed)
+        student_teacher_topk_divergence = kl_stats["mean"]
+        student_entropy_stats = _global_tensor_stats(
+            student_scores.entropies[valid], distributed
+        )
+        teacher_entropy_stats = _global_tensor_stats(
+            teacher_scores.entropies[valid], distributed
+        )
+        entropy_gap_stats = _global_tensor_stats(
+            (student_scores.entropies[valid] - teacher_scores.entropies[valid]).abs(),
+            distributed,
+        )
+        student_topk_mass_stats = _global_tensor_stats(
+            student_scores.top_k_log_probs[valid].float().exp().sum(dim=-1),
+            distributed,
+        )
+        teacher_topk_mass_stats = _global_tensor_stats(
+            teacher_scores.top_k_log_probs[valid].float().exp().sum(dim=-1),
+            distributed,
+        )
 
         vllm_logprob_sanity: dict[str, Any] = {"enabled": False}
         sanity = dict(config["rollout"].get("vllm", {}).get("logprob_sanity", {}))
@@ -1884,6 +1996,9 @@ def run_training(
             "optimizer_time": distributed.max_float(train_metrics["optimizer_time"]),
             "global_weight_mass": train_metrics["global_weight_mass"],
             "opd_clip_fraction": train_metrics["clip_fraction"],
+            "opd_ratio_mean": train_metrics["ratio_mean"],
+            "opd_ratio_min": train_metrics["ratio_min"],
+            "opd_ratio_max": train_metrics["ratio_max"],
         }
         final_metrics = {
             "step": step,
@@ -1933,6 +2048,9 @@ def run_training(
             "opd_adv_estimator": advantage_estimator,
             "opd_loss_agg_mode": loss_aggregation,
             "opd_advantage_abs_mean": opd_advantage_abs_mean,
+            "opd_advantage_mean": advantage_stats["mean"],
+            "opd_advantage_min": advantage_stats["min"],
+            "opd_advantage_max": advantage_stats["max"],
             "opd_teacher_student_logprob_gap": (opd_teacher_student_logprob_gap),
             "fused_optimizer": fused_optimizer,
             "lr": float(optimizer.param_groups[0]["lr"]),
@@ -2012,6 +2130,14 @@ def run_training(
             "eos_fraction": eos_responses / max(trajectory_count, 1),
             "student_teacher_topk_overlap_ratio": student_teacher_topk_overlap,
             "student_teacher_topk_divergence": student_teacher_topk_divergence,
+            "student_entropy": student_entropy_stats["mean"],
+            "teacher_entropy": teacher_entropy_stats["mean"],
+            "entropy_gap": entropy_gap_stats["mean"],
+            "topk_student_mass": student_topk_mass_stats["mean"],
+            "topk_teacher_mass": teacher_topk_mass_stats["mean"],
+            "topk_kl_mean": kl_stats["mean"],
+            "topk_kl_min": kl_stats["min"],
+            "topk_kl_max": kl_stats["max"],
             "peak_gpu_allocated_bytes": peak_allocated,
             "peak_gpu_reserved_bytes": peak_reserved,
             "peak_gpu_allocated_gb": peak_allocated / 2**30,

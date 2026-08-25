@@ -151,6 +151,8 @@ class ScoringTests(unittest.TestCase):
                 independent_cross.candidate_log_probs,
             ),
             (joint_teacher.sampled_log_probs, independent_teacher.sampled_log_probs),
+            (joint_student.entropies, independent_student.entropies),
+            (joint_teacher.entropies, independent_teacher.entropies),
             (joint_teacher.top_k_log_probs, independent_teacher.top_k_log_probs),
             (
                 joint_teacher.candidate_log_probs,
@@ -264,6 +266,10 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(torch.equal(compact.log_normalizers, retained.log_normalizers))
         self.assertEqual(compact.top_k_ids.shape, (2, 3, 4))
         expected_log_probs = torch.log_softmax(logits[:, 2:5].float(), dim=-1)
+        expected_entropy = -(
+            expected_log_probs.exp() * expected_log_probs
+        ).sum(dim=-1)
+        self.assertTrue(torch.allclose(compact.entropies, expected_entropy))
         self.assertTrue(
             torch.allclose(
                 compact.top_k_log_probs,
