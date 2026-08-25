@@ -118,7 +118,7 @@ trong shared config để audit fairness.
 
 ## Hot path
 
-- Student rollout được tạo đúng một lần mỗi optimizer step bằng persistent co-located vLLM server
+- Student rollout được tạo đúng một lần mỗi global rollout batch bằng persistent co-located vLLM server
   TP=1 trên từng rank. HF fallback chỉ dành cho single-process/DDP debug; production FSDP yêu cầu
   vLLM để mọi rank có lịch collective xác định.
 - Common core score student Top-K và teacher-on-student IDs một lần. Với TA/RAC, student và teacher
@@ -156,15 +156,16 @@ rollout, seed, batch, optimizer, schedule và evaluation settings được kế 
 Các launcher đều expose:
 
 ```text
-LR EPOCHS MAX_STEPS BATCH_SIZE MICRO_BATCH_SIZE_PER_GPU NUM_RESPONSES
-MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TOP_K TA_RHO
+LR EPOCHS MAX_STEPS BATCH_SIZE NUM_RESPONSES
+MAX_PROMPT_LENGTH OVERLONG_PROMPT_POLICY MAX_RESPONSE_LENGTH TOP_K TA_RHO
+PPO_MINI_BATCH_SIZE MICRO_BATCH_SIZE_PER_GPU
 RAC_GAMMA RAC_W_MIN RAC_BETA RAC_SCAN_BACKEND
 EVAL_INTERVAL SAVE_INTERVAL LOG_INTERVAL SEED
 ```
 
 Production defaults là hai rank FSDP, BF16 full-parameter student, `LR=1e-6`, một epoch, global
-prompt batch 64, `n=1`, local trajectories 32/GPU, micro-batch 8/GPU và bốn accumulated
-microbatch/GPU/step. Prompt/response là `1024/7168`, eval/save mỗi 50 step. Micro-batch không tự
+prompt batch 64, `n=1`, PPO mini-batch toàn cục 16 trajectory, rồi micro-batch 8/GPU.
+Prompt/response là `1024/7168`, eval/save mỗi 50 optimizer step. Micro-batch không tự
 giảm khi OOM và LR không tự scale; thử `8 → 16`, rồi lùi về `4` nếu thiếu VRAM, giữ global batch 64.
 
 Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric

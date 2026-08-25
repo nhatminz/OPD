@@ -18,8 +18,8 @@ export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
 # Paths may be absolute or relative to STORAGE_ROOT. Environment overrides
 # take precedence, so the same launchers work for any vocabulary-compatible
 # teacher/student pair without editing YAML files.
-export TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${TEACHER_MODEL:-${TEACHER_PATH:-models/Qwen3-8B}}}"
-export STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-${STUDENT_MODEL:-${STUDENT_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}}"
+export TEACHER_MODEL_PATH="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-${TEACHER_PATH:-models/Qwen3-8B}}}"
+export STUDENT_MODEL_PATH="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-${STUDENT_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}}"
 export TRAIN_DATASET="${TRAIN_DATASET:-competition_math}"  # competition_math, dapo_math, custom
 
 case "${TRAIN_DATASET,,}" in
@@ -51,9 +51,9 @@ case "${TRAIN_DATASET,,}" in
     ;;
 esac
 
-export TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${TRAIN_DATA:-${PRESET_TRAIN_DATA_PATH}}}"
+export TRAIN_DATA_PATH="${TRAIN_DATA:-${TRAIN_DATA_PATH:-${PRESET_TRAIN_DATA_PATH}}}"
 export TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-${PRESET_TRAIN_DATA_SPLIT}}"
-export TRAIN_PROMPT_KEY="${TRAIN_PROMPT_KEY:-${PROMPT_KEY:-${PRESET_TRAIN_PROMPT_KEY}}}"
+export TRAIN_PROMPT_KEY="${PROMPT_KEY:-${TRAIN_PROMPT_KEY:-${PRESET_TRAIN_PROMPT_KEY}}}"
 export TRAIN_PREFER_SOURCE_PROMPT="${TRAIN_PREFER_SOURCE_PROMPT:-${PRESET_TRAIN_PREFER_SOURCE_PROMPT}}"
 # This experiment intentionally has no teacher-tokenizer path. Qwen3's hard
 # no-think switch is always applied while the student tokenizer renders the one
@@ -301,10 +301,12 @@ build_training_args() {
     --set "paths.storage_root=${STORAGE_ROOT}"
     --set "experiment.seed=${SEED:-${EXPERIMENT_SEED:-42}}"
     --set "data.max_prompt_tokens=${MAX_PROMPT_LENGTH:-${MAX_PROMPT_LEN:-1024}}"
+    --set "data.overlong_prompt_policy=${OVERLONG_PROMPT_POLICY:-filter}"
     --set "training.epochs=${NUM_EPOCHS:-${EPOCHS:-1}}"
     --set "training.learning_rate=${LR:-${LEARNING_RATE:-1.0e-6}}"
     --set "training.save_interval=${SAVE_INTERVAL:-50}"
     --set "training.grad_accum_steps=${GRAD_ACCUM_STEPS:-auto}"
+    --set "training.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-16}"
     --set "training.gradient_checkpointing=${GRADIENT_CHECKPOINTING:-true}"
     --set "distributed.strategy=${DISTRIBUTED_STRATEGY:-fsdp}"
     --set "distributed.fsdp.teacher_cpu_offload=${FSDP_TEACHER_CPU_OFFLOAD:-false}"

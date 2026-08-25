@@ -100,6 +100,8 @@ export NUM_RESPONSES=1
 export LR=1e-6
 export NUM_EPOCHS=1
 export MAX_PROMPT_LENGTH=1024
+export OVERLONG_PROMPT_POLICY=filter
+export PPO_MINI_BATCH_SIZE=16
 export MAX_RESPONSE_LENGTH=7168
 export TOP_K=16
 export TA_RHO=0.10
@@ -206,7 +208,7 @@ tensorboard --logdir_spec \
   --bind_all --port 6006
 ```
 
-Production event giữ metric cũ và thêm Top-K loss/entropy/mass/overlap/KL, PPO ratio/clip/
+Production event giữ metric cũ và thêm Top-K loss/entropy/mass/overlap/divergence proxy, PPO ratio/clip/
 advantage, response length min/mean/max/clip/throughput, VRAM allocated/reserved và step time.
 TA thêm D/C/teachability/selected fraction; RAC thêm local teachability/alignment/V/weight stats.
 Debug vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được

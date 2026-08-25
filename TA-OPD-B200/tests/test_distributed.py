@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from b200_experiment.data import expand_prompt_batch
 from b200_experiment.distributed import (
     DistributedContext,
     batch_layout,
@@ -28,6 +29,8 @@ from b200_experiment.trainer import (
     _globalize_ta_output,
     _local_mask_from_global_budget,
     _opd_train_step,
+    _optimizer_steps_per_epoch,
+    _rollout_position_after_optimizer_steps,
 )
 from b200_experiment.opd_core import (
     build_topk_opd_reference,
@@ -83,16 +86,22 @@ def _tiny_batch(start: int, end: int) -> RolloutBatch:
     )
 
 
-def _tiny_config(micro_batch_size_per_gpu: int = 3) -> dict:
+def _tiny_config(
+    micro_batch_size_per_gpu: int = 3,
+    ppo_mini_batch_size: int | None = None,
+) -> dict:
+    training = {
+        "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
+        "ppo_clip_low": 0.2,
+        "ppo_clip_high": 0.28,
+        "max_grad_norm": 100.0,
+    }
+    if ppo_mini_batch_size is not None:
+        training["ppo_mini_batch_size"] = ppo_mini_batch_size
     return {
         "rollout": {"temperature": 1.0},
         "selector": {"score_chunk_steps": 2},
-        "training": {
-            "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
-            "ppo_clip_low": 0.2,
-            "ppo_clip_high": 0.28,
-            "max_grad_norm": 100.0,
-        },
+        "training": training,
     }
 
 
@@ -272,11 +281,13 @@ class DistributedInvariantTests(unittest.TestCase):
         self.assertIn("TORCHELASTIC_USE_AGENT_STORE", source)
 
     def test_production_batch_layout_is_explicit(self):
-        layout = batch_layout(64, 1, 2, 8)
+        layout = batch_layout(64, 1, 2, 8, 16)
         self.assertEqual(layout.global_prompt_batch_size, 64)
         self.assertEqual(layout.local_prompt_batch_size, 32)
         self.assertEqual(layout.global_trajectory_batch_size, 64)
         self.assertEqual(layout.local_trajectory_batch_size, 32)
+        self.assertEqual(layout.ppo_mini_batch_size, 16)
+        self.assertEqual(layout.optimizer_steps_per_full_rollout, 4)
         self.assertEqual(layout.micro_batch_size_per_gpu, 8)
         self.assertEqual(layout.micro_batches_per_gpu, 4)
 
@@ -388,6 +399,143 @@ class DistributedInvariantTests(unittest.TestCase):
         self.assertTrue(
             torch.allclose(
                 _parameters(first), _parameters(second), atol=1e-7, rtol=1e-6
+            )
+        )
+
+    def test_ppo_minibatches_step_twice_for_sixteen_expanded_trajectories(self):
+        encoded = {
+            "input_ids": torch.tensor(
+                [[1, 2], [2, 3], [3, 4], [4, 5]], dtype=torch.long
+            ),
+            "attention_mask": torch.ones(4, 2, dtype=torch.long),
+        }
+        expanded, indices, response_indices = expand_prompt_batch(
+            encoded, [0, 1, 2, 3], 4
+        )
+        self.assertEqual(expanded["input_ids"].shape[0], 16)
+        self.assertEqual(len(indices), 16)
+        self.assertEqual(response_indices, [0, 1, 2, 3] * 4)
+        rows = torch.cat(
+            [expanded["input_ids"], torch.full((16, 2), 4, dtype=torch.long)],
+            dim=1,
+        )
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((16, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((16, 2)),
+            prompt_width=2,
+        )
+        model = _TinyCausalLM()
+        reference = _tiny_reference(model, rollout)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        original_step = optimizer.step
+        step_calls = 0
+
+        def counted_step(*args, **kwargs):
+            nonlocal step_calls
+            step_calls += 1
+            return original_step(*args, **kwargs)
+
+        optimizer.step = counted_step
+        metrics = _opd_train_step(
+            model,
+            optimizer,
+            rollout,
+            rollout.valid_mask,
+            reference,
+            _tiny_config(2, 8),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+        )
+
+        self.assertEqual(step_calls, 2)
+        self.assertEqual(metrics["optimizer_steps"], 2)
+        self.assertEqual(
+            [item["ppo_minibatch_trajectory_count"] for item in metrics["minibatches"]],
+            [8.0, 8.0],
+        )
+
+    def test_partial_ppo_minibatch_and_optimizer_step_schedule(self):
+        # Prompt batches are 4, 4, 2; with n=4 this is 16, 16, 8
+        # trajectories and therefore 2, 2, 1 optimizer steps at PPO size 8.
+        self.assertEqual(_optimizer_steps_per_epoch(10, 4, 4, 8), 5)
+        self.assertEqual(
+            _rollout_position_after_optimizer_steps(1, 10, 4, 4, 8),
+            (0, 1),
+        )
+        self.assertEqual(
+            _rollout_position_after_optimizer_steps(4, 10, 4, 4, 8),
+            (2, 0),
+        )
+        self.assertEqual(
+            _rollout_position_after_optimizer_steps(5, 10, 4, 4, 8),
+            (3, 0),
+        )
+
+        model = _TinyCausalLM()
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(10)], dtype=torch.long
+        )
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((10, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((10, 2)),
+            prompt_width=2,
+        )
+        metrics = _opd_train_step(
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.01),
+            rollout,
+            rollout.valid_mask,
+            _tiny_reference(model, rollout),
+            _tiny_config(8, 8),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+        )
+        self.assertEqual(metrics["optimizer_steps"], 2)
+        self.assertEqual(
+            [item["ppo_minibatch_trajectory_count"] for item in metrics["minibatches"]],
+            [8.0, 2.0],
+        )
+
+    def test_microbatch_partition_does_not_change_two_ppo_updates(self):
+        torch.manual_seed(17)
+        reference_model = _TinyCausalLM()
+        microbatched_model = copy.deepcopy(reference_model)
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(16)], dtype=torch.long
+        )
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((16, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((16, 2)),
+            prompt_width=2,
+        )
+        reference = _tiny_reference(reference_model, rollout)
+        for model, micro in ((reference_model, 8), (microbatched_model, 2)):
+            metrics = _opd_train_step(
+                model,
+                torch.optim.SGD(model.parameters(), lr=0.02),
+                rollout,
+                rollout.valid_mask,
+                reference,
+                _tiny_config(micro, 8),
+                torch.device("cpu"),
+                DistributedContext(0, 0, 1, torch.device("cpu")),
+            )
+            self.assertEqual(metrics["optimizer_steps"], 2)
+        self.assertTrue(
+            torch.allclose(
+                _parameters(reference_model),
+                _parameters(microbatched_model),
+                atol=1e-7,
+                rtol=1e-6,
             )
         )
 

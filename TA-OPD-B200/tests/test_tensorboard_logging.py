@@ -35,10 +35,10 @@ def _metrics() -> dict:
 
 class TensorBoardMetricTests(unittest.TestCase):
     def test_opd_writes_all_common_diagnostic_tags(self):
-        self.assertEqual(
-            set(production_tensorboard_metrics(_metrics(), "opd")),
-            set(BASE_TAGS),
-        )
+        selected = production_tensorboard_metrics(_metrics(), "opd")
+        self.assertEqual(set(selected), set(BASE_TAGS))
+        self.assertNotIn("distillation/kl_mean", selected)
+        self.assertIn("distillation/topk_divergence_proxy_mean", selected)
 
     def test_ta_adds_requested_selector_diagnostics(self):
         selected = production_tensorboard_metrics(_metrics(), "ta")

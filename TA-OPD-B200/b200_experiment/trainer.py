@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from contextlib import nullcontext
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from .config import save_config
 from .data import (
     epoch_batch_indices,
     expand_prompt_batch,
+    filter_overlong_prompt_records,
     read_records,
     render_record_prompt,
     stable_sample_id,
@@ -55,7 +57,7 @@ from .eval_schedule import (
     training_evaluation_steps,
 )
 from .metadata import collect_metadata, save_metadata
-from .models import load_models, validate_shared_tokenizer_protocol
+from .models import load_models, load_student_tokenizer, validate_shared_tokenizer_protocol
 from .math_prompts import render_math_prompt
 from .fsdp import (
     clip_grad_norm,
@@ -131,6 +133,60 @@ def _micro_batch_size_per_gpu(training: dict[str, Any], world_size: int) -> int:
     return value
 
 
+def _ppo_mini_batch_size(
+    training: dict[str, Any], global_trajectory_batch_size: int
+) -> int:
+    value = int(training.get("ppo_mini_batch_size", global_trajectory_batch_size))
+    if value <= 0:
+        raise ValueError("training.ppo_mini_batch_size must be positive")
+    return value
+
+
+def _ppo_minibatch_count(global_trajectory_count: int, ppo_size: int) -> int:
+    if global_trajectory_count <= 0 or ppo_size <= 0:
+        raise ValueError("Trajectory count and PPO mini-batch size must be positive")
+    return (global_trajectory_count + ppo_size - 1) // ppo_size
+
+
+def _optimizer_steps_per_epoch(
+    num_records: int,
+    prompt_batch_size: int,
+    num_responses: int,
+    ppo_size: int,
+) -> int:
+    total = 0
+    for begin in range(0, num_records, prompt_batch_size):
+        prompt_count = min(prompt_batch_size, num_records - begin)
+        total += _ppo_minibatch_count(prompt_count * num_responses, ppo_size)
+    return total
+
+
+def _rollout_position_after_optimizer_steps(
+    completed_steps: int,
+    num_records: int,
+    prompt_batch_size: int,
+    num_responses: int,
+    ppo_size: int,
+) -> tuple[int, int]:
+    """Map optimizer-step state to deterministic rollout/minibatch position."""
+    if completed_steps < 0:
+        raise ValueError("completed_steps cannot be negative")
+    rollout_batches = math.ceil(num_records / prompt_batch_size)
+    steps_per_epoch = _optimizer_steps_per_epoch(
+        num_records, prompt_batch_size, num_responses, ppo_size
+    )
+    epoch, remaining = divmod(completed_steps, steps_per_epoch)
+    for slot in range(rollout_batches):
+        prompt_count = min(
+            prompt_batch_size, num_records - slot * prompt_batch_size
+        )
+        count = _ppo_minibatch_count(prompt_count * num_responses, ppo_size)
+        if remaining < count:
+            return epoch * rollout_batches + slot, remaining
+        remaining -= count
+    return (epoch + 1) * rollout_batches, 0
+
+
 def _format_batch_layout(
     layout: BatchLayout,
     strategy: str,
@@ -147,6 +203,9 @@ def _format_batch_layout(
             f"num_responses                 = {layout.num_responses}",
             f"global_trajectory_batch_size  = {layout.global_trajectory_batch_size}",
             f"local_trajectory_batch_size   = {layout.local_trajectory_batch_size}",
+            f"ppo_mini_batch_size           = {layout.ppo_mini_batch_size}",
+            "optimizer_steps/full_rollout  = "
+            f"{layout.optimizer_steps_per_full_rollout}",
             f"micro_batch_size_per_gpu      = {layout.micro_batch_size_per_gpu}",
             f"micro_batches_per_gpu         = {layout.micro_batches_per_gpu}",
             f"learning_rate                 = {float(training['learning_rate']):.8g}",
@@ -435,9 +494,9 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "entropy_gap",
         "topk_student_mass",
         "topk_teacher_mass",
-        "topk_kl_mean",
-        "topk_kl_min",
-        "topk_kl_max",
+        "topk_divergence_proxy_mean",
+        "topk_divergence_proxy_min",
+        "topk_divergence_proxy_max",
         "opd_ratio_mean",
         "opd_ratio_min",
         "opd_ratio_max",
@@ -453,7 +512,7 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "max_response_length",
         "response_clip_ratio",
         "student_teacher_topk_overlap_ratio",
-        "student_teacher_topk_divergence",
+        "student_teacher_topk_divergence_proxy",
         "throughput_tokens_per_sec",
         "rollout_time",
         "total_scoring_time_sec",
@@ -796,6 +855,11 @@ def _opd_train_step(
     device,
     distributed: DistributedContext,
     objective_valid_mask: torch.Tensor | None = None,
+    trajectory_active_mask: torch.Tensor | None = None,
+    ppo_minibatch_offset: int = 0,
+    max_optimizer_steps: int | None = None,
+    optimizer_step_start: int = 0,
+    on_optimizer_step: Callable[[int, dict[str, float]], None] | None = None,
 ):
     training = config["training"]
     micro_batch = _micro_batch_size_per_gpu(training, distributed.world_size)
@@ -816,186 +880,307 @@ def _opd_train_step(
         raise ValueError("objective_valid_mask must align with rollout.valid_mask")
     if bool((objective_valid & ~rollout.valid_mask.bool()).any()):
         raise ValueError("Objective-valid tokens must also be valid rollout tokens")
-    local_weight_mass = float(
-        position_weights[objective_valid].detach().float().sum().item()
+    trajectory_active = (
+        objective_valid.any(dim=-1)
+        if trajectory_active_mask is None
+        else trajectory_active_mask.to(
+            device=rollout.valid_mask.device, dtype=torch.bool
+        )
     )
-    global_weight_mass = distributed.sum_float(local_weight_mass)
-    if global_weight_mass <= 0.0:
-        raise ValueError("Position weights must have positive global mass")
-    optimizer.zero_grad(set_to_none=True)
+    if trajectory_active.shape != (local_batch_size,):
+        raise ValueError("trajectory_active_mask must have shape [local_batch]")
+    active_positions = trajectory_active.nonzero(as_tuple=False).flatten()
+    local_real_count = int(active_positions.numel())
+    if local_real_count and not torch.equal(
+        active_positions,
+        torch.arange(local_real_count, device=active_positions.device),
+    ):
+        raise ValueError("Active local trajectories must form a contiguous prefix")
+    counts = tuple(int(value) for value in distributed.all_gather_objects(local_real_count))
+    local_global_start = sum(counts[: distributed.rank])
+    global_trajectory_count = sum(counts)
+    if global_trajectory_count <= 0:
+        raise ValueError("OPD train step received no active global trajectories")
+    ppo_size = _ppo_mini_batch_size(training, global_trajectory_count)
+    ppo_count = _ppo_minibatch_count(global_trajectory_count, ppo_size)
+    offset = int(ppo_minibatch_offset)
+    if not 0 <= offset < ppo_count:
+        raise ValueError(
+            f"ppo_minibatch_offset={offset} is invalid for {ppo_count} mini-batches"
+        )
+    remaining_limit = ppo_count - offset
+    if max_optimizer_steps is not None:
+        remaining_limit = min(remaining_limit, max(0, int(max_optimizer_steps)))
+    if remaining_limit <= 0:
+        raise ValueError("No PPO mini-batch remains for this optimizer call")
     model.train()
     unwrap_model(model).config.use_cache = False
-    forward_seconds = backward_seconds = optimizer_seconds = loss_value = 0.0
-    base_loss_sum = 0.0
-    local_clipped_candidates = local_candidate_count = 0
-    local_ratio_sum = 0.0
-    local_ratio_min = float("inf")
-    local_ratio_max = float("-inf")
     response_lengths = rollout.valid_mask.long().sum(dim=-1)
-    order = torch.arange(local_batch_size, device=rollout.input_ids.device)
-    if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
-        order = torch.argsort(response_lengths, descending=True, stable=True)
-    micro_batches = list(order.split(micro_batch))
-    for chunk_index, indices in enumerate(micro_batches):
-        synchronize = chunk_index == len(micro_batches) - 1
-        fsdp_no_sync = bool(
-            config.get("distributed", {}).get("fsdp", {}).get("use_no_sync", False)
+    fsdp_no_sync = bool(
+        config.get("distributed", {}).get("fsdp", {}).get("use_no_sync", False)
+    )
+    may_skip_sync = isinstance(model, DistributedDataParallel) or (
+        is_fsdp_model(model) and fsdp_no_sync
+    )
+    minibatch_metrics: list[dict[str, float]] = []
+    for ppo_index in range(offset, min(ppo_count, offset + remaining_limit)):
+        global_begin = ppo_index * ppo_size
+        global_end = min(global_begin + ppo_size, global_trajectory_count)
+        local_begin = max(global_begin, local_global_start)
+        local_end = min(global_end, local_global_start + local_real_count)
+        local_indices = list(
+            range(
+                max(0, local_begin - local_global_start),
+                max(0, local_end - local_global_start),
+            )
         )
-        may_skip_sync = isinstance(model, DistributedDataParallel) or (
-            is_fsdp_model(model) and fsdp_no_sync
+        padded_count = distributed.max_int(len(local_indices))
+        filler = (
+            int(response_lengths.argmin().item()) if local_batch_size else 0
         )
-        sync_context = (
-            model.no_sync() if not synchronize and may_skip_sync else nullcontext()
+        row_active = [True] * len(local_indices)
+        while len(local_indices) < padded_count:
+            local_indices.append(filler)
+            row_active.append(False)
+        indices = torch.tensor(
+            local_indices, dtype=torch.long, device=rollout.input_ids.device
         )
-        with sync_context:
-            cuda_sync(device)
-            started = time.perf_counter()
-            local_width = int(response_lengths.index_select(0, indices).max().item())
-            start = rollout.prompt_width - 1
-            input_stop = start + local_width
-            input_ids = rollout.input_ids.index_select(0, indices)[:, :input_stop]
-            attention_mask = rollout.attention_mask.index_select(0, indices)[
-                :, :input_stop
-            ]
-            forward_kwargs = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids_from_mask(attention_mask),
-                "use_cache": False,
-                "return_dict": True,
-            }
-            response_only_logits = supports_response_only_logits(model)
-            if response_only_logits:
-                forward_kwargs["logits_to_keep"] = local_width
-            output = model(**forward_kwargs)
-            logits = (
-                output.logits[:, -local_width:]
-                if response_only_logits
-                else output.logits[:, start : start + local_width]
+        active_rows = torch.tensor(
+            row_active, dtype=torch.bool, device=rollout.input_ids.device
+        )
+        if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
+            lengths = response_lengths.index_select(0, indices)
+            sort_values = torch.where(active_rows, lengths, -torch.ones_like(lengths))
+            order = torch.argsort(sort_values, descending=True, stable=True)
+            indices = indices.index_select(0, order)
+            active_rows = active_rows.index_select(0, order)
+        micro_indices = list(indices.split(micro_batch))
+        micro_active = list(active_rows.split(micro_batch))
+        ppo_valid = objective_valid.index_select(0, indices) & active_rows.unsqueeze(1)
+        ppo_weights = position_weights.index_select(0, indices)
+        local_weight_mass = float(
+            ppo_weights[ppo_valid].detach().float().sum().item()
+        )
+        global_weight_mass = distributed.sum_float(local_weight_mass)
+        optimizer.zero_grad(set_to_none=True)
+        forward_seconds = backward_seconds = loss_value = 0.0
+        base_loss_sum = 0.0
+        local_clipped_candidates = local_candidate_count = 0
+        local_ratio_sum = 0.0
+        local_ratio_min = float("inf")
+        local_ratio_max = float("-inf")
+        for chunk_index, (chunk_indices, chunk_active) in enumerate(
+            zip(micro_indices, micro_active)
+        ):
+            synchronize = chunk_index == len(micro_indices) - 1
+            sync_context = (
+                model.no_sync()
+                if not synchronize and may_skip_sync
+                else nullcontext()
             )
-            candidate_ids = opd_reference.candidate_ids.index_select(0, indices)[
-                :, :local_width
-            ]
-            current = gather_candidate_log_probs(
-                logits,
-                candidate_ids,
-                temperature=float(config["rollout"].get("temperature", 1.0)),
-                chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
-            )
-            chunk_reference = TopKOPDReference(
-                candidate_ids=candidate_ids,
-                old_student_log_probs=opd_reference.old_student_log_probs.index_select(
-                    0, indices
-                )[:, :local_width],
-                teacher_log_probs=opd_reference.teacher_log_probs.index_select(
-                    0, indices
-                )[:, :local_width],
-                student_weights=opd_reference.student_weights.index_select(0, indices)[
-                    :, :local_width
-                ],
-                advantages=opd_reference.advantages.index_select(0, indices)[
-                    :, :local_width
-                ],
-            )
-            per_position_loss = topk_candidate_ppo_loss(
-                current,
-                chunk_reference,
-                clip_low=eps_low,
-                clip_high=eps_high,
-                dual_clip=dual_clip,
-            )
-            valid_chunk = objective_valid.index_select(0, indices)[:, :local_width]
-            chunk_weights = position_weights.index_select(0, indices)[:, :local_width]
-            local_numerator, _ = weighted_token_sums(
-                per_position_loss,
-                chunk_weights,
-                valid_chunk,
-            )
-            base_loss_sum += float(
-                per_position_loss.detach()[valid_chunk].float().sum().item()
-            )
-            with torch.no_grad():
-                ratio = torch.exp(
-                    (current.detach() - chunk_reference.old_student_log_probs).clamp(
-                        min=-20.0, max=20.0
-                    )
+            with sync_context:
+                cuda_sync(device)
+                started = time.perf_counter()
+                local_width = int(
+                    response_lengths.index_select(0, chunk_indices).max().item()
                 )
-                candidate_valid = valid_chunk.unsqueeze(-1).expand_as(ratio)
-                clipped = ratio.lt(1.0 - eps_low) | ratio.gt(1.0 + eps_high)
-                local_clipped_candidates += int((clipped & candidate_valid).sum())
-                ratio_values = ratio[candidate_valid]
-                local_candidate_count += ratio_values.numel()
-                if ratio_values.numel():
-                    local_ratio_sum += float(ratio_values.sum().item())
-                    local_ratio_min = min(
-                        local_ratio_min, float(ratio_values.min().item())
+                start = rollout.prompt_width - 1
+                input_stop = start + local_width
+                input_ids = rollout.input_ids.index_select(0, chunk_indices)[
+                    :, :input_stop
+                ]
+                attention_mask = rollout.attention_mask.index_select(
+                    0, chunk_indices
+                )[:, :input_stop]
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids_from_mask(attention_mask),
+                    "use_cache": False,
+                    "return_dict": True,
+                }
+                response_only_logits = supports_response_only_logits(model)
+                if response_only_logits:
+                    forward_kwargs["logits_to_keep"] = local_width
+                output = model(**forward_kwargs)
+                logits = (
+                    output.logits[:, -local_width:]
+                    if response_only_logits
+                    else output.logits[:, start : start + local_width]
+                )
+                candidate_ids = opd_reference.candidate_ids.index_select(
+                    0, chunk_indices
+                )[:, :local_width]
+                current = gather_candidate_log_probs(
+                    logits,
+                    candidate_ids,
+                    temperature=float(config["rollout"].get("temperature", 1.0)),
+                    chunk_steps=int(
+                        config["selector"].get("score_chunk_steps", 128)
+                    ),
+                )
+                chunk_reference = TopKOPDReference(
+                    candidate_ids=candidate_ids,
+                    old_student_log_probs=(
+                        opd_reference.old_student_log_probs.index_select(
+                            0, chunk_indices
+                        )[:, :local_width]
+                    ),
+                    teacher_log_probs=opd_reference.teacher_log_probs.index_select(
+                        0, chunk_indices
+                    )[:, :local_width],
+                    student_weights=opd_reference.student_weights.index_select(
+                        0, chunk_indices
+                    )[:, :local_width],
+                    advantages=opd_reference.advantages.index_select(
+                        0, chunk_indices
+                    )[:, :local_width],
+                )
+                per_position_loss = topk_candidate_ppo_loss(
+                    current,
+                    chunk_reference,
+                    clip_low=eps_low,
+                    clip_high=eps_high,
+                    dual_clip=dual_clip,
+                )
+                valid_chunk = (
+                    objective_valid.index_select(0, chunk_indices)[:, :local_width]
+                    & chunk_active.unsqueeze(1)
+                )
+                chunk_weights = position_weights.index_select(
+                    0, chunk_indices
+                )[:, :local_width]
+                local_numerator, _ = weighted_token_sums(
+                    per_position_loss, chunk_weights, valid_chunk
+                )
+                base_loss_sum += float(
+                    per_position_loss.detach()[valid_chunk].float().sum().item()
+                )
+                with torch.no_grad():
+                    ratio = torch.exp(
+                        (
+                            current.detach()
+                            - chunk_reference.old_student_log_probs
+                        ).clamp(min=-20.0, max=20.0)
                     )
-                    local_ratio_max = max(
-                        local_ratio_max, float(ratio_values.max().item())
+                    candidate_valid = valid_chunk.unsqueeze(-1).expand_as(ratio)
+                    clipped = ratio.lt(1.0 - eps_low) | ratio.gt(1.0 + eps_high)
+                    local_clipped_candidates += int(
+                        (clipped & candidate_valid).sum().item()
                     )
-            # DDP and FSDP data-parallel reductions average synchronized rank
-            # gradients. The world-size factor therefore yields exactly:
-            # global sum(w_t*l_t) / global sum(w_t), including accumulation.
-            loss = local_numerator * (
-                distributed.world_size / float(global_weight_mass)
-            )
-            cuda_sync(device)
-            forward_seconds += time.perf_counter() - started
-            finite_or_raise("OPD loss", loss.detach().reshape(1))
-            cuda_sync(device)
-            started = time.perf_counter()
-            loss.backward()
-            cuda_sync(device)
-            backward_seconds += time.perf_counter() - started
-            loss_value += float(loss.detach().item())
-            del (
-                output,
-                logits,
-                current,
-                per_position_loss,
-                local_numerator,
-                loss,
-                input_ids,
-                attention_mask,
-                forward_kwargs,
-                candidate_ids,
-                chunk_weights,
-            )
-    gradient_norm = clip_grad_norm(
-        model,
-        float(training.get("max_grad_norm", 1.0)),
+                    ratio_values = ratio[candidate_valid]
+                    local_candidate_count += ratio_values.numel()
+                    if ratio_values.numel():
+                        local_ratio_sum += float(ratio_values.sum().item())
+                        local_ratio_min = min(
+                            local_ratio_min, float(ratio_values.min().item())
+                        )
+                        local_ratio_max = max(
+                            local_ratio_max, float(ratio_values.max().item())
+                        )
+                # Synchronized DDP/FSDP gradients are rank-averaged. This
+                # factor therefore yields the exact global weighted-token mean
+                # for this PPO mini-batch, independent of micro-batch splitting.
+                normalizer = (
+                    distributed.world_size / global_weight_mass
+                    if global_weight_mass > 0.0
+                    else 0.0
+                )
+                loss = local_numerator * normalizer
+                cuda_sync(device)
+                forward_seconds += time.perf_counter() - started
+                finite_or_raise("OPD loss", loss.detach().reshape(1))
+                cuda_sync(device)
+                started = time.perf_counter()
+                loss.backward()
+                cuda_sync(device)
+                backward_seconds += time.perf_counter() - started
+                loss_value += float(loss.detach().item())
+                del (
+                    output,
+                    logits,
+                    current,
+                    per_position_loss,
+                    local_numerator,
+                    loss,
+                    input_ids,
+                    attention_mask,
+                    forward_kwargs,
+                    candidate_ids,
+                    chunk_weights,
+                )
+        gradient_norm = clip_grad_norm(
+            model, float(training.get("max_grad_norm", 1.0))
+        )
+        cuda_sync(device)
+        started = time.perf_counter()
+        optimizer.step()
+        cuda_sync(device)
+        optimizer_seconds = time.perf_counter() - started
+        optimizer.zero_grad(set_to_none=True)
+        global_loss = distributed.sum_float(loss_value) / distributed.world_size
+        global_base_loss_sum = distributed.sum_float(base_loss_sum)
+        global_valid_tokens = distributed.sum_int(int(ppo_valid.sum().item()))
+        global_clipped_candidates = distributed.sum_int(local_clipped_candidates)
+        global_candidate_count = distributed.sum_int(local_candidate_count)
+        global_ratio_mean = distributed.sum_float(local_ratio_sum) / max(
+            global_candidate_count, 1
+        )
+        global_ratio_min = (
+            -distributed.max_float(-local_ratio_min)
+            if global_candidate_count
+            else 1.0
+        )
+        global_ratio_max = (
+            distributed.max_float(local_ratio_max) if global_candidate_count else 1.0
+        )
+        metric = {
+            "loss": global_loss,
+            "weighted_final_loss": global_loss,
+            "base_topk_opd_loss": global_base_loss_sum
+            / max(global_valid_tokens, 1),
+            "unweighted_opd_loss": global_base_loss_sum
+            / max(global_valid_tokens, 1),
+            "gradient_norm": float(gradient_norm.detach().item()),
+            "training_forward_time": forward_seconds,
+            "backward_time": backward_seconds,
+            "optimizer_time": optimizer_seconds,
+            "global_weight_mass": global_weight_mass,
+            "clip_fraction": global_clipped_candidates
+            / max(global_candidate_count, 1),
+            "ratio_mean": global_ratio_mean,
+            "ratio_min": global_ratio_min,
+            "ratio_max": global_ratio_max,
+            "ppo_minibatch_index": float(ppo_index),
+            "ppo_minibatch_trajectory_count": float(global_end - global_begin),
+        }
+        minibatch_metrics.append(metric)
+        global_optimizer_step = optimizer_step_start + len(minibatch_metrics)
+        if on_optimizer_step is not None:
+            on_optimizer_step(global_optimizer_step, metric)
+    total_weight = sum(item["global_weight_mass"] for item in minibatch_metrics)
+    if total_weight > 0:
+        aggregate_loss = sum(
+            item["loss"] * item["global_weight_mass"] for item in minibatch_metrics
+        ) / total_weight
+    else:
+        aggregate_loss = sum(item["loss"] for item in minibatch_metrics) / len(
+            minibatch_metrics
+        )
+    result = dict(minibatch_metrics[-1])
+    result.update(
+        loss=aggregate_loss,
+        weighted_final_loss=aggregate_loss,
+        training_forward_time=sum(
+            item["training_forward_time"] for item in minibatch_metrics
+        ),
+        backward_time=sum(item["backward_time"] for item in minibatch_metrics),
+        optimizer_time=sum(item["optimizer_time"] for item in minibatch_metrics),
+        global_weight_mass=total_weight,
+        optimizer_steps=len(minibatch_metrics),
+        minibatches=minibatch_metrics,
     )
-    cuda_sync(device)
-    started = time.perf_counter()
-    optimizer.step()
-    cuda_sync(device)
-    optimizer_seconds = time.perf_counter() - started
-    optimizer.zero_grad(set_to_none=True)
-    global_loss = distributed.sum_float(loss_value) / distributed.world_size
-    global_base_loss_sum = distributed.sum_float(base_loss_sum)
-    global_valid_tokens = distributed.sum_int(int(objective_valid.sum().item()))
-    global_clipped_candidates = distributed.sum_int(local_clipped_candidates)
-    global_candidate_count = distributed.sum_int(local_candidate_count)
-    global_ratio_mean = distributed.sum_float(local_ratio_sum) / max(
-        global_candidate_count, 1
-    )
-    global_ratio_min = -distributed.max_float(-local_ratio_min)
-    global_ratio_max = distributed.max_float(local_ratio_max)
-    return {
-        "loss": global_loss,
-        "weighted_final_loss": global_loss,
-        "base_topk_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
-        "unweighted_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
-        "gradient_norm": float(gradient_norm.detach().item()),
-        "training_forward_time": forward_seconds,
-        "backward_time": backward_seconds,
-        "optimizer_time": optimizer_seconds,
-        "global_weight_mass": global_weight_mass,
-        "clip_fraction": global_clipped_candidates / max(global_candidate_count, 1),
-        "ratio_mean": global_ratio_mean,
-        "ratio_min": global_ratio_min,
-        "ratio_max": global_ratio_max,
-    }
+    return result
 
 
 def _save_checkpoint(
@@ -1098,11 +1283,15 @@ def run_training(
     micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
         training, distributed.world_size
     )
+    ppo_mini_batch_size = _ppo_mini_batch_size(
+        training, global_prompt_batch_size * num_responses
+    )
     layout = batch_layout(
         global_prompt_batch_size,
         num_responses,
         distributed.world_size,
         micro_batch_size_per_gpu,
+        ppo_mini_batch_size,
     )
     configured_accumulation = training.get("grad_accum_steps", "auto")
     if configured_accumulation not in (None, "auto"):
@@ -1219,6 +1408,25 @@ def run_training(
     if not records:
         raise ValueError("Configured training dataset is empty")
     validate_prompt_records(records, config["data"])
+    original_record_count = len(records)
+    prompt_tokenizer = load_student_tokenizer(config)
+    records, prompt_filter_summary = filter_overlong_prompt_records(
+        records, prompt_tokenizer, config["data"]
+    )
+    del prompt_tokenizer
+    if distributed.is_main:
+        tqdm.write(f"Dataset examples: {prompt_filter_summary['original_count']}")
+        tqdm.write(f"Kept: {prompt_filter_summary['kept_count']}")
+        tqdm.write(
+            "Filtered over MAX_PROMPT_LEN="
+            f"{prompt_filter_summary['max_prompt_tokens']}: "
+            f"{prompt_filter_summary['filtered_overlong_count']} "
+            f"({prompt_filter_summary['filtered_overlong_percentage']:.2f}%)"
+        )
+        tqdm.write(
+            "Maximum observed rendered prompt length: "
+            f"{prompt_filter_summary['maximum_observed_prompt_length']} tokens"
+        )
     setup_progress.update(1)
     setup_progress.set_postfix_str(
         f"stage=start-rollout-{rollout_backend}", refresh=True
@@ -1308,6 +1516,8 @@ def run_training(
         )
         metadata["data_schema"] = {
             "rows": len(records),
+            "original_rows": original_record_count,
+            "prompt_filter": prompt_filter_summary,
             "columns": sorted(records[0]),
             "files": [str(path) for path in data_files],
             "split": config["data"].get("split"),
@@ -1398,12 +1608,15 @@ def run_training(
     batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:
         raise ValueError("Prompt batch size and rollout.num_responses must be positive")
-    steps_per_epoch = math.ceil(len(records) / batch_size)
+    rollout_batches_per_epoch = math.ceil(len(records) / batch_size)
+    optimizer_steps_per_epoch = _optimizer_steps_per_epoch(
+        len(records), batch_size, num_responses, ppo_mini_batch_size
+    )
     configured_max_steps = training.get("max_steps")
     max_steps = (
         int(configured_max_steps)
         if configured_max_steps is not None
-        else int(training.get("epochs", 1)) * steps_per_epoch
+        else int(training.get("epochs", 1)) * optimizer_steps_per_epoch
     )
     if resume_step >= max_steps:
         raise ValueError(
@@ -1479,7 +1692,7 @@ def run_training(
         distributed.barrier()
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
-        range(resume_step, max_steps),
+        total=max_steps,
         desc=f"{METHOD_DISPLAY_NAMES[method]} B200",
         unit="step",
         dynamic_ncols=True,
@@ -1487,14 +1700,34 @@ def run_training(
         disable=not distributed.is_main,
         mininterval=0.5,
         initial=resume_step,
-        total=max_steps,
     )
-    for step_index in progress:
-        step, step_started = step_index + 1, time.perf_counter()
+    optimizer_step = resume_step
+    rollout_index, ppo_minibatch_offset = _rollout_position_after_optimizer_steps(
+        optimizer_step,
+        len(records),
+        batch_size,
+        num_responses,
+        ppo_mini_batch_size,
+    )
+    while optimizer_step < max_steps:
+        step_started = time.perf_counter()
+        rollout_first_optimizer_step = optimizer_step + 1
         if distributed.is_main:
             progress.set_postfix_str(f"stage=rollout-{rollout_backend}", refresh=True)
         torch.cuda.reset_peak_memory_stats(device)
-        global_indices = epoch_batch_indices(len(records), batch_size, step_index, seed)
+        global_indices = epoch_batch_indices(
+            len(records), batch_size, rollout_index, seed
+        )
+        rollout_ppo_minibatches = _ppo_minibatch_count(
+            len(global_indices) * num_responses, ppo_mini_batch_size
+        )
+        optimizer_steps_this_rollout = min(
+            rollout_ppo_minibatches - ppo_minibatch_offset,
+            max_steps - optimizer_step,
+        )
+        rollout_last_optimizer_step = (
+            optimizer_step + optimizer_steps_this_rollout
+        )
         local_start, _ = contiguous_partition(
             len(global_indices), distributed.rank, distributed.world_size
         )
@@ -1534,7 +1767,8 @@ def run_training(
             # Repeated prompts are separate requests with globally unique,
             # deterministic seeds, so all n trajectories are independent.
             sample_seed_offset=(
-                step_index * batch_size * num_responses + local_start * num_responses
+                rollout_index * batch_size * num_responses
+                + local_start * num_responses
             ),
         )
         rollout_backend_metrics = (
@@ -1658,8 +1892,8 @@ def run_training(
             float(overlap_values.sum().item())
         ) / max(global_overlap_count, 1)
         local_divergence = -opd_reference.advantages.sum(dim=-1)[valid]
-        kl_stats = _global_tensor_stats(local_divergence, distributed)
-        student_teacher_topk_divergence = kl_stats["mean"]
+        divergence_proxy_stats = _global_tensor_stats(local_divergence, distributed)
+        student_teacher_topk_divergence_proxy = divergence_proxy_stats["mean"]
         student_entropy_stats = _global_tensor_stats(
             student_scores.entropies[valid], distributed
         )
@@ -1862,7 +2096,9 @@ def run_training(
         if not torch.equal(original_rollout, rollout.input_ids):
             raise AssertionError("Selector changed the original rollout")
         token_score_stats_path = (
-            score_stats_logger.write(step, max_steps, global_primary_diagnostics)
+            score_stats_logger.write(
+                rollout_last_optimizer_step, max_steps, global_primary_diagnostics
+            )
             if distributed.is_main
             else None
         )
@@ -1874,7 +2110,7 @@ def run_training(
         ]
         logged_selected = (
             token_logger.write(
-                step=step,
+                step=rollout_last_optimizer_step,
                 dataset_indices=indices,
                 sample_ids=sample_ids,
                 response_ids=rollout.response_ids,
@@ -1903,6 +2139,59 @@ def run_training(
             torch.cuda.empty_cache()
         if distributed.is_main:
             progress.set_postfix_str("stage=train", refresh=True)
+        checkpoints_by_step: dict[int, Path] = {}
+        evaluation_sources: dict[int, tuple[Path, bool]] = {}
+        save_checkpoints = bool(training.get("save_checkpoints", True))
+        save_interval = int(training.get("save_interval", 100))
+
+        def after_optimizer_step(
+            current_step: int, _metrics: dict[str, float]
+        ) -> None:
+            should_evaluate = should_run_training_evaluation(
+                current_step, max_steps, training_eval_settings
+            )
+            should_save = save_checkpoints and (
+                current_step == max_steps
+                or (save_interval > 0 and current_step % save_interval == 0)
+            )
+            checkpoint_path = None
+            if should_save:
+                if distributed.is_main:
+                    progress.set_postfix_str("stage=checkpoint", refresh=True)
+                checkpoint_path = _save_checkpoint(
+                    training_student,
+                    tokenizer,
+                    optimizer,
+                    output_dir,
+                    current_step,
+                    current_step == max_steps,
+                    bool(training.get("save_optimizer", True)),
+                    distributed,
+                )
+                checkpoints_by_step[current_step] = checkpoint_path
+            if should_evaluate:
+                evaluation_path = checkpoint_path
+                temporary = False
+                if evaluation_path is None:
+                    evaluation_path = (
+                        output_dir
+                        / ".evaluation_snapshots"
+                        / f"step-{current_step:06d}"
+                    )
+                    if distributed.is_main and evaluation_path.exists():
+                        shutil.rmtree(evaluation_path)
+                    distributed.barrier()
+                    _save_inference_snapshot(
+                        training_student,
+                        tokenizer,
+                        evaluation_path,
+                        distributed,
+                    )
+                    temporary = True
+                evaluation_sources[current_step] = (evaluation_path, temporary)
+            if distributed.is_main:
+                progress.update(1)
+
         train_metrics = _opd_train_step(
             training_student,
             optimizer,
@@ -1913,26 +2202,16 @@ def run_training(
             device,
             distributed,
             objective_valid_mask=objective_valid,
+            trajectory_active_mask=active_trajectories,
+            ppo_minibatch_offset=ppo_minibatch_offset,
+            max_optimizer_steps=max_steps - optimizer_step,
+            optimizer_step_start=optimizer_step,
+            on_optimizer_step=after_optimizer_step,
         )
-        checkpoint = None
-        save_checkpoints = bool(training.get("save_checkpoints", True))
-        save_interval = int(training.get("save_interval", 100))
-        should_save_checkpoint = save_checkpoints and (
-            step == max_steps or (save_interval > 0 and step % save_interval == 0)
-        )
-        if should_save_checkpoint:
-            if distributed.is_main:
-                progress.set_postfix_str("stage=checkpoint", refresh=True)
-            checkpoint = _save_checkpoint(
-                training_student,
-                tokenizer,
-                optimizer,
-                output_dir,
-                step,
-                step == max_steps,
-                bool(training.get("save_optimizer", True)),
-                distributed,
-            )
+        optimizer_steps_completed = int(train_metrics["optimizer_steps"])
+        optimizer_step += optimizer_steps_completed
+        step = optimizer_step
+        checkpoint = checkpoints_by_step.get(step)
         cuda_sync(device)
         local_wall_time = time.perf_counter() - step_started
         local_valid_tokens = int(valid.sum().item())
@@ -2002,8 +2281,11 @@ def run_training(
         }
         final_metrics = {
             "step": step,
-            "epoch": step_index // steps_per_epoch,
-            "step_in_epoch": step_index % steps_per_epoch,
+            "epoch": rollout_index // rollout_batches_per_epoch,
+            "step_in_epoch": rollout_index % rollout_batches_per_epoch,
+            "rollout_batch_index": rollout_index,
+            "rollout_first_optimizer_step": rollout_first_optimizer_step,
+            "rollout_last_optimizer_step": step,
             "method": method,
             "resumed_from": (
                 str(resume_state.checkpoint) if resume_state is not None else None
@@ -2026,6 +2308,8 @@ def run_training(
             )
             * num_responses,
             "configured_batch_size": batch_size,
+            "ppo_mini_batch_size": ppo_mini_batch_size,
+            "ppo_minibatches_in_rollout": optimizer_steps_completed,
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
             "distributed_strategy": strategy,
@@ -2129,15 +2413,17 @@ def run_training(
             "response_clip_ratio": clipped_responses / max(trajectory_count, 1),
             "eos_fraction": eos_responses / max(trajectory_count, 1),
             "student_teacher_topk_overlap_ratio": student_teacher_topk_overlap,
-            "student_teacher_topk_divergence": student_teacher_topk_divergence,
+            "student_teacher_topk_divergence_proxy": (
+                student_teacher_topk_divergence_proxy
+            ),
             "student_entropy": student_entropy_stats["mean"],
             "teacher_entropy": teacher_entropy_stats["mean"],
             "entropy_gap": entropy_gap_stats["mean"],
             "topk_student_mass": student_topk_mass_stats["mean"],
             "topk_teacher_mass": teacher_topk_mass_stats["mean"],
-            "topk_kl_mean": kl_stats["mean"],
-            "topk_kl_min": kl_stats["min"],
-            "topk_kl_max": kl_stats["max"],
+            "topk_divergence_proxy_mean": divergence_proxy_stats["mean"],
+            "topk_divergence_proxy_min": divergence_proxy_stats["min"],
+            "topk_divergence_proxy_max": divergence_proxy_stats["max"],
             "peak_gpu_allocated_bytes": peak_allocated,
             "peak_gpu_reserved_bytes": peak_reserved,
             "peak_gpu_allocated_gb": peak_allocated / 2**30,
@@ -2179,53 +2465,103 @@ def run_training(
             active_trajectories,
             rollout_backend_metrics,
         )
-        if should_run_training_evaluation(step, max_steps, training_eval_settings):
-            evaluation_checkpoint = checkpoint
-            temporary_eval_snapshot = None
-            if strategy == "fsdp" and evaluation_checkpoint is None:
-                temporary_eval_snapshot = (
-                    output_dir / ".evaluation_snapshots" / f"step-{step:06d}"
-                )
-                if distributed.is_main and temporary_eval_snapshot.exists():
-                    shutil.rmtree(temporary_eval_snapshot)
-                distributed.barrier()
-                _save_inference_snapshot(
-                    training_student,
-                    tokenizer,
-                    temporary_eval_snapshot,
-                    distributed,
-                )
-                evaluation_checkpoint = temporary_eval_snapshot
+        periodic_evaluations: dict[int, dict[str, Any]] = {}
+        for evaluation_step, (evaluation_checkpoint, temporary) in sorted(
+            evaluation_sources.items()
+        ):
             distributed.barrier()
             if distributed.is_main:
                 progress.set_postfix_str("stage=evaluation", refresh=True)
-                periodic_evaluation = _run_training_evaluation(
+                periodic_evaluations[evaluation_step] = _run_training_evaluation(
                     training_student,
                     tokenizer,
                     method,
-                    step,
+                    evaluation_step,
                     max_steps,
                     config,
                     output_dir,
                     resolved_config_path,
                     checkpoint=evaluation_checkpoint,
                 )
-                final_metrics["periodic_evaluation"] = {
-                    "evaluation_time": periodic_evaluation["evaluation_time"],
-                    "benchmarks": periodic_evaluation["benchmarks"],
-                    "details": periodic_evaluation["details"],
+            distributed.barrier()
+            if distributed.is_main and temporary:
+                shutil.rmtree(evaluation_checkpoint)
+            distributed.barrier()
+
+        training_events: list[dict[str, Any]] = []
+        for event_offset, minibatch_metric in enumerate(train_metrics["minibatches"]):
+            event_step = rollout_first_optimizer_step + event_offset
+            event = copy.deepcopy(final_metrics)
+            event.update(
+                {
+                    "step": event_step,
+                    "train_loss": minibatch_metric["loss"],
+                    "loss": minibatch_metric["loss"],
+                    "weighted_final_loss": minibatch_metric["weighted_final_loss"],
+                    "base_topk_opd_loss": minibatch_metric["base_topk_opd_loss"],
+                    "unweighted_opd_loss": minibatch_metric[
+                        "unweighted_opd_loss"
+                    ],
+                    "gradient_norm": distributed.max_float(
+                        minibatch_metric["gradient_norm"]
+                    ),
+                    "grad_norm": distributed.max_float(
+                        minibatch_metric["gradient_norm"]
+                    ),
+                    "training_forward_time": distributed.max_float(
+                        minibatch_metric["training_forward_time"]
+                    ),
+                    "backward_time": distributed.max_float(
+                        minibatch_metric["backward_time"]
+                    ),
+                    "optimizer_time": distributed.max_float(
+                        minibatch_metric["optimizer_time"]
+                    ),
+                    "global_weight_mass": minibatch_metric["global_weight_mass"],
+                    "opd_clip_fraction": minibatch_metric["clip_fraction"],
+                    "opd_ratio_mean": minibatch_metric["ratio_mean"],
+                    "opd_ratio_min": minibatch_metric["ratio_min"],
+                    "opd_ratio_max": minibatch_metric["ratio_max"],
+                    "ppo_minibatch_index": int(
+                        minibatch_metric["ppo_minibatch_index"]
+                    ),
+                    "ppo_minibatch_trajectory_count": int(
+                        minibatch_metric["ppo_minibatch_trajectory_count"]
+                    ),
+                    "forward_backward_time_sec": distributed.max_float(
+                        minibatch_metric["training_forward_time"]
+                        + minibatch_metric["backward_time"]
+                    ),
+                    "optimizer_time_sec": distributed.max_float(
+                        minibatch_metric["optimizer_time"]
+                    ),
+                    "checkpoint": (
+                        str(checkpoints_by_step[event_step])
+                        if event_step in checkpoints_by_step
+                        else None
+                    ),
                 }
-                final_metrics["wall_clock_step_plus_eval_time"] = (
-                    wall_time + periodic_evaluation["evaluation_time"]
+            )
+            if event_step in periodic_evaluations:
+                periodic = periodic_evaluations[event_step]
+                event["periodic_evaluation"] = {
+                    "evaluation_time": periodic["evaluation_time"],
+                    "benchmarks": periodic["benchmarks"],
+                    "details": periodic["details"],
+                }
+                event["wall_clock_step_plus_eval_time"] = (
+                    wall_time + periodic["evaluation_time"]
                 )
-            distributed.barrier()
-            if distributed.is_main and temporary_eval_snapshot is not None:
-                shutil.rmtree(temporary_eval_snapshot)
-            distributed.barrier()
+            else:
+                event.pop("periodic_evaluation", None)
+                event.pop("wall_clock_step_plus_eval_time", None)
+            training_events.append(event)
+        final_metrics = training_events[-1]
         if distributed.is_main:
-            _append_jsonl(metrics_path, final_metrics)
-            _append_train_metrics_csv(output_dir / "train_metrics.csv", final_metrics)
-            tensorboard_logger.write(step, final_metrics, method)
+            for event in training_events:
+                _append_jsonl(metrics_path, event)
+                _append_train_metrics_csv(output_dir / "train_metrics.csv", event)
+                tensorboard_logger.write(event["step"], event, method)
             progress.set_postfix(
                 loss=f"{train_metrics['loss']:.4f}",
                 selected=f"{expected}/{valid_tokens}",
@@ -2237,6 +2573,10 @@ def run_training(
             tqdm.write(
                 json.dumps(final_metrics, indent=2, ensure_ascii=False, allow_nan=True)
             )
+        ppo_minibatch_offset += optimizer_steps_completed
+        if ppo_minibatch_offset >= rollout_ppo_minibatches:
+            rollout_index += 1
+            ppo_minibatch_offset = 0
     tensorboard_logger.close()
     if rollout_engine is not None:
         rollout_engine.close()
@@ -2247,7 +2587,11 @@ def run_training(
         "steps": max_steps,
         "epochs": training.get("epochs"),
         "dataset_rows": len(records),
+        "original_dataset_rows": original_record_count,
+        "prompt_filter": prompt_filter_summary,
         "full_dataset": True,
+        "ppo_mini_batch_size": ppo_mini_batch_size,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "rollout_backend": rollout_backend,
         "resumed_from": (
             str(resume_state.checkpoint) if resume_state is not None else None

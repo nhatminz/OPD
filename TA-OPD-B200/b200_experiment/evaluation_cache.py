@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .evaluation import _resolve_benchmark_file
+from .math_prompts import EVAL_PROMPT_PROTOCOL_VERSION
 
 
-BASE_EVALUATION_CACHE_SCHEMA = 1
+BASE_EVALUATION_CACHE_SCHEMA = 2
 
 
 def _sha256_file(path: Path) -> str:
@@ -47,9 +48,16 @@ def base_evaluation_cache_key(
     config: dict[str, Any],
     runtime_settings: dict[str, Any],
     model_path: str | Path,
+    *,
+    math_prompts_path: str | Path | None = None,
 ) -> str:
-    """Return a method-independent key for an untouched-base evaluation."""
+    """Return a stable, protocol-complete untouched-base evaluation key."""
     model_path = Path(model_path).expanduser().resolve()
+    prompt_source = (
+        Path(math_prompts_path).expanduser().resolve()
+        if math_prompts_path is not None
+        else Path(__file__).resolve().with_name("math_prompts.py")
+    )
     benchmark_names = tuple(runtime_settings.get("benchmark_names", ()))
     benchmark_signatures = []
     for name in benchmark_names:
@@ -69,16 +77,33 @@ def base_evaluation_cache_key(
         vllm_version = importlib.metadata.version("vllm")
     except importlib.metadata.PackageNotFoundError:
         vllm_version = "unavailable"
+    model_signature = _model_signature(model_path)
     payload = {
         "schema": BASE_EVALUATION_CACHE_SCHEMA,
+        "evaluation_prompt_protocol_version": EVAL_PROMPT_PROTOCOL_VERSION,
+        "math_prompts_sha256": _sha256_file(prompt_source),
         "evaluator_sha256": _sha256_file(
             Path(__file__).resolve().with_name("vllm_evaluation.py")
         ),
         "vllm_version": vllm_version,
+        "model_identifier": str(model_path),
         "model_path": str(model_path),
-        "model_signature": _model_signature(model_path),
+        # Includes tokenizer/config/chat-template files by content hash. Large
+        # immutable weight shards use their stable path/size/mtime signature.
+        "tokenizer_and_model_signature": model_signature,
         "model_dtype": config.get("models", {}).get("dtype"),
+        "enable_thinking": config.get("data", {})
+        .get("chat_template_kwargs", {})
+        .get("enable_thinking"),
         "chat_template_kwargs": config.get("data", {}).get("chat_template_kwargs", {}),
+        "sampling": {
+            "temperature": runtime_settings.get("temperature"),
+            "top_p": runtime_settings.get("top_p"),
+            "num_responses": runtime_settings.get("num_responses"),
+            "max_new_tokens": runtime_settings.get("max_new_tokens"),
+        },
+        # Keep the complete resolved evaluator settings as well as the explicit
+        # sampling subset so any output-relevant vLLM option invalidates reuse.
         "runtime_settings": runtime_settings,
         "benchmarks": benchmark_signatures,
     }
@@ -236,6 +261,19 @@ def _publish_cache(
     os.replace(manifest_temporary, cache_entry / "cache_manifest.json")
 
 
+def _write_cache_manifest(directory: Path, cache_key: str) -> None:
+    temporary = directory / f".cache-manifest.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(
+        json.dumps(
+            {"schema": BASE_EVALUATION_CACHE_SCHEMA, "cache_key": cache_key},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, directory / "cache_manifest.json")
+
+
 def evaluate_or_reuse_base(
     *,
     config: dict[str, Any],
@@ -259,7 +297,10 @@ def evaluate_or_reuse_base(
     with _cache_lock(cache_root, cache_key):
         if reuse_destination:
             local = load_compatible_evaluation(
-                destination, model_path, runtime_settings
+                destination,
+                model_path,
+                runtime_settings,
+                expected_cache_key=cache_key,
             )
             if local is not None:
                 if (
@@ -281,10 +322,11 @@ def evaluate_or_reuse_base(
             expected_cache_key=cache_key,
         )
         if cached is not None:
-            return (
-                materialize_evaluation(cache_entry, destination, model_name=model_name),
-                "shared",
+            suite = materialize_evaluation(
+                cache_entry, destination, model_name=model_name
             )
+            _write_cache_manifest(destination, cache_key)
+            return suite, "shared"
 
         suite = evaluator()
         verified = load_compatible_evaluation(destination, model_path, runtime_settings)
@@ -293,4 +335,5 @@ def evaluate_or_reuse_base(
                 "Base evaluator completed without a compatible summary/prediction set"
             )
         _publish_cache(destination, cache_entry, cache_key, model_name)
+        _write_cache_manifest(destination, cache_key)
         return suite, "generated"

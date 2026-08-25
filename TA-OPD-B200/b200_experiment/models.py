@@ -194,3 +194,17 @@ def load_models(config: dict[str, Any], device: torch.device):
         teacher_parameters=sum(p.numel() for p in teacher.parameters()),
     )
     return student, teacher, tokenizer, assets
+
+
+def load_student_tokenizer(config: dict[str, Any]):
+    """Load the sole runtime tokenizer without materializing either model.
+
+    Training uses this lightweight path to validate the fully rendered prompt
+    lengths before starting vLLM or loading multi-billion-parameter models.
+    """
+    student_path = Path(config["models"]["student_path"]).resolve()
+    tokenizer = AutoTokenizer.from_pretrained(student_path, local_files_only=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer

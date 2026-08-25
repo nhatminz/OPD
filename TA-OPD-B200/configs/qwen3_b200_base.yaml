@@ -48,6 +48,8 @@ data:
   prompt_key: problem
   prefer_source_prompt: false
   max_prompt_tokens: 1024
+  # Fully rendered overlong prompts are excluded; they are never truncated.
+  overlong_prompt_policy: filter
   chat_template_kwargs:
     # Shared prompt IDs condition the teacher, so this is deliberately fixed
     # to Qwen3's hard no-think chat-template switch.
@@ -55,7 +57,7 @@ data:
 
 rollout:
   # Default training rollout uses a persistent, same-GPU vLLM server. Student
-  # weights are synchronized through CUDA IPC before every optimizer step.
+  # weights are synchronized through CUDA IPC before every rollout batch.
   backend: vllm
   # Global prompt batch. n=1 intentionally creates 64 independent trajectories.
   batch_size: 64
@@ -143,6 +145,9 @@ training:
   resume_allow_config_mismatch: false
   # Local trajectories per differentiable forward/backward on each GPU.
   micro_batch_size_per_gpu: 8
+  # Global trajectories per optimizer update. Each rollout batch is split into
+  # these PPO mini-batches, then each mini-batch is split into local micros.
+  ppo_mini_batch_size: 16
   # Group similar response lengths to reduce padding
   # in the differentiable forward/backward pass.
   length_bucketed_micro_batches: true

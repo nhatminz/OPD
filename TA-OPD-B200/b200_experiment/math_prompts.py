@@ -6,6 +6,7 @@ from typing import Any
 MATH_USER_INSTRUCTION = (
     r"Let's think step by step and output the final answer within \boxed{}."
 )
+EVAL_PROMPT_PROTOCOL_VERSION = "verl_eopd_math_v1"
 
 
 def _problem_text(value: Any) -> str:

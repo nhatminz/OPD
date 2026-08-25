@@ -2,6 +2,15 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ================= USER CONFIG: SHARED ASSETS =================
+# Environment overrides take precedence and are forwarded unchanged to every
+# child method, regardless of legacy variables inherited by this shell.
+export STUDENT_MODEL="${STUDENT_MODEL:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}"
+export TEACHER_MODEL="${TEACHER_MODEL:-models/Qwen3-8B}"
+export TRAIN_DATA="${TRAIN_DATA:-nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet}"
+export PROMPT_KEY="${PROMPT_KEY:-problem}"
+# ==============================================================
+
 # ================= BASIC PARAMETERS: EDIT HERE =================
 # Environment values supplied when launching the script still take precedence.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -15,6 +24,7 @@ export RUN_NAME="${RUN_NAME:-comparison_${RUN_TIMESTAMP}}"
 export GLOBAL_BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}"
 export BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 export NUM_RESPONSES="${NUM_RESPONSES:-1}"
+export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}}"
 export DDP_BUCKET_CAP_MB="${DDP_BUCKET_CAP_MB:-100}"
 # Set true only when you explicitly want smoke_test_b200.sh to search candidates.
@@ -23,6 +33,7 @@ export NUM_EPOCHS="${NUM_EPOCHS:-${EPOCHS:-1}}"
 export LR="${LR:-${LEARNING_RATE:-1.0e-6}}"
 export TA_RHO="${TA_RHO:-${RHO:-0.10}}"
 export MAX_PROMPT_LEN="${MAX_PROMPT_LENGTH:-${MAX_PROMPT_LEN:-1024}}"
+export OVERLONG_PROMPT_POLICY="${OVERLONG_PROMPT_POLICY:-filter}"
 export MAX_RESPONSE_LEN="${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-7168}}}"
 # Training rollout backend. vllm syncs the live student before every batch;
 # use hf only as a compatibility/debug fallback.
@@ -77,12 +88,18 @@ source "${SCRIPT_DIR}/common_b200.sh"
 
 resolve_run_paths
 RUN_NAME="${OPD_RUN_NAME}" OUTPUT_DIR="${OPD_RUN_OUTPUT}" \
+  STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
+  TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
   RESUME_FROM_CHECKPOINT="${OPD_RESUME_FROM_CHECKPOINT:-}" \
   bash "${SCRIPT_DIR}/train_opd_b200.sh"
 RUN_NAME="${TA_RUN_NAME}" OUTPUT_DIR="${TA_RUN_OUTPUT}" \
+  STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
+  TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
   RESUME_FROM_CHECKPOINT="${TA_RESUME_FROM_CHECKPOINT:-}" \
   bash "${SCRIPT_DIR}/train_ta_b200.sh"
 RUN_NAME="${RAC_RUN_NAME}" OUTPUT_DIR="${RAC_RUN_OUTPUT}" \
+  STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
+  TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
   RESUME_FROM_CHECKPOINT="${RAC_RESUME_FROM_CHECKPOINT:-}" \
   bash "${SCRIPT_DIR}/train_rac_b200.sh"
 echo "All three runs finished. Plot explicitly with:"

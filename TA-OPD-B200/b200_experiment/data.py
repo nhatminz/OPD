@@ -137,6 +137,75 @@ def validate_prompt_records(records, data_config: dict[str, Any]) -> None:
             raise type(error)(f"Training row {row_index}: {error}") from error
 
 
+def filter_overlong_prompt_records(
+    records: list[dict[str, Any]],
+    tokenizer,
+    data_config: dict[str, Any],
+    *,
+    tokenize_batch_size: int = 256,
+) -> tuple[list[dict[str, Any]], dict[str, int | float | str]]:
+    """Filter using the final rendered prompt length, never raw problem text.
+
+    The returned records retain their input order. ``error`` mode validates the
+    complete dataset before raising so the startup summary is actionable.
+    """
+    policy = str(data_config.get("overlong_prompt_policy", "filter")).lower()
+    if policy not in {"filter", "error"}:
+        raise ValueError(
+            "data.overlong_prompt_policy must be 'filter' or 'error', "
+            f"got {policy!r}"
+        )
+    maximum = int(data_config.get("max_prompt_tokens", 512))
+    if maximum <= 0:
+        raise ValueError("data.max_prompt_tokens must be positive")
+    chunk_size = max(1, int(tokenize_batch_size))
+    kept: list[dict[str, Any]] = []
+    overlong_rows: list[tuple[int, int]] = []
+    maximum_observed = 0
+    for begin in range(0, len(records), chunk_size):
+        chunk = records[begin : begin + chunk_size]
+        prompts = [render_record_prompt(record, tokenizer, data_config) for record in chunk]
+        encoded = tokenizer(
+            prompts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+        )
+        lengths = [len(input_ids) for input_ids in encoded["input_ids"]]
+        for offset, (record, length) in enumerate(zip(chunk, lengths)):
+            maximum_observed = max(maximum_observed, int(length))
+            if length > maximum:
+                overlong_rows.append((begin + offset, int(length)))
+            else:
+                kept.append(record)
+    original = len(records)
+    filtered = len(overlong_rows)
+    percentage = 100.0 * filtered / max(original, 1)
+    summary: dict[str, int | float | str] = {
+        "policy": policy,
+        "original_count": original,
+        "kept_count": len(kept),
+        "filtered_overlong_count": filtered,
+        "filtered_overlong_percentage": percentage,
+        "max_prompt_tokens": maximum,
+        "maximum_observed_prompt_length": maximum_observed,
+    }
+    if overlong_rows and policy == "error":
+        preview = ", ".join(
+            f"row {row} ({length} tokens)" for row, length in overlong_rows[:5]
+        )
+        raise ValueError(
+            f"Found {filtered} rendered prompts over MAX_PROMPT_LEN={maximum}; "
+            f"first examples: {preview}"
+        )
+    if not kept:
+        raise ValueError(
+            f"No training samples remain after applying MAX_PROMPT_LEN={maximum} "
+            f"with OVERLONG_PROMPT_POLICY={policy}"
+        )
+    return kept, summary
+
+
 def stable_sample_id(record: dict[str, Any], dataset_index: int) -> str:
     for key in ("id", "index", "uuid", "sample_id", "unique_id"):
         if key in record and record[key] is not None:
@@ -155,15 +224,23 @@ def tokenize_prompts(
     prompts = [render_record_prompt(record, tokenizer, data_config) for record in records]
     previous_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
-    encoded = tokenizer(
-        prompts,
-        add_special_tokens=False,
-        padding=True,
-        truncation=True,
-        max_length=int(data_config.get("max_prompt_tokens", 512)),
-        return_tensors="pt",
-    )
-    tokenizer.padding_side = previous_side
+    try:
+        encoded = tokenizer(
+            prompts,
+            add_special_tokens=False,
+            padding=True,
+            truncation=False,
+            return_tensors="pt",
+        )
+    finally:
+        tokenizer.padding_side = previous_side
+    maximum = int(data_config.get("max_prompt_tokens", 512))
+    observed = int(encoded["attention_mask"].sum(dim=-1).max().item())
+    if observed > maximum:
+        raise ValueError(
+            f"Rendered prompt length {observed} exceeds MAX_PROMPT_LEN={maximum}; "
+            "the dataset must be filtered before batching"
+        )
     return {key: value.to(device) for key, value in encoded.items()}, prompts
 
 

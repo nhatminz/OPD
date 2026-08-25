@@ -6,10 +6,64 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from b200_experiment.evaluation_cache import evaluate_or_reuse_base
+from b200_experiment.evaluation_cache import (
+    BASE_EVALUATION_CACHE_SCHEMA,
+    base_evaluation_cache_key,
+    evaluate_or_reuse_base,
+)
+from b200_experiment.math_prompts import EVAL_PROMPT_PROTOCOL_VERSION
 
 
 class BaseEvaluationCacheTests(unittest.TestCase):
+    def _fingerprint_fixture(self, root: Path):
+        model = root / "model"
+        model.mkdir()
+        (model / "config.json").write_text("{}\n", encoding="utf-8")
+        (model / "tokenizer.json").write_text('{"vocab":{}}\n', encoding="utf-8")
+        benchmark = root / "math.jsonl"
+        benchmark.write_text(
+            json.dumps({"problem": "1+1?", "answer": "2"}) + "\n",
+            encoding="utf-8",
+        )
+        config = {
+            "models": {"dtype": "bfloat16"},
+            "data": {"chat_template_kwargs": {"enable_thinking": False}},
+            "evaluation": {"benchmarks": {"MATH-500": {"path": str(benchmark)}}},
+        }
+        settings = {
+            "backend": "vllm",
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "num_responses": 16,
+            "max_new_tokens": 32,
+            "limit": None,
+            "benchmark_names": ["MATH-500"],
+            "vllm": {"performance_mode": "throughput"},
+        }
+        return model, config, settings
+
+    def test_cache_fingerprint_tracks_prompt_protocol_and_sampling(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model, config, settings = self._fingerprint_fixture(root)
+            first = base_evaluation_cache_key(config, settings, model)
+            unchanged = base_evaluation_cache_key(config, settings, model)
+            changed_settings = dict(settings, temperature=0.5)
+            sampling_changed = base_evaluation_cache_key(
+                config, changed_settings, model
+            )
+            prompt_copy = root / "math_prompts_modified.py"
+            prompt_copy.write_text("DIFFERENT PROMPT PROTOCOL\n", encoding="utf-8")
+            prompt_changed = base_evaluation_cache_key(
+                config, settings, model, math_prompts_path=prompt_copy
+            )
+
+            self.assertEqual(first, unchanged)
+            self.assertNotEqual(first, sampling_changed)
+            self.assertNotEqual(first, prompt_changed)
+            self.assertEqual(BASE_EVALUATION_CACHE_SCHEMA, 2)
+            self.assertEqual(EVAL_PROMPT_PROTOCOL_VERSION, "verl_eopd_math_v1")
+
     def test_identical_base_eval_is_generated_once_and_paths_are_rewritten(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

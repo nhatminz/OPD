@@ -208,6 +208,8 @@ class BatchLayout:
     num_responses: int
     global_trajectory_batch_size: int
     local_trajectory_batch_size: int
+    ppo_mini_batch_size: int
+    optimizer_steps_per_full_rollout: int
     micro_batch_size_per_gpu: int
     micro_batches_per_gpu: int
 
@@ -217,6 +219,7 @@ def batch_layout(
     num_responses: int,
     world_size: int,
     micro_batch_size_per_gpu: int,
+    ppo_mini_batch_size: int | None = None,
 ) -> BatchLayout:
     """Resolve explicit global/local batch semantics for one training step."""
     values = {
@@ -231,15 +234,28 @@ def batch_layout(
     local_prompts = (
         values["global_prompt_batch_size"] + values["world_size"] - 1
     ) // values["world_size"]
+    global_trajectories = (
+        values["global_prompt_batch_size"] * values["num_responses"]
+    )
+    ppo_size = (
+        global_trajectories
+        if ppo_mini_batch_size is None
+        else int(ppo_mini_batch_size)
+    )
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
     return BatchLayout(
         global_prompt_batch_size=values["global_prompt_batch_size"],
         world_size=values["world_size"],
         local_prompt_batch_size=local_prompts,
         num_responses=values["num_responses"],
-        global_trajectory_batch_size=(
-            values["global_prompt_batch_size"] * values["num_responses"]
-        ),
+        global_trajectory_batch_size=global_trajectories,
         local_trajectory_batch_size=local_prompts * values["num_responses"],
+        ppo_mini_batch_size=ppo_size,
+        optimizer_steps_per_full_rollout=(
+            global_trajectories + ppo_size - 1
+        )
+        // ppo_size,
         micro_batch_size_per_gpu=values["micro_batch_size_per_gpu"],
         micro_batches_per_gpu=(
             local_prompts * values["num_responses"]

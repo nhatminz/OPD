@@ -13,10 +13,12 @@ import torch
 from b200_experiment.data import (
     epoch_batch_indices,
     expand_prompt_batch,
+    filter_overlong_prompt_records,
     read_records,
     record_messages,
     render_record_prompt,
     stable_sample_id,
+    tokenize_prompts,
     validate_prompt_records,
 )
 from b200_experiment.evaluation import (
@@ -40,6 +42,43 @@ class _TemplateTokenizer:
         )
 
 
+class _LengthTokenizer(_TemplateTokenizer):
+    padding_side = "right"
+
+    def __call__(
+        self,
+        prompts,
+        *,
+        add_special_tokens,
+        padding,
+        truncation,
+        return_tensors=None,
+    ):
+        del add_special_tokens
+        if truncation:
+            raise AssertionError("Prompt tokenization must never truncate")
+        rows = [list(range(1, len(prompt.split()) + 1)) for prompt in prompts]
+        if not padding:
+            return {"input_ids": rows}
+        width = max(map(len, rows))
+        input_ids = []
+        attention_mask = []
+        for row in rows:
+            missing = width - len(row)
+            if self.padding_side == "left":
+                input_ids.append([0] * missing + row)
+                attention_mask.append([0] * missing + [1] * len(row))
+            else:
+                input_ids.append(row + [0] * missing)
+                attention_mask.append([1] * len(row) + [0] * missing)
+        if return_tensors == "pt":
+            return {
+                "input_ids": torch.tensor(input_ids),
+                "attention_mask": torch.tensor(attention_mask),
+            }
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
 class DataEvaluationConfigTests(unittest.TestCase):
     def test_one_response_keeps_one_independent_trajectory_per_prompt(self):
         encoded = {
@@ -60,6 +99,25 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(expanded["input_ids"].shape[0], 4)
         self.assertEqual(indices, [17, 17, 17, 17])
         self.assertEqual(response_indices, [0, 1, 2, 3])
+
+    def test_num_responses_is_arbitrary_not_hard_coded(self):
+        encoded = {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "attention_mask": torch.ones(2, 2, dtype=torch.long),
+        }
+        for num_responses in (1, 2, 4, 8):
+            with self.subTest(num_responses=num_responses):
+                expanded, indices, response_indices = expand_prompt_batch(
+                    encoded, [7, 9], num_responses
+                )
+                self.assertEqual(
+                    expanded["input_ids"].shape[0], 2 * num_responses
+                )
+                self.assertEqual(len(indices), 2 * num_responses)
+                self.assertEqual(
+                    response_indices,
+                    list(range(num_responses)) * 2,
+                )
 
     def test_aggregation_includes_pure_opd_in_controlled_order(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -194,6 +252,44 @@ class DataEvaluationConfigTests(unittest.TestCase):
                 {"prompt_key": "problem", "prefer_source_prompt": False},
             )
 
+    def test_overlong_policy_filters_final_rendered_prompts_without_truncation(self):
+        tokenizer = _LengthTokenizer()
+        records = [
+            {"problem": "short problem"},
+            {"problem": " ".join(["long"] * 30)},
+        ]
+        config = {
+            "prompt_key": "problem",
+            "max_prompt_tokens": 20,
+            "overlong_prompt_policy": "filter",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+        kept, summary = filter_overlong_prompt_records(records, tokenizer, config)
+
+        self.assertEqual(kept, records[:1])
+        self.assertEqual(summary["original_count"], 2)
+        self.assertEqual(summary["kept_count"], 1)
+        self.assertEqual(summary["filtered_overlong_count"], 1)
+        encoded, _ = tokenize_prompts(
+            kept, tokenizer, config, torch.device("cpu")
+        )
+        self.assertLessEqual(int(encoded["attention_mask"].sum()), 20)
+
+    def test_overlong_error_policy_fails_instead_of_truncating(self):
+        config = {
+            "prompt_key": "problem",
+            "max_prompt_tokens": 20,
+            "overlong_prompt_policy": "error",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        with self.assertRaisesRegex(ValueError, "rendered prompts over"):
+            filter_overlong_prompt_records(
+                [{"problem": " ".join(["long"] * 30)}],
+                _LengthTokenizer(),
+                config,
+            )
+
     def test_competition_math_eval_uses_answer_not_worked_solution(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "test-00000-of-00001.parquet"
@@ -303,6 +399,8 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(base["rollout"]["num_responses"], 1)
         self.assertEqual(base["rollout"]["temperature"], 1.0)
         self.assertEqual(base["training"]["micro_batch_size_per_gpu"], 8)
+        self.assertEqual(base["training"]["ppo_mini_batch_size"], 16)
+        self.assertEqual(base["data"]["overlong_prompt_policy"], "filter")
         self.assertTrue(base["training"]["gradient_checkpointing"])
         self.assertEqual(base["data"]["max_prompt_tokens"], 1024)
         self.assertEqual(base["rollout"]["max_new_tokens"], 7168)
